@@ -90,7 +90,9 @@ function configureEngine(
     });
   }
   const stateRoot = stateRootForConfig(config);
-  const eventStore = new EventStore({ logDirectory: join(stateRoot, "events") });
+  const eventStore = new EventStore({
+    executionDirectory: join(stateRoot, "executions"),
+  });
   const evidenceStore = new EvidenceStore({ directory: join(stateRoot, "evidence") });
   const fingerprintRegistry = new FingerprintRegistry({
     statePath: join(stateRoot, "fingerprints.json"),
@@ -146,6 +148,7 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
   const reviewPath = resolve(required(options, "review"));
   const config = await loadConfig(configPath);
   const previousMCodePath = process.env["G2M_MCODE_PATH"];
+  let eventStoreToClose: EventStore | undefined;
   if (config.mcode_path !== undefined) process.env["G2M_MCODE_PATH"] = config.mcode_path;
 
   try {
@@ -156,6 +159,7 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
       worker,
       runtime.version ?? "unknown",
     );
+    eventStoreToClose = eventStore;
     emit({ type: "g2m.runtime.ready", runtime });
     const pending = await engine.execute(await readJson(taskPath));
     const runRoot = resolve(config.artifact_root, pending.executionId);
@@ -185,6 +189,7 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
     ]);
     emit({ type: "g2m.completed", outcome_path: outcomePath, ...completed });
   } finally {
+    eventStoreToClose?.close();
     if (previousMCodePath === undefined) delete process.env["G2M_MCODE_PATH"];
     else process.env["G2M_MCODE_PATH"] = previousMCodePath;
   }

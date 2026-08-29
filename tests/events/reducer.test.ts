@@ -269,6 +269,34 @@ describe("reduce — fingerprint change → RECOVERY_REQUIRED (user requirement 
   });
 });
 
+describe("reduce — event domains", () => {
+  it("does not let storage events drive lifecycle state", () => {
+    const store = new EventStore();
+    const created = store.append({ taskId: "t", attemptId: "a1", type: "task.created", payload: {} });
+    const gcMarked = store.append({ taskId: "t", attemptId: "a1", type: "gc.marked", payload: {} });
+    const reg = new FingerprintRegistry();
+    const planned = reduce(null, created, { fingerprintRegistry: reg });
+
+    expect(gcMarked.domain).toBe("storage");
+    expect(reduce(planned, gcMarked, { fingerprintRegistry: reg })).toBe("PLANNED");
+  });
+
+  it("does not let projection events disturb a terminal lifecycle state", () => {
+    const store = new EventStore();
+    const repaired = store.append({
+      taskId: "t",
+      attemptId: "a1",
+      type: "projection.repaired",
+      payload: {},
+    });
+
+    expect(repaired.domain).toBe("projection");
+    expect(reduce("ACCEPTED", repaired, {
+      fingerprintRegistry: new FingerprintRegistry(),
+    })).toBe("ACCEPTED");
+  });
+});
+
 describe("reduce — illegal transitions (user requirement 2)", () => {
   it("throws InvalidTransitionError for skipping stages", () => {
     const store = new EventStore();

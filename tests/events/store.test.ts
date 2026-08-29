@@ -56,13 +56,19 @@ describe("EventStore.append", () => {
       fingerprint: fp,
     });
     expect(event.hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(event.schemaVersion).toBe(1);
+    expect(event.domain).toBe("lifecycle");
+    expect(event.durability).toBe("CRITICAL");
     // 手工重算并比较
     const recomputed = computeEventHash({
       eventId: event.eventId,
+      schemaVersion: event.schemaVersion,
       seq: event.seq,
       timestampMs: event.timestampMs,
       taskId: event.taskId,
       attemptId: event.attemptId,
+      domain: event.domain,
+      durability: event.durability,
       type: event.type,
       prevHash: event.prevHash,
       ...(event.fingerprint !== undefined ? { fingerprint: event.fingerprint } : {}),
@@ -220,6 +226,18 @@ describe("verifyChain (user requirement 1: chain integrity, no reordering)", () 
     expect(result.brokenAtSeq).toBe(1);
   });
 
+  it("rejects a non-monotonic sequence even when its hash was recomputed", () => {
+    const store = new EventStore();
+    const event = store.append({ taskId: "t", attemptId: "a1", type: "task.created", payload: {} });
+    const { hash: ignored, ...withoutHash } = event;
+    void ignored;
+    const changed = { ...withoutHash, seq: 2 };
+    const result = verifyChain([{ ...changed, hash: computeEventHash(changed) }]);
+
+    expect(result.valid).toBe(false);
+    expect(result.reason).toBe("SEQ_MISMATCH");
+  });
+
   it("flags prevHash mismatch when events are reordered (plan §52: 禁止排序)", () => {
     const store = new EventStore();
     store.append({ taskId: "t", attemptId: "a1", type: "task.created", payload: {} });
@@ -230,16 +248,19 @@ describe("verifyChain (user requirement 1: chain integrity, no reordering)", () 
     const reordered = [events[0], events[2], events[1]] as TaskEvent[];
     const result = verifyChain(reordered);
     expect(result.valid).toBe(false);
-    expect(result.reason).toBe("PREV_HASH_MISMATCH");
+    expect(result.reason).toBe("SEQ_MISMATCH");
   });
 
   it("first event must have prevHash = null; flagging if it's something else", () => {
     const e: TaskEvent = {
       eventId: "x",
+      schemaVersion: 1,
       seq: 1,
       timestampMs: 1,
       taskId: "t",
       attemptId: "a1",
+      domain: "lifecycle",
+      durability: "CRITICAL",
       type: "task.created",
       prevHash: "should-be-null",
       hash: "0".repeat(64),

@@ -29,11 +29,40 @@ Implemented:
 Verification:
 
 - targeted Phase 1 tests pass;
-- complete suite: 340 passed, 5 skipped;
+- complete suite: 351 passed, 5 skipped after Phase 2;
+- typecheck and build passed.
+
+## Phase 2 — Durable Journal
+
+Status: complete in the Phase 2 implementation commit.
+
+Implemented:
+
+- a unified `JournalWriter` with `append`, `flush`, and `close` operations;
+- NORMAL-event batching and a CRITICAL flush barrier that durably writes every
+  preceding queued event in physical append order;
+- the frozen v2 snake_case event schema, including schema version, execution
+  identity, domain, durability, sequence, and complete hash-chain bindings;
+- per-execution `executions/<execution-id>/state-events.ndjson` journals;
+- domain separation so storage, recovery, and projection facts cannot drive
+  lifecycle state transitions;
+- valid-prefix replay with explicit `TRUNCATED_TAIL` reporting for a final
+  unterminated line;
+- hard failure for malformed middle or completed lines and broken hash chains;
+- write refusal after a truncated tail so recovery evidence cannot be appended
+  over an uncertain journal;
+- a deprecated flat-directory adapter for existing internal callers while CLI
+  writes use only the v2 execution-directory layout.
+
+Verification:
+
+- targeted Journal, persistence, reducer, Review ingress, and CLI E2E tests
+  pass;
+- complete suite: 351 passed, 5 skipped;
 - typecheck and build passed.
 
 ## Remaining phases
 
-Phase 2 Durable Journal is next, followed by SQLite Projection, Startup
-Backfill, Recovery, crash-safe ACCEPT, cross-process lease, Process Supervisor,
-Storage Manager, GC, operational CLI, runtime hardening, and CI matrices.
+Phase 3 SQLite Projection is next, followed by Startup Backfill, Recovery,
+crash-safe ACCEPT, cross-process lease, Process Supervisor, Storage Manager,
+GC, operational CLI, runtime hardening, and CI matrices.

@@ -51,7 +51,15 @@ export type TaskEventType =
   | "review.decision.revise"
   | "review.decision.block"
   // Recovery (plan §51) — 任何 active state 看到 recovery.required 都会进 RECOVERY_REQUIRED
-  | "recovery.required";
+  | "recovery.required"
+  | "recovery.reconciled"
+  | "gc.marked"
+  | "gc.completed"
+  | "projection.stale"
+  | "projection.repaired";
+
+export type EventDomain = "lifecycle" | "recovery" | "storage" | "projection";
+export type EventDurability = "CRITICAL" | "NORMAL" | "DIAGNOSTIC";
 
 /**
  * 事件 payload。MVP 用宽泛的 Record<string, unknown> —
@@ -65,12 +73,15 @@ export type TaskEventPayload = Record<string, unknown>;
  * prevHash / hash 由 EventStore.append 自动填,调用方不传。
  */
 export interface TaskEvent {
+  readonly schemaVersion: 1;
   readonly eventId: string;
   readonly seq: number;
   readonly timestampMs: number;
   readonly taskId: string;
   readonly attemptId: string;
+  readonly domain: EventDomain;
   readonly type: TaskEventType;
+  readonly durability: EventDurability;
   readonly prevHash: string | null;
   readonly hash: string;
   /**

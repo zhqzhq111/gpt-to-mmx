@@ -83,6 +83,8 @@ export function reduce(
     );
   }
 
+  if (event.domain !== "lifecycle") return state;
+
   // Step 2:Terminal state 拒绝所有事件
   if (isTerminal(state)) {
     throw new InvalidTransitionError(
