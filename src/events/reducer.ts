@@ -46,6 +46,7 @@ const FINGERPRINT_TRANSITION_EVENTS = new Set<string>([
   "verification.completed",
   "verification.skipped",
   "verification.failed",
+  "patch.frozen",
   "review.decision.accept",
   "review.decision.revise",
   "review.decision.block",

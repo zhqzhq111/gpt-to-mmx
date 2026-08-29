@@ -30,9 +30,17 @@ import type { WorkerResult } from "../workers/coding-worker.js";
 import type { DiffResult } from "../evidence/diff.js";
 import type { WorkspaceBaseline } from "../workspace/baseline.js";
 import type { VerificationResult } from "../evidence/verification.js";
+import type { ChangeSetEntry } from "../workspace/change-set.js";
 
 export interface FrozenPatchEvidence {
+  readonly artifactId: string;
+  readonly artifactPath: string;
   readonly baseRevision: string;
+  readonly patchBlobHash: string;
+  readonly changeSetHash: string;
+  readonly patchBytes: number;
+  readonly changeSet: readonly ChangeSetEntry[];
+  /** @deprecated Use patchBlobHash. */
   readonly patchHash: string;
   readonly patchText: string;
   readonly changedFiles: readonly string[];

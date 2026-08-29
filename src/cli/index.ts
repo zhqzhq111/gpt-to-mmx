@@ -5,7 +5,6 @@ import { join, resolve } from "node:path";
 
 import { EvidenceStore } from "../evidence/store.js";
 import { EventStore } from "../events/store.js";
-import { collectDiff } from "../evidence/diff.js";
 import { G2MExecutionEngine, G2MExecutionEngineError } from "../execution/engine.js";
 import { fingerprintHash, FingerprintRegistry } from "../execution/fingerprint.js";
 import { ProfileRegistry } from "../policy/verification.js";
@@ -16,6 +15,7 @@ import { MCodeAdapter } from "../workers/mcode/adapter.js";
 import { WorkspaceLock } from "../workspace/lock.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { captureBaseline } from "../workspace/baseline.js";
+import { computeWorkingTreeChangeSet } from "../workspace/change-set.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
 import { createReviewForBundle, writeJsonAtomic } from "./review-file.js";
 
@@ -274,7 +274,12 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
     | {
         workspaceEvidence?: {
           diff?: { diffHash?: unknown };
-          patch?: { patchHash?: unknown };
+          patch?: {
+            patchBlobHash?: unknown;
+            patchHash?: unknown;
+            changeSetHash?: unknown;
+            changedFiles?: unknown;
+          };
         };
       }
     | undefined;
@@ -282,24 +287,35 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
   const patchApplied = events.find((event) => event.type === "patch.applied");
   const completed = events.find((event) => event.type === "review.accept.completed");
   if ((prepared !== undefined || patchApplied !== undefined) && completed === undefined) {
-    const preparedPatchHash = prepared?.payload["patchHash"];
-    const expectedDiffHash = bundle?.workspaceEvidence?.diff?.diffHash;
-    const expectedPatchHash = bundle?.workspaceEvidence?.patch?.patchHash;
+    const preparedPatchHash =
+      prepared?.payload["patch_blob_hash"] ?? prepared?.payload["patchHash"];
+    const expectedPatchHash =
+      bundle?.workspaceEvidence?.patch?.patchBlobHash ??
+      bundle?.workspaceEvidence?.patch?.patchHash;
+    const expectedChangeSetHash = bundle?.workspaceEvidence?.patch?.changeSetHash;
+    const changedFiles = bundle?.workspaceEvidence?.patch?.changedFiles;
     const expectedBaseRevision =
       workspaceEvidence?.type === "workspace"
         ? workspaceEvidence.diff.baseRevision
         : undefined;
-    const targetDiff =
+    const targetChangeSet =
       expectedBaseRevision !== undefined &&
-      currentBaseline.baseRevision === expectedBaseRevision
-        ? await collectDiff(workspace.path, expectedBaseRevision)
+      currentBaseline.baseRevision === expectedBaseRevision &&
+      Array.isArray(changedFiles) &&
+      changedFiles.every((path) => typeof path === "string")
+        ? await computeWorkingTreeChangeSet(
+            workspace.path,
+            expectedBaseRevision,
+            changedFiles as string[],
+            resolve(config.artifact_root, executionId),
+          )
         : undefined;
     const targetMatches =
       processStatus !== "alive" &&
       processStatus !== "unknown" &&
-      targetDiff !== undefined &&
-      typeof expectedDiffHash === "string" &&
-      targetDiff.diffHash === expectedDiffHash &&
+      targetChangeSet !== undefined &&
+      typeof expectedChangeSetHash === "string" &&
+      targetChangeSet.hash === expectedChangeSetHash &&
       typeof expectedPatchHash === "string" &&
       preparedPatchHash === expectedPatchHash;
     if (targetMatches) {
@@ -309,7 +325,9 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
           attemptId: executionId,
           type: "patch.applied",
           payload: {
-            patchHash: expectedPatchHash,
+            patch_blob_hash: expectedPatchHash,
+            expected_change_set_hash: expectedChangeSetHash,
+            actual_change_set_hash: targetChangeSet.hash,
             status: "reconciled",
             targetPath: workspace.path,
           },

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,8 +84,17 @@ describe("Temporary Git Worktree", () => {
 
     expect(patch.empty).toBe(false);
     expect(patch.changedFiles).toEqual(["new-file.txt", "source.txt"]);
-    expect((await readFile(patch.patchPath, "utf8"))).toContain("new-file.txt");
-    expect(patch.patchHash).toMatch(/^[a-f0-9]{64}$/);
+    const patchBytes = await readFile(patch.patchPath);
+    expect(patchBytes.toString("utf8")).toContain("new-file.txt");
+    expect(patch.patchBlobHash).toBe(createHash("sha256").update(patchBytes).digest("hex"));
+    expect(patch.changeSetHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(patch.patchBytes).toBe(patchBytes.length);
+    expect(JSON.parse(await readFile(patch.metadataPath, "utf8"))).toMatchObject({
+      patch_blob_hash: patch.patchBlobHash,
+      change_set_hash: patch.changeSetHash,
+      base_revision: baseRevision,
+      patch_bytes: patchBytes.length,
+    });
   });
 
   it("applies an accepted patch to a clean main workspace without committing", async () => {
@@ -101,6 +111,7 @@ describe("Temporary Git Worktree", () => {
     const applied = await applyAcceptedPatch(handle, patch, repositoryPath);
 
     expect(applied.status).toBe("applied");
+    expect(applied.actualChangeSetHash).toBe(patch.changeSetHash);
     expect((await readFile(join(repositoryPath, "source.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("accepted\n");
     expect((await readFile(join(repositoryPath, "new-file.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("accepted new\n");
     expect(await git(repositoryPath, ["rev-parse", "HEAD"])).toBe(baseRevision);

@@ -88,7 +88,15 @@ function makeBaseline(overrides: Partial<WorkspaceBaseline> = {}): WorkspaceBase
 
 function makePatch() {
   return {
+    artifactId: "patch-1",
+    artifactPath: "frozen.patch",
     baseRevision: "HEAD",
+    patchBlobHash: "p".repeat(64),
+    changeSetHash: "c".repeat(64),
+    patchBytes: 32,
+    changeSet: [
+      { path: "a.ts", kind: "file" as const, mode: "100644", content_sha256: "f".repeat(64) },
+    ],
     patchHash: "p".repeat(64),
     patchText: "diff --git a/a.ts b/a.ts\n+new\n",
     changedFiles: ["a.ts"],

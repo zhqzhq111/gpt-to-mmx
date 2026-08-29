@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 import { EventStore } from "../events/store.js";
 import { reduce } from "../events/reducer.js";
@@ -18,6 +19,7 @@ import {
   recordWorkspaceEvidence,
 } from "../evidence/store.js";
 import { runVerification } from "../evidence/verification.js";
+import { writeImmutableArtifact } from "../persistence/artifact-writer.js";
 import { ProfileRegistry, resolveProfile } from "../policy/verification.js";
 import { sha256, taskHash } from "../protocol/hash.js";
 import {
@@ -439,7 +441,8 @@ export class G2MExecutionEngine {
         verification,
       );
 
-      const patch = await collectWorktreePatch(worktree, this.options.artifactRoot);
+      const executionArtifactRoot = resolve(this.options.artifactRoot, executionId);
+      const patch = await collectWorktreePatch(worktree, executionArtifactRoot);
       const diff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
       recordWorkspaceEvidence(
         this.options.evidenceStore,
@@ -453,6 +456,20 @@ export class G2MExecutionEngine {
         executionId,
         type: "evidence.diff.collected",
         payload: { diffHash: diff.diffHash },
+        fingerprint,
+      });
+      this.appendAndReduce(mutable, {
+        taskId: task.task_id,
+        executionId,
+        type: "patch.frozen",
+        payload: {
+          artifact_id: patch.artifactId,
+          artifact_path: "frozen.patch",
+          patch_blob_hash: patch.patchBlobHash,
+          change_set_hash: patch.changeSetHash,
+          base_revision: patch.baseRevision,
+          patch_bytes: patch.patchBytes,
+        },
         fingerprint,
       });
 
@@ -495,7 +512,13 @@ export class G2MExecutionEngine {
           diff,
           baseline,
           patch: {
+            artifactId: patch.artifactId,
+            artifactPath: "frozen.patch",
             baseRevision: patch.baseRevision,
+            patchBlobHash: patch.patchBlobHash,
+            changeSetHash: patch.changeSetHash,
+            patchBytes: patch.patchBytes,
+            changeSet: patch.changeSet,
             patchHash: patch.patchHash,
             patchText: patch.patchText,
             changedFiles: patch.changedFiles,
@@ -509,7 +532,12 @@ export class G2MExecutionEngine {
         taskId: task.task_id,
         executionId,
         type: "review.requested",
-        payload: { bundleId: bundle.bundleId },
+        payload: {
+          review_bundle_id: bundle.bundleId,
+          review_bundle_hash: bundle.reviewBundleHash,
+          task_hash: bundle.taskHash,
+          result_hash: bundle.resultHash,
+        },
         fingerprint,
       });
       if (mutable.state !== "REVIEW_PENDING") {
@@ -598,7 +626,8 @@ export class G2MExecutionEngine {
             reviewId: review.reviewId,
             reviewBundleId: review.reviewBundleId,
             reviewHash: review.reviewHash,
-            patchHash: pending.patch.patchHash,
+            patch_blob_hash: pending.patch.patchBlobHash,
+            change_set_hash: pending.patch.changeSetHash,
           },
           fingerprint: pending.fingerprint,
         });
@@ -608,12 +637,27 @@ export class G2MExecutionEngine {
           pending.worktree.repositoryPath,
         );
         patchStatus = appliedPatch.status;
+        const applyEvidence = {
+          patch_blob_hash: appliedPatch.patchBlobHash,
+          expected_change_set_hash: appliedPatch.expectedChangeSetHash,
+          actual_change_set_hash: appliedPatch.actualChangeSetHash,
+          target_path: appliedPatch.targetPath,
+          status: appliedPatch.status,
+          applied_at: appliedPatch.appliedAt,
+        };
+        const applyEvidenceArtifact = await writeImmutableArtifact(
+          resolve(this.options.artifactRoot, pending.executionId, "apply-evidence.json"),
+          Buffer.from(`${JSON.stringify(applyEvidence, null, 2)}\n`, "utf8"),
+        );
         this.appendAndReduce(transaction, {
           taskId: review.taskId,
           executionId: review.executionId,
           type: "patch.applied",
           payload: {
-            patchHash: appliedPatch.patchHash,
+            patch_blob_hash: appliedPatch.patchBlobHash,
+            expected_change_set_hash: appliedPatch.expectedChangeSetHash,
+            actual_change_set_hash: appliedPatch.actualChangeSetHash,
+            apply_evidence_hash: applyEvidenceArtifact.sha256,
             status: appliedPatch.status,
             targetPath: appliedPatch.targetPath,
           },

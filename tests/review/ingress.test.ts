@@ -155,7 +155,15 @@ function makeBundleInput(task: CodeTaskV1): BuildBundleInput {
       diff: makeDiff(),
       baseline: makeBaseline(),
       patch: {
+        artifactId: "patch-1",
+        artifactPath: "frozen.patch",
         baseRevision: "HEAD",
+        patchBlobHash: "p".repeat(64),
+        changeSetHash: "c".repeat(64),
+        patchBytes: 32,
+        changeSet: [
+          { path: "a.ts", kind: "file", mode: "100644", content_sha256: "f".repeat(64) },
+        ],
         patchHash: "p".repeat(64),
         patchText: "diff --git a/a.ts b/a.ts\n+new\n",
         changedFiles: ["a.ts"],

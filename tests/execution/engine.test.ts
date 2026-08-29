@@ -209,9 +209,17 @@ describe("G2MExecutionEngine", () => {
       "agent.spawn.started",
       "agent.completed",
       "evidence.diff.collected",
+      "patch.frozen",
       "verification.completed",
       "review.requested",
     ]);
+    expect(
+      eventStore.getByTaskId(task.task_id).find((event) => event.type === "patch.frozen")?.payload,
+    ).toMatchObject({
+      patch_blob_hash: pending.bundle.workspaceEvidence.patch.patchBlobHash,
+      change_set_hash: pending.bundle.workspaceEvidence.patch.changeSetHash,
+      base_revision: pending.worktree.baseRevision,
+    });
     expect(workspaceLock.isHeld("demo")).toBe(false);
   });
 

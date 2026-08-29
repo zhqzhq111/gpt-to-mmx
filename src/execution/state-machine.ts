@@ -141,6 +141,7 @@ const TRANSITIONS: Readonly<
     "recovery.required": "RECOVERY_REQUIRED",
   },
   VERIFYING: {
+    "patch.frozen": "VERIFYING",
     "verification.completed": "EXECUTION_SUCCEEDED",
     "verification.skipped": "EXECUTION_SUCCEEDED",
     "verification.failed": "FAILED",

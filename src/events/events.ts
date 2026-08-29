@@ -37,6 +37,7 @@ export type TaskEventType =
   | "agent.cancelled"
   // Evidence collection
   | "evidence.diff.collected"
+  | "patch.frozen"
   // Verification
   | "verification.completed"
   | "verification.skipped"

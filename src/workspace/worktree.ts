@@ -8,12 +8,17 @@
  */
 
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { sha256 } from "../protocol/hash.js";
+import { writeImmutableArtifact } from "../persistence/artifact-writer.js";
+import {
+  computeIndexedChangeSet,
+  computeWorkingTreeChangeSet,
+  type ChangeSetEntry,
+} from "./change-set.js";
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 30_000;
@@ -35,10 +40,17 @@ export interface TemporaryWorktreeHandle {
 }
 
 export interface WorktreePatch {
+  readonly artifactId: string;
   readonly worktreeId: string;
   readonly baseRevision: string;
   readonly patchPath: string;
+  readonly metadataPath: string;
   readonly patchText: string;
+  readonly patchBlobHash: string;
+  readonly changeSetHash: string;
+  readonly changeSet: readonly ChangeSetEntry[];
+  readonly patchBytes: number;
+  /** @deprecated Use patchBlobHash. */
   readonly patchHash: string;
   readonly changedFiles: readonly string[];
   readonly empty: boolean;
@@ -49,6 +61,9 @@ export interface ApplyAcceptedPatchResult {
   readonly status: "applied" | "no_changes";
   readonly targetPath: string;
   readonly patchHash: string;
+  readonly patchBlobHash: string;
+  readonly expectedChangeSetHash: string;
+  readonly actualChangeSetHash: string;
   readonly changedFiles: readonly string[];
   readonly appliedAt: number;
 }
@@ -61,6 +76,7 @@ export class TemporaryWorktreeError extends Error {
     | "WORKTREE_HEAD_MOVED"
     | "PATCH_FAILED"
     | "PATCH_HASH_MISMATCH"
+    | "PATCH_RESULT_MISMATCH"
     | "TARGET_REPOSITORY_MISMATCH"
     | "BASE_REVISION_MISMATCH"
     | "DIRTY_TARGET"
@@ -95,6 +111,30 @@ async function git(
       maxBuffer: 20 * 1024 * 1024,
     });
     return stdout;
+  } catch (error) {
+    throw new TemporaryWorktreeError(
+      errorCode,
+      `git ${args.join(" ")} failed in ${cwd}: ${(error as Error).message}`,
+      error,
+    );
+  }
+}
+
+async function gitBuffer(
+  cwd: string,
+  args: readonly string[],
+  errorCode: TemporaryWorktreeError["code"],
+): Promise<Buffer> {
+  try {
+    const { stdout } = await execFileAsync("git", [...args], {
+      cwd,
+      timeout: GIT_TIMEOUT_MS,
+      windowsHide: true,
+      shell: false,
+      encoding: "buffer",
+      maxBuffer: 50 * 1024 * 1024,
+    });
+    return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
   } catch (error) {
     throw new TemporaryWorktreeError(
       errorCode,
@@ -214,37 +254,48 @@ export async function collectWorktreePatch(
   // Staging happens only inside the disposable worktree and allows one patch
   // to include tracked, deleted, binary, and previously untracked files.
   await git(handle.worktreePath, ["add", "-A"], "PATCH_FAILED");
-  const [patchText, changedOutput] = await Promise.all([
-    git(
+  const patchBytes = await gitBuffer(
       handle.worktreePath,
       ["diff", "--cached", "--binary", handle.baseRevision],
       "PATCH_FAILED",
-    ),
-    git(
-      handle.worktreePath,
-      ["diff", "--cached", "--name-only", handle.baseRevision],
-      "PATCH_FAILED",
-    ),
-  ]);
-
-  const changedFiles = changedOutput
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .sort();
-  await mkdir(resolve(artifactRoot), { recursive: true });
-  const patchPath = join(resolve(artifactRoot), `${handle.worktreeId}.patch`);
-  await writeFile(patchPath, patchText, "utf8");
-  const patchHash = sha256({ baseRevision: handle.baseRevision, patchText });
+    );
+  const changeSet = await computeIndexedChangeSet(handle.worktreePath, handle.baseRevision);
+  const changedFiles = changeSet.entries.map((entry) => entry.path);
+  const artifactDirectory = resolve(artifactRoot);
+  await mkdir(artifactDirectory, { recursive: true });
+  const patchPath = join(artifactDirectory, "frozen.patch");
+  const metadataPath = join(artifactDirectory, "frozen-patch.json");
+  const artifactId = `patch-${handle.worktreeId}`;
+  const patchArtifact = await writeImmutableArtifact(patchPath, patchBytes);
+  const metadata = {
+    artifact_id: artifactId,
+    artifact_path: "frozen.patch",
+    patch_blob_hash: patchArtifact.sha256,
+    change_set_hash: changeSet.hash,
+    base_revision: handle.baseRevision,
+    patch_bytes: patchArtifact.bytes,
+    change_set: changeSet.entries,
+  };
+  await writeImmutableArtifact(
+    metadataPath,
+    Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`, "utf8"),
+  );
+  const patchText = patchBytes.toString("utf8");
 
   return Object.freeze({
+    artifactId,
     worktreeId: handle.worktreeId,
     baseRevision: handle.baseRevision,
     patchPath,
+    metadataPath,
     patchText,
-    patchHash,
+    patchBlobHash: patchArtifact.sha256,
+    changeSetHash: changeSet.hash,
+    changeSet: changeSet.entries,
+    patchBytes: patchArtifact.bytes,
+    patchHash: patchArtifact.sha256,
     changedFiles: Object.freeze(changedFiles),
-    empty: patchText.length === 0,
+    empty: patchBytes.length === 0,
     createdAt: Date.now(),
   });
 }
@@ -254,11 +305,11 @@ export async function applyAcceptedPatch(
   patch: WorktreePatch,
   targetPath: string,
 ): Promise<ApplyAcceptedPatchResult> {
-  const patchText = await readFile(patch.patchPath, "utf8").catch((error) => {
+  const patchBytes = await readFile(patch.patchPath).catch((error) => {
     throw new TemporaryWorktreeError("PATCH_FAILED", "cannot read patch artifact", error);
   });
-  const actualPatchHash = sha256({ baseRevision: patch.baseRevision, patchText });
-  if (actualPatchHash !== patch.patchHash) {
+  const actualPatchHash = createHash("sha256").update(patchBytes).digest("hex");
+  if (actualPatchHash !== patch.patchBlobHash) {
     throw new TemporaryWorktreeError(
       "PATCH_HASH_MISMATCH",
       "patch artifact content no longer matches its frozen hash",
@@ -299,10 +350,25 @@ export async function applyAcceptedPatch(
   }
 
   if (patch.empty) {
+    const actualChangeSet = await computeWorkingTreeChangeSet(
+      targetRoot,
+      patch.baseRevision,
+      patch.changedFiles,
+      dirname(patch.patchPath),
+    );
+    if (actualChangeSet.hash !== patch.changeSetHash) {
+      throw new TemporaryWorktreeError(
+        "PATCH_RESULT_MISMATCH",
+        `empty patch result hash ${actualChangeSet.hash} differs from expected ${patch.changeSetHash}`,
+      );
+    }
     return Object.freeze({
       status: "no_changes",
       targetPath: targetRoot,
-      patchHash: patch.patchHash,
+      patchHash: patch.patchBlobHash,
+      patchBlobHash: patch.patchBlobHash,
+      expectedChangeSetHash: patch.changeSetHash,
+      actualChangeSetHash: actualChangeSet.hash,
       changedFiles: patch.changedFiles,
       appliedAt: Date.now(),
     });
@@ -311,10 +377,26 @@ export async function applyAcceptedPatch(
   await git(targetRoot, ["apply", "--check", "--binary", patch.patchPath], "APPLY_CHECK_FAILED");
   await git(targetRoot, ["apply", "--binary", patch.patchPath], "APPLY_FAILED");
 
+  const actualChangeSet = await computeWorkingTreeChangeSet(
+    targetRoot,
+    patch.baseRevision,
+    patch.changedFiles,
+    dirname(patch.patchPath),
+  );
+  if (actualChangeSet.hash !== patch.changeSetHash) {
+    throw new TemporaryWorktreeError(
+      "PATCH_RESULT_MISMATCH",
+      `applied change set hash ${actualChangeSet.hash} differs from expected ${patch.changeSetHash}`,
+    );
+  }
+
   return Object.freeze({
     status: "applied",
     targetPath: targetRoot,
-    patchHash: patch.patchHash,
+    patchHash: patch.patchBlobHash,
+    patchBlobHash: patch.patchBlobHash,
+    expectedChangeSetHash: patch.changeSetHash,
+    actualChangeSetHash: actualChangeSet.hash,
     changedFiles: patch.changedFiles,
     appliedAt: Date.now(),
   });
