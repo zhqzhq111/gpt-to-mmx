@@ -92,6 +92,11 @@ C:\Users\zhq\.codex\skills\gpt-to-mmx
 - UNKNOWN 不得自动重试；G2M 转入 RECOVERY_REQUIRED 并保留隔离现场。
 - REVISE 会创建新 task ID 并保留隔离 worktree；当前 v1 不自动执行下一轮 revision。
 
+## 最近修复
+
+- diff 指纹现在基于规范化的工作区文件内容，不会因新增文件从未跟踪变为已暂存而误报 worktree 变化。
+- 独立验证完成后会重新采集最终 diff，验证过程中生成的文件会进入 review evidence 和冻结 patch。
+
 ## 目录
 
 ```text

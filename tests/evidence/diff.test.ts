@@ -79,6 +79,16 @@ describe("collectDiff", () => {
     ).toBe("?");
   });
 
+  it("keeps diffHash stable when an untracked file is staged", async () => {
+    await writeFile(join(repoDir, "new-file.ts"), "// new\n");
+    const beforeStaging = await collectDiff(repoDir, baseRevision);
+
+    await execFileAsync("git", ["add", "new-file.ts"], { cwd: repoDir });
+    const afterStaging = await collectDiff(repoDir, baseRevision);
+
+    expect(afterStaging.diffHash).toBe(beforeStaging.diffHash);
+  });
+
   it("flags a test file change as protected (plan §30)", async () => {
     await writeFile(
       join(repoDir, "tests/existing.test.ts"),

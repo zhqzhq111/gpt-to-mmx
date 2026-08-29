@@ -387,13 +387,58 @@ export class G2MExecutionEngine {
         fingerprint,
       });
 
-      const diff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
+      const workerDiff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
       recordWorkerEvidence(
         this.options.evidenceStore,
         task.task_id,
         executionId,
         workerResult,
       );
+
+      if (!task.requested_capabilities.write && workerDiff.changedFiles.length > 0) {
+        recordWorkspaceEvidence(
+          this.options.evidenceStore,
+          task.task_id,
+          executionId,
+          workerDiff,
+          baseline,
+        );
+        this.appendAndReduce(mutable, {
+          taskId: task.task_id,
+          executionId,
+          type: "evidence.diff.collected",
+          payload: { diffHash: workerDiff.diffHash },
+          fingerprint,
+        });
+        this.appendAndReduce(mutable, {
+          taskId: task.task_id,
+          executionId,
+          type: "verification.failed",
+          payload: {
+            reason: "write capability was not authorized",
+            changedFiles: workerDiff.changedFiles.map((entry) => entry.path),
+          },
+          fingerprint,
+        });
+        throw new G2MExecutionEngineError(
+          "CAPABILITY_VIOLATION",
+          `worker modified ${workerDiff.changedFiles.length} file(s) without write capability`,
+        );
+      }
+
+      const verification = await runVerification(
+        profile,
+        task.workspace_scope.workspace_id,
+        worktree.worktreePath,
+      );
+      recordVerificationEvidence(
+        this.options.evidenceStore,
+        task.task_id,
+        executionId,
+        verification,
+      );
+
+      const diff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
       recordWorkspaceEvidence(
         this.options.evidenceStore,
         task.task_id,
@@ -409,34 +454,6 @@ export class G2MExecutionEngine {
         fingerprint,
       });
 
-      if (!task.requested_capabilities.write && diff.changedFiles.length > 0) {
-        this.appendAndReduce(mutable, {
-          taskId: task.task_id,
-          executionId,
-          type: "verification.failed",
-          payload: {
-            reason: "write capability was not authorized",
-            changedFiles: diff.changedFiles.map((entry) => entry.path),
-          },
-          fingerprint,
-        });
-        throw new G2MExecutionEngineError(
-          "CAPABILITY_VIOLATION",
-          `worker modified ${diff.changedFiles.length} file(s) without write capability`,
-        );
-      }
-
-      const verification = await runVerification(
-        profile,
-        task.workspace_scope.workspace_id,
-        worktree.worktreePath,
-      );
-      recordVerificationEvidence(
-        this.options.evidenceStore,
-        task.task_id,
-        executionId,
-        verification,
-      );
       if (verification.status === "passed") {
         this.appendAndReduce(mutable, {
           taskId: task.task_id,

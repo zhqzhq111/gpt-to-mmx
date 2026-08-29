@@ -215,6 +215,34 @@ describe("G2MExecutionEngine", () => {
     expect(workspaceLock.isHeld("demo")).toBe(false);
   });
 
+  it("captures files created by verification in the final workspace evidence", async () => {
+    profileRegistry.register({
+      id: "mutating_tests",
+      workspaceId: "demo",
+      description: "verification creates an evidence file",
+      program: process.execPath,
+      args: [
+        "-e",
+        "require('fs').writeFileSync('verification.log', 'created\\n')",
+      ],
+      timeoutMs: 10_000,
+      registeredAt: 0,
+    });
+
+    const mutatingTask = {
+      ...task,
+      task_id: "task-verification-artifact",
+      verification_profile: "mutating_tests",
+    } satisfies CodeTaskV1;
+
+    const pending = await engine().execute(mutatingTask);
+
+    expect(pending.bundle.workspaceEvidence.diff.changedFiles).toContainEqual({
+      path: "verification.log",
+      status: "?",
+    });
+  });
+
   it("applies the reviewed patch only after an ACCEPT decision", async () => {
     const runner = engine();
     const pending = await runner.execute(task);

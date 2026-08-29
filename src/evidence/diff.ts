@@ -18,8 +18,10 @@
  */
 
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { canonicalJson } from "../protocol/hash.js";
 
 const execFileAsync = promisify(execFile);
@@ -197,6 +199,32 @@ function isProtected(filePath: string, patterns: readonly string[]): boolean {
   return false;
 }
 
+async function stableSnapshotHash(
+  workspacePath: string,
+  baseRevision: string,
+  changedFiles: readonly FileChange[],
+): Promise<string> {
+  const files = await Promise.all(
+    [...changedFiles]
+      .map((change) => ({
+        path: change.path.replaceAll("\\", "/"),
+        status: change.status === "?" ? "A" : change.status,
+      }))
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .map(async (change) => {
+        if (change.status === "D") return change;
+
+        const content = await readFile(resolve(workspacePath, change.path));
+        const contentHash = createHash("sha256").update(content).digest("hex");
+        return { ...change, contentHash };
+      }),
+  );
+
+  return createHash("sha256")
+    .update(canonicalJson({ baseRevision, files }), "utf8")
+    .digest("hex");
+}
+
 export interface CollectDiffOptions {
   readonly protectedPatterns?: readonly string[];
 }
@@ -235,9 +263,11 @@ export async function collectDiff(
     .filter((c) => isProtected(c.path, patterns))
     .map((c) => c.path);
 
-  const diffHash = createHash("sha256")
-    .update(canonicalJson({ fullDiff, changedFiles }), "utf8")
-    .digest("hex");
+  const diffHash = await stableSnapshotHash(
+    workspacePath,
+    baseRevision,
+    changedFiles,
+  );
 
   return {
     workspacePath,
