@@ -1,0 +1,23 @@
+{
+  "protocol_version": "g2m.local-config.v1",
+  "workspaces": [
+    {
+      "workspace_id": "my-project",
+      "path": "F:/absolute/path/to/my-project"
+    }
+  ],
+  "verification_profiles": [
+    {
+      "id": "targeted_tests",
+      "workspace_id": "my-project",
+      "description": "Run the project's independent test command",
+      "program": "C:/Program Files/nodejs/node.exe",
+      "args": ["--test"],
+      "timeout_ms": 120000
+    }
+  ],
+  "worktree_root": "F:/g2m-state/worktrees",
+  "artifact_root": "F:/g2m-state/artifacts",
+  "mcode_path": "C:/Users/USER/AppData/Roaming/npm/mcode.cmd",
+  "review_timeout_ms": 1800000
+}

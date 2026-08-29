@@ -1,0 +1,123 @@
+# GPT-to-MiniMax (G2M)
+
+> Codex 负责高质量规划与最终复核，MiniMax Code 作为 Coding Worker 执行，G2M 负责隔离、权限边界、证据和恢复。
+
+```text
+Codex 想 -> G2M 守 -> MiniMax Code 写 -> G2M 验 -> Codex 判
+```
+
+## 状态
+
+G2M v1.0.0 Coding Orchestrator 已完成：
+
+- `g2m.code-task.v1` 严格任务协议与禁止字段；
+- Workspace Registry、单工作区锁、Clean Worktree 检查；
+- MiniMax Code 0.2.7 Resolver、stream-json Parser、Result Normalizer；
+- Temporary Git Worktree 隔离与 binary-capable patch；
+- Worker / Workspace / Verification 三类证据；
+- 独立 Verification Profile（`execFile`，无 shell）；
+- Event Hash Chain、State Machine、task fingerprint；
+- Review Bundle、六字段绑定、anti-stale / anti-replay；
+- ACCEPT / REVISE / BLOCK；
+- UNKNOWN Resolver 与 RECOVERY_REQUIRED；
+- Windows process-tree cancel、外层 watchdog；
+- `read_only` 任务的真实 diff 强制审计；
+- 可交互 `g2m run` / `g2m review` 命令；
+- 已安装的 `$gpt-to-mmx` Codex Skill。
+
+完整状态见 [_skill/docs/implementation-status.md](/F:/gpt-mmx/_skill/docs/implementation-status.md)，架构基线见 [_skill/docs/GPT-to-MMX-v1-实施计划书.md](/F:/gpt-mmx/_skill/docs/GPT-to-MMX-v1-实施计划书.md)。
+
+## 已验证
+
+```text
+npm run typecheck  -> pass
+npm run build      -> pass
+npm test           -> 329 passed / 5 skipped (334 total)
+npm audit          -> 0 vulnerabilities
+```
+
+默认跳过的 5 条会消耗 MiniMax 额度，已在本机分别显式运行通过：
+
+- 真实 mcode 只读 Adapter Smoke；
+- 真实 mcode 修改并修复 failing test 的完整 Engine E2E；
+- `smart` / `full` / `off` 三种 permission 写入行为。
+
+CLI 的 run -> review pending -> bound BLOCK -> completed 交接也在默认测试中通过。
+
+## 使用
+
+要求 Node.js >= 22.19、Git，以及已登录可用的 `mcode`。
+
+```powershell
+npm install
+npm run build
+npm run g2m -- probe --config <g2m.config.json>
+```
+
+本地配置可从 [examples/g2m.config.example.json](/F:/gpt-mmx/examples/g2m.config.example.json) 开始。任务、review 和 findings 文件应放在目标仓库外，例如 `.tmp/handoffs/<task-id>/`。
+
+启动执行并等待 Codex 复核：
+
+```powershell
+npm run g2m -- run --config <config.json> --task <task.json> --review <review.json>
+```
+
+看到 `g2m.review.pending` 后，读取输出的 `review-bundle.json`，再生成绑定决定：
+
+```powershell
+npm run g2m -- review --bundle <review-bundle.json> --decision ACCEPT --output <review.json> --findings-file <findings.txt>
+```
+
+原 `run` 进程读取 review 文件后完成 ACCEPT / REVISE / BLOCK。ACCEPT 只把冻结补丁作为未提交改动应用到主工作区；不会 commit、push 或 merge。
+
+## Codex Skill
+
+Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](/F:/gpt-mmx/_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
+
+```text
+C:\Users\zhq\.codex\skills\gpt-to-mmx
+  -> F:\gpt-mmx\_skill\gpt-to-mmx
+```
+
+以后可直接说：
+
+> 使用 `$gpt-to-mmx`，由你规划和复核，把编码执行交给 MiniMax Code。
+
+## 安全边界
+
+- `smart`、`full`、`off` 在本机 headless 实测中都能写文件；它们不是只读 sandbox。
+- G2M 的可执行文件边界来自临时 worktree、capability diff audit、独立 verification 和 Codex review。
+- `requested_capabilities.network=false` 目前是传给 Worker 的策略与提示约束，不是操作系统级网络沙箱。
+- 验证失败不能 ACCEPT。
+- UNKNOWN 不得自动重试；G2M 转入 RECOVERY_REQUIRED 并保留隔离现场。
+- REVISE 会创建新 task ID 并保留隔离 worktree；当前 v1 不自动执行下一轮 revision。
+
+## 目录
+
+```text
+src/
+├── cli/                       本地 config、run/review CLI
+├── protocol/                  Task schema、validator、hash
+├── policy/                    Permission / Verification Profile
+├── workspace/                 Registry、Lock、Baseline、Temporary Worktree
+├── evidence/                  Diff、Verification、Evidence Store
+├── events/                    Event types、Hash Chain Store、Replay、Reducer
+├── execution/                 State Machine、Fingerprint、Execution Engine
+├── review/                    Bundle、Ingress、Replay Guard
+├── recovery/                  UNKNOWN / RECOVERY_REQUIRED Resolver
+└── workers/mcode/             Resolver、Adapter、Parser、Normalizer
+
+_skill/
+├── docs/                      架构、Probe、实施状态与复评
+└── gpt-to-mmx/                可安装 Codex Skill
+```
+
+## v1 范围结论
+
+ACP 已复评为当前闭环不需要；Agent Team 暂无稳定 External Interface，因此 v1 不接入。详见 [_skill/docs/phase12-13-evaluation.md](/F:/gpt-mmx/_skill/docs/phase12-13-evaluation.md)。
+
+```text
+Plans cross the boundary as data.
+Results cross the boundary as evidence.
+Commands never cross the boundary.
+```

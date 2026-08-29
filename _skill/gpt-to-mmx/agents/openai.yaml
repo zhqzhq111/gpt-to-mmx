@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT to MiniMax"
+  short_description: "让 Codex 规划复核，MiniMax Code 隔离执行"
+  default_prompt: "Use $gpt-to-mmx to delegate this coding task to MiniMax Code and review the verified result."
