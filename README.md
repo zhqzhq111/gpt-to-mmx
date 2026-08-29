@@ -56,6 +56,8 @@ npm run g2m -- probe --config <g2m.config.json>
 
 本地配置可从 [examples/g2m.config.example.json](/F:/gpt-mmx/examples/g2m.config.example.json) 开始。任务、review 和 findings 文件应放在目标仓库外，例如 `.tmp/handoffs/<task-id>/`。
 
+可选的 `state_root` 用于保存跨进程恢复所需的事件、证据、指纹和 Review 防重放状态；未配置时默认使用 `<artifact_root>/state`。
+
 启动执行并等待 Codex 复核：
 
 ```powershell
@@ -69,6 +71,12 @@ npm run g2m -- review --bundle <review-bundle.json> --decision ACCEPT --output <
 ```
 
 原 `run` 进程读取 review 文件后完成 ACCEPT / REVISE / BLOCK。ACCEPT 只把冻结补丁作为未提交改动应用到主工作区；不会 commit、push 或 merge。
+
+如果 `run` 进程在执行中断，可使用以下命令读取持久化状态并进行恢复裁定。`--process-status` 必须由外部进程监管者如实提供：
+
+```powershell
+npm run g2m -- recover --config <config.json> --execution-id <execution-id> --process-status crashed
+```
 
 ## Codex Skill
 
@@ -91,6 +99,7 @@ C:\Users\zhq\.codex\skills\gpt-to-mmx
 - 验证失败不能 ACCEPT。
 - UNKNOWN 不得自动重试；G2M 转入 RECOVERY_REQUIRED 并保留隔离现场。
 - REVISE 会创建新 task ID 并保留隔离 worktree；当前 v1 不自动执行下一轮 revision。
+- ACCEPT 使用 `review.accept.prepared`、`patch.applied`、`review.accept.completed` 三阶段事件；恢复时只会对账已冻结 patch，不会自动重试未知结果。
 
 ## 最近修复
 

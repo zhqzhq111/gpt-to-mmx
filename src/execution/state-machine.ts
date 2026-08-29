@@ -32,6 +32,8 @@ export type TaskState =
   | "VERIFYING"
   | "EXECUTION_SUCCEEDED"
   | "REVIEW_PENDING"
+  | "ACCEPT_PREPARED"
+  | "PATCH_APPLIED"
   // Terminal
   | "REVISION_REQUESTED"
   | "ACCEPTED"
@@ -52,6 +54,8 @@ export const ACTIVE_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
   "VERIFYING",
   "EXECUTION_SUCCEEDED",
   "REVIEW_PENDING",
+  "ACCEPT_PREPARED",
+  "PATCH_APPLIED",
 ]);
 
 export const TERMINAL_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
@@ -147,9 +151,18 @@ const TRANSITIONS: Readonly<
     "recovery.required": "RECOVERY_REQUIRED",
   },
   REVIEW_PENDING: {
+    "review.accept.prepared": "ACCEPT_PREPARED",
     "review.decision.accept": "ACCEPTED",
     "review.decision.revise": "REVISION_REQUESTED",
     "review.decision.block": "BLOCKED",
+    "recovery.required": "RECOVERY_REQUIRED",
+  },
+  ACCEPT_PREPARED: {
+    "patch.applied": "PATCH_APPLIED",
+    "recovery.required": "RECOVERY_REQUIRED",
+  },
+  PATCH_APPLIED: {
+    "review.accept.completed": "ACCEPTED",
     "recovery.required": "RECOVERY_REQUIRED",
   },
   // Terminal states:no outgoing edges

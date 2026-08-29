@@ -16,11 +16,13 @@ import {
 } from "../../src/execution/state-machine.js";
 
 describe("TaskState sets", () => {
-  it("ACTIVE_STATES contains 10 active states", () => {
-    expect(ACTIVE_STATES.size).toBe(10);
+  it("ACTIVE_STATES contains the ACCEPT transaction states", () => {
+    expect(ACTIVE_STATES.size).toBe(12);
     expect(ACTIVE_STATES.has("PLANNED")).toBe(true);
     expect(ACTIVE_STATES.has("RUNNING")).toBe(true);
     expect(ACTIVE_STATES.has("REVIEW_PENDING")).toBe(true);
+    expect(ACTIVE_STATES.has("ACCEPT_PREPARED")).toBe(true);
+    expect(ACTIVE_STATES.has("PATCH_APPLIED")).toBe(true);
   });
 
   it("TERMINAL_STATES contains 7 terminal states, including RECOVERY_REQUIRED", () => {
@@ -45,11 +47,11 @@ describe("TaskState sets", () => {
     expect(allStates.includes("UNKNOWN" as TaskState)).toBe(false);
   });
 
-  it("isActive / isTerminal are complements for the 17 states", () => {
+  it("isActive / isTerminal are complements for all states", () => {
     const allStates: TaskState[] = [
       "PLANNED", "VALIDATING", "READY", "WAITING_WORKSPACE_LOCK",
       "SPAWNING_AGENT", "RUNNING", "COLLECTING_EVIDENCE", "VERIFYING",
-      "EXECUTION_SUCCEEDED", "REVIEW_PENDING",
+      "EXECUTION_SUCCEEDED", "REVIEW_PENDING", "ACCEPT_PREPARED", "PATCH_APPLIED",
       "REVISION_REQUESTED", "ACCEPTED", "BLOCKED",
       "FAILED", "TIMED_OUT", "CANCELLED", "RECOVERY_REQUIRED",
     ];
@@ -60,6 +62,12 @@ describe("TaskState sets", () => {
 });
 
 describe("nextState (plan §41 transitions)", () => {
+  it("supports the crash-recoverable ACCEPT transaction", () => {
+    expect(nextState("REVIEW_PENDING", "review.accept.prepared")).toBe("ACCEPT_PREPARED");
+    expect(nextState("ACCEPT_PREPARED", "patch.applied")).toBe("PATCH_APPLIED");
+    expect(nextState("PATCH_APPLIED", "review.accept.completed")).toBe("ACCEPTED");
+  });
+
   it("happy path: PLANNED → VALIDATING → READY → ... → ACCEPTED", () => {
     const path: Array<[TaskState, Parameters<typeof nextState>[1], TaskState]> = [
       ["PLANNED", "task.validation.started", "VALIDATING"],

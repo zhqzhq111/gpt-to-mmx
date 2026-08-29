@@ -35,6 +35,7 @@ describeWindows("G2M CLI handoff E2E", () => {
     const root = await mkdtemp(join(tmpdir(), "g2m-cli-e2e-"));
     const repo = join(root, "repo");
     const artifacts = join(root, "artifacts");
+    const state = join(root, "state");
     const worktrees = join(root, "worktrees");
     const reviewPath = join(root, "review.json");
     const configPath = join(root, "config.json");
@@ -74,6 +75,7 @@ describeWindows("G2M CLI handoff E2E", () => {
           verification_profiles: [],
           worktree_root: worktrees,
           artifact_root: artifacts,
+          state_root: state,
           mcode_path: mockPath,
           review_timeout_ms: 20_000,
         }),
@@ -137,6 +139,9 @@ describeWindows("G2M CLI handoff E2E", () => {
       ) as { state: string; patchStatus: string };
       expect(outcome).toMatchObject({ state: "BLOCKED", patchStatus: "discarded" });
       expect(await git(repo, ["status", "--porcelain"])).toBe("");
+      expect((await readdir(join(state, "events"))).length).toBeGreaterThan(0);
+      expect((await readdir(join(state, "evidence"))).length).toBeGreaterThan(0);
+      expect((await readFile(join(state, "replay-guard.json"), "utf8")).trim()).not.toBe("");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

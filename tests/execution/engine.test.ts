@@ -261,6 +261,11 @@ describe("G2MExecutionEngine", () => {
 
     expect(completed.state).toBe("ACCEPTED");
     expect(completed.patchStatus).toBe("applied");
+    expect(eventStore.getByTaskId(task.task_id).slice(-3).map((event) => event.type)).toEqual([
+      "review.accept.prepared",
+      "patch.applied",
+      "review.accept.completed",
+    ]);
     expect((await readFile(join(repositoryPath, "source.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("fixed\n");
     await expect(stat(pending.worktree.worktreePath)).rejects.toBeTruthy();
   });
@@ -285,7 +290,7 @@ describe("G2MExecutionEngine", () => {
     });
 
     expect(replayGuard.size()).toBe(0);
-    expect(eventStore.getByTaskId(task.task_id).at(-1)?.type).toBe("review.requested");
+    expect(eventStore.getByTaskId(task.task_id).at(-1)?.type).toBe("review.accept.prepared");
     expect(await readFile(join(repositoryPath, "source.txt"), "utf8")).toMatch(/^broken\r?\n$/);
     await expect(stat(pending.worktree.worktreePath)).resolves.toBeTruthy();
   });

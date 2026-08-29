@@ -22,8 +22,11 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { mkdirSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { sha256 } from "../protocol/hash.js";
+import { appendJsonLine, readJsonLines } from "../persistence/durable-state.js";
 import type { WorkerResult } from "../workers/coding-worker.js";
 import type { DiffResult } from "./diff.js";
 import type { WorkspaceBaseline } from "../workspace/baseline.js";
@@ -62,8 +65,24 @@ export type Evidence =
   | WorkspaceEvidence
   | VerificationEvidence;
 
+function evidenceContentHash(evidence: Evidence): string {
+  switch (evidence.type) {
+    case "worker":
+      return sha256({
+        workerResult: evidence.workerResult,
+        ...(evidence.rawEventLogRef !== undefined
+          ? { rawEventLogRef: evidence.rawEventLogRef }
+          : {}),
+      });
+    case "workspace":
+      return sha256({ diff: evidence.diff, baseline: evidence.baseline });
+    case "verification":
+      return sha256({ verification: evidence.verification });
+  }
+}
+
 export class EvidenceStoreError extends Error {
-  readonly code: "DUPLICATE_EVIDENCE_ID" | "EVIDENCE_NOT_FOUND";
+  readonly code: "DUPLICATE_EVIDENCE_ID" | "EVIDENCE_NOT_FOUND" | "PERSISTENCE_FAILED";
   constructor(
     code: EvidenceStoreError["code"],
     message: string,
@@ -87,27 +106,61 @@ function newEvidenceId(type: EvidenceType): string {
   return `${type}-${randomUUID()}`;
 }
 
+export interface EvidenceStoreOptions {
+  readonly directory?: string;
+}
+
 export class EvidenceStore {
   private readonly byId = new Map<string, Evidence>();
   // 次级索引。浅引用,值更新跟 byId 同步。
   private readonly byExecution = new Map<string, Evidence[]>();
   private readonly byTask = new Map<string, Evidence[]>();
+  private readonly directory: string | undefined;
+
+  constructor(options: EvidenceStoreOptions = {}) {
+    this.directory = options.directory;
+    if (this.directory === undefined) return;
+
+    mkdirSync(this.directory, { recursive: true });
+    const files = readdirSync(this.directory)
+      .filter((file) => file.endsWith(".jsonl"))
+      .sort();
+    for (const file of files) {
+      for (const evidence of readJsonLines<Evidence>(join(this.directory, file))) {
+        this.putInternal(evidence, false);
+      }
+    }
+  }
 
   /**
    * 放入一个 evidence。evidenceId 重复抛 DUPLICATE_EVIDENCE_ID。
    * 返回入参本身,方便链式调用。
    */
   put<E extends Evidence>(evidence: E): E {
+    this.putInternal(evidence, true);
+    return evidence;
+  }
+
+  private putInternal<E extends Evidence>(evidence: E, persist: boolean): void {
     if (this.byId.has(evidence.evidenceId)) {
       throw new EvidenceStoreError(
         "DUPLICATE_EVIDENCE_ID",
         `evidenceId "${evidence.evidenceId}" already in store`,
       );
     }
+    if (evidenceContentHash(evidence) !== evidence.contentHash) {
+      throw new EvidenceStoreError(
+        "PERSISTENCE_FAILED",
+        `evidence "${evidence.evidenceId}" failed content hash validation`,
+      );
+    }
+    if (persist && this.directory !== undefined) {
+      const path = join(this.directory, `${encodeURIComponent(evidence.executionId)}.jsonl`);
+      appendJsonLine(path, evidence);
+    }
     this.byId.set(evidence.evidenceId, evidence);
     appendToIndex(this.byExecution, evidence.executionId, evidence);
     appendToIndex(this.byTask, evidence.taskId, evidence);
-    return evidence;
   }
 
   get(evidenceId: string): Evidence | undefined {

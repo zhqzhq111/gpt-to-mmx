@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 
 import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { EvidenceStore } from "../evidence/store.js";
 import { EventStore } from "../events/store.js";
+import { collectDiff } from "../evidence/diff.js";
 import { G2MExecutionEngine, G2MExecutionEngineError } from "../execution/engine.js";
-import { FingerprintRegistry } from "../execution/fingerprint.js";
+import { fingerprintHash, FingerprintRegistry } from "../execution/fingerprint.js";
 import { ProfileRegistry } from "../policy/verification.js";
+import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
 import { MCodeAdapter } from "../workers/mcode/adapter.js";
 import { WorkspaceLock } from "../workspace/lock.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
+import { captureBaseline } from "../workspace/baseline.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
 import { createReviewForBundle, writeJsonAtomic } from "./review-file.js";
 
@@ -63,6 +66,8 @@ function configureEngine(
   readonly engine: G2MExecutionEngine;
   readonly eventStore: EventStore;
   readonly evidenceStore: EvidenceStore;
+  readonly fingerprintRegistry: FingerprintRegistry;
+  readonly replayGuard: ReplayGuard;
   readonly worker: MCodeAdapter;
 } {
   const workspaceRegistry = new WorkspaceRegistry();
@@ -84,23 +89,39 @@ function configureEngine(
       registeredAt: 0,
     });
   }
-  const eventStore = new EventStore();
-  const evidenceStore = new EvidenceStore();
+  const stateRoot = stateRootForConfig(config);
+  const eventStore = new EventStore({ logDirectory: join(stateRoot, "events") });
+  const evidenceStore = new EvidenceStore({ directory: join(stateRoot, "evidence") });
+  const fingerprintRegistry = new FingerprintRegistry({
+    statePath: join(stateRoot, "fingerprints.json"),
+  });
+  const replayGuard = new ReplayGuard({ statePath: join(stateRoot, "replay-guard.json") });
   const engine = new G2MExecutionEngine({
     workspaceRegistry,
     workspaceLock: new WorkspaceLock(),
     profileRegistry,
     evidenceStore,
     eventStore,
-    fingerprintRegistry: new FingerprintRegistry(),
-    replayGuard: new ReplayGuard(),
+    fingerprintRegistry,
+    replayGuard,
     worker,
     workerRuntime: { runtime: "mcode", version: workerVersion, model: "configured" },
     adapterContractVersion: "g2m-worker-v1",
     worktreeRoot: config.worktree_root,
     artifactRoot: config.artifact_root,
   });
-  return { engine, eventStore, evidenceStore, worker };
+  return {
+    engine,
+    eventStore,
+    evidenceStore,
+    fingerprintRegistry,
+    replayGuard,
+    worker,
+  };
+}
+
+function stateRootForConfig(config: G2MLocalConfig): string {
+  return config.state_root ?? resolve(config.artifact_root, "state");
 }
 
 async function waitForReview(path: string, timeoutMs: number): Promise<Review> {
@@ -196,6 +217,196 @@ async function reviewCommand(options: ReadonlyMap<string, string>): Promise<void
   emit({ type: "g2m.review.written", review_path: outputPath, decision });
 }
 
+function parseProcessStatus(value: string): ProcessStatus {
+  const allowed: readonly ProcessStatus[] = [
+    "alive",
+    "exited_clean",
+    "exited_error",
+    "crashed",
+    "unknown",
+  ];
+  if (!allowed.includes(value as ProcessStatus)) {
+    throw new Error("--process-status must be one of: " + allowed.join(", "));
+  }
+  return value as ProcessStatus;
+}
+
+async function recoverCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  const config = await loadConfig(resolve(required(options, "config")));
+  const executionId = required(options, "execution-id");
+  const processStatus = parseProcessStatus(required(options, "process-status"));
+  const worker = new MCodeAdapter();
+  const { eventStore, evidenceStore, fingerprintRegistry, replayGuard } = configureEngine(
+    config,
+    worker,
+    "recovery",
+  );
+  const events = eventStore.getByAttemptId(executionId);
+  if (events.length === 0) throw new Error("no persisted execution found: " + executionId);
+  const taskEvent = events.find((event) => event.type === "task.created");
+  const task = taskEvent?.payload["task"];
+  if (task === undefined || typeof task !== "object" || task === null) {
+    throw new Error("execution " + executionId + " has no persisted task payload");
+  }
+  const taskId = (task as { task_id?: unknown }).task_id;
+  const workspaceId = (task as { workspace_scope?: { workspace_id?: unknown } }).workspace_scope?.workspace_id;
+  if (typeof taskId !== "string" || typeof workspaceId !== "string") {
+    throw new Error("execution " + executionId + " has an invalid persisted task payload");
+  }
+  const workspace = config.workspaces.find((entry) => entry.workspace_id === workspaceId);
+  if (workspace === undefined) throw new Error("workspace not found in config: " + workspaceId);
+
+  const executionEvidence = evidenceStore.getByExecution(executionId);
+  const workerEvidence = executionEvidence.find((entry) => entry.type === "worker");
+  const workspaceEvidence = executionEvidence.find((entry) => entry.type === "workspace");
+  const fingerprintEvent = [...events]
+    .reverse()
+    .find((event) => event.fingerprint !== undefined);
+  const frozen = fingerprintRegistry.get(taskId);
+  const fingerprintMatch =
+    fingerprintEvent?.fingerprint !== undefined &&
+    frozen !== undefined &&
+    fingerprintHash(fingerprintEvent.fingerprint) === fingerprintHash(frozen);
+  const currentBaseline = await captureBaseline(workspace.path);
+
+  const bundlePath = resolve(config.artifact_root, executionId, "review-bundle.json");
+  const bundle = await readJson(bundlePath).catch(() => undefined) as
+    | {
+        workspaceEvidence?: {
+          diff?: { diffHash?: unknown };
+          patch?: { patchHash?: unknown };
+        };
+      }
+    | undefined;
+  const prepared = events.find((event) => event.type === "review.accept.prepared");
+  const patchApplied = events.find((event) => event.type === "patch.applied");
+  const completed = events.find((event) => event.type === "review.accept.completed");
+  if ((prepared !== undefined || patchApplied !== undefined) && completed === undefined) {
+    const preparedPatchHash = prepared?.payload["patchHash"];
+    const expectedDiffHash = bundle?.workspaceEvidence?.diff?.diffHash;
+    const expectedPatchHash = bundle?.workspaceEvidence?.patch?.patchHash;
+    const expectedBaseRevision =
+      workspaceEvidence?.type === "workspace"
+        ? workspaceEvidence.diff.baseRevision
+        : undefined;
+    const targetDiff =
+      expectedBaseRevision !== undefined &&
+      currentBaseline.baseRevision === expectedBaseRevision
+        ? await collectDiff(workspace.path, expectedBaseRevision)
+        : undefined;
+    const targetMatches =
+      processStatus !== "alive" &&
+      processStatus !== "unknown" &&
+      targetDiff !== undefined &&
+      typeof expectedDiffHash === "string" &&
+      targetDiff.diffHash === expectedDiffHash &&
+      typeof expectedPatchHash === "string" &&
+      preparedPatchHash === expectedPatchHash;
+    if (targetMatches) {
+      if (patchApplied === undefined) {
+        eventStore.append({
+          taskId,
+          attemptId: executionId,
+          type: "patch.applied",
+          payload: {
+            patchHash: expectedPatchHash,
+            status: "reconciled",
+            targetPath: workspace.path,
+          },
+          ...(frozen !== undefined ? { fingerprint: frozen } : {}),
+        });
+      }
+      const reviewId = prepared?.payload["reviewId"];
+      const reviewBundleId = prepared?.payload["reviewBundleId"];
+      const reviewHash = prepared?.payload["reviewHash"];
+      if (
+        typeof reviewId !== "string" ||
+        typeof reviewBundleId !== "string" ||
+        typeof reviewHash !== "string"
+      ) {
+        throw new Error("prepared ACCEPT event has incomplete review binding");
+      }
+      if (replayGuard.get(reviewBundleId) === undefined) {
+        replayGuard.record({
+          reviewId,
+          reviewBundleId,
+          reviewHash,
+          decision: "ACCEPT",
+        });
+      }
+      eventStore.append({
+        taskId,
+        attemptId: executionId,
+        type: "review.accept.completed",
+        payload: { reviewId, reviewBundleId, reviewHash },
+        ...(frozen !== undefined ? { fingerprint: frozen } : {}),
+      });
+      emit({
+        type: "g2m.recovery.resolved",
+        execution_id: executionId,
+        task_id: taskId,
+        verdict: "RECOVERY_RECONCILED",
+        reason: "ACCEPT transaction matched the frozen patch on disk",
+        suggestedNextState: "ACCEPTED",
+        safeToRetry: false,
+        safeToResume: false,
+        canAutoContinueNextTask: true,
+      });
+      return;
+    }
+
+    const reason =
+      "ACCEPT transaction is incomplete and the target repository does not match the frozen patch";
+    if (!events.some((event) => event.type === "recovery.required")) {
+      eventStore.append({
+        taskId,
+        attemptId: executionId,
+        type: "recovery.required",
+        payload: { reason },
+        ...(frozen !== undefined ? { fingerprint: frozen } : {}),
+      });
+    }
+    emit({
+      type: "g2m.recovery.resolved",
+      execution_id: executionId,
+      task_id: taskId,
+      verdict: "UNKNOWN",
+      reason,
+      suggestedNextState: "RECOVERY_REQUIRED",
+      safeToRetry: false,
+      safeToResume: false,
+      canAutoContinueNextTask: false,
+    });
+    return;
+  }
+
+  const resolution = resolveRecovery({
+    currentState: null,
+    events,
+    processStatus,
+    workerResult: workerEvidence?.type === "worker" ? workerEvidence.workerResult : null,
+    diff: workspaceEvidence?.type === "workspace" ? workspaceEvidence.diff : null,
+    fingerprintMatch,
+    workspaceDirty: currentBaseline.dirty,
+  });
+
+  if (resolution.verdict === "UNKNOWN") {
+    eventStore.append({
+      taskId,
+      attemptId: executionId,
+      type: "recovery.required",
+      payload: { reason: resolution.reason },
+      ...(frozen !== undefined ? { fingerprint: frozen } : {}),
+    });
+  }
+  emit({
+    type: "g2m.recovery.resolved",
+    execution_id: executionId,
+    task_id: taskId,
+    ...resolution,
+  });
+}
+
 async function probeCommand(options: ReadonlyMap<string, string>): Promise<void> {
   const config = await loadConfig(required(options, "config"));
   const previousMCodePath = process.env["G2M_MCODE_PATH"];
@@ -216,6 +427,7 @@ function printHelp(): void {
       "Commands:",
       "  g2m probe  --config <g2m.config.json>",
       "  g2m run    --config <config> --task <task.json> --review <review.json>",
+      "  g2m recover --config <config> --execution-id <id> --process-status <status>",
       "  g2m review --bundle <review-bundle.json> --decision <ACCEPT|REVISE|BLOCK>",
       "             --output <review.json> [--findings-file <path>] [--new-task-id <id>]",
       "",
@@ -231,6 +443,9 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       return;
     case "review":
       await reviewCommand(parsed.options);
+      return;
+    case "recover":
+      await recoverCommand(parsed.options);
       return;
     case "probe":
       await probeCommand(parsed.options);

@@ -28,6 +28,7 @@ import { validateCodeTask } from "../protocol/schema-validator.js";
 import { buildReviewBundle, type ReviewBundle, type WorkerRuntimeInfo } from "../review/bundle.js";
 import {
   applyReview as applyBoundReview,
+  reviewSignature,
   validateReview,
   type Review,
 } from "../review/ingress.js";
@@ -201,7 +202,7 @@ export class G2MExecutionEngine {
       taskId: task.task_id,
       executionId,
       type: "task.created",
-      payload: { protocolVersion: task.protocol_version },
+      payload: { protocolVersion: task.protocol_version, task },
     });
     this.appendAndReduce(mutable, {
       taskId: task.task_id,
@@ -586,29 +587,64 @@ export class G2MExecutionEngine {
       } as const;
       const validation = validateReview(review, pending.bundle, reviewContext);
       let patchStatus: CompletedReviewExecution["patchStatus"];
+      let newState: CompletedReviewExecution["state"];
       if (review.decision === "ACCEPT") {
+        const transaction: MutableExecutionState = { state: pending.state };
+        this.appendAndReduce(transaction, {
+          taskId: review.taskId,
+          executionId: review.executionId,
+          type: "review.accept.prepared",
+          payload: {
+            reviewId: review.reviewId,
+            reviewBundleId: review.reviewBundleId,
+            reviewHash: review.reviewHash,
+            patchHash: pending.patch.patchHash,
+          },
+          fingerprint: pending.fingerprint,
+        });
         const appliedPatch = await applyAcceptedPatch(
           pending.worktree,
           pending.patch,
           pending.worktree.repositoryPath,
         );
         patchStatus = appliedPatch.status;
+        this.appendAndReduce(transaction, {
+          taskId: review.taskId,
+          executionId: review.executionId,
+          type: "patch.applied",
+          payload: {
+            patchHash: appliedPatch.patchHash,
+            status: appliedPatch.status,
+            targetPath: appliedPatch.targetPath,
+          },
+          fingerprint: pending.fingerprint,
+        });
+        this.options.replayGuard.record(reviewSignature(review));
+        this.appendAndReduce(transaction, {
+          taskId: review.taskId,
+          executionId: review.executionId,
+          type: "review.accept.completed",
+          payload: {
+            reviewId: review.reviewId,
+            reviewBundleId: review.reviewBundleId,
+            reviewHash: review.reviewHash,
+          },
+          fingerprint: pending.fingerprint,
+        });
+        newState = "ACCEPTED";
       } else if (review.decision === "BLOCK") {
         await removeTemporaryWorktree(pending.worktree);
         patchStatus = "discarded";
+        newState = "BLOCKED";
       } else {
         patchStatus = "retained_for_revision";
+        newState = "REVISION_REQUESTED";
       }
-      const appliedReview = applyBoundReview(review, pending.bundle, reviewContext);
-      const newState = appliedReview.newState;
+      if (review.decision !== "ACCEPT") {
+        applyBoundReview(review, pending.bundle, reviewContext);
+      }
       if (review.decision === "ACCEPT") {
         await removeTemporaryWorktree(pending.worktree);
-      }
-      if (validation.kind === "idempotent" && appliedReview.kind !== "idempotent") {
-        throw new G2MExecutionEngineError(
-          "UNKNOWN_PENDING_EXECUTION",
-          "review validation changed before the decision was recorded",
-        );
       }
       this.pending.delete(pending.bundle.bundleId);
 

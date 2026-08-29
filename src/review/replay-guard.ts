@@ -15,6 +15,7 @@
  */
 
 import type { ReviewDecision } from "./ingress.js";
+import { readJsonFile, writeJsonAtomic } from "../persistence/durable-state.js";
 
 export interface AppliedReview {
   readonly reviewId: string;
@@ -44,8 +45,32 @@ export interface ReviewSignature {
   readonly decision: ReviewDecision;
 }
 
+export interface ReplayGuardOptions {
+  readonly statePath?: string;
+}
+
 export class ReplayGuard {
   private readonly applied = new Map<string, AppliedReview>();
+  private readonly statePath: string | undefined;
+
+  constructor(options: ReplayGuardOptions = {}) {
+    this.statePath = options.statePath;
+    if (this.statePath === undefined) return;
+    const loaded = readJsonFile<Record<string, AppliedReview>>(this.statePath);
+    if (loaded === undefined) return;
+    for (const [bundleId, review] of Object.entries(loaded)) {
+      if (
+        typeof bundleId !== "string" ||
+        typeof review.reviewId !== "string" ||
+        typeof review.reviewHash !== "string" ||
+        typeof review.decision !== "string" ||
+        typeof review.appliedAt !== "number"
+      ) {
+        throw new Error(`invalid replay guard entry for bundle "${bundleId}"`);
+      }
+      this.applied.set(bundleId, review);
+    }
+  }
 
   /**
    * 检查 review 是否可以应用。
@@ -73,12 +98,18 @@ export class ReplayGuard {
    * 记录一个已应用的 review。覆盖前不检查 — 调用方(check 之后)负责保证合法性。
    */
   record(review: ReviewSignature, appliedAt: number = Date.now()): void {
-    this.applied.set(review.reviewBundleId, {
+    const applied: AppliedReview = {
       reviewId: review.reviewId,
       reviewHash: review.reviewHash,
       decision: review.decision,
       appliedAt,
-    });
+    };
+    if (this.statePath !== undefined) {
+      const next = Object.fromEntries(this.applied.entries());
+      next[review.reviewBundleId] = applied;
+      writeJsonAtomic(this.statePath, next);
+    }
+    this.applied.set(review.reviewBundleId, applied);
   }
 
   /**

@@ -17,6 +17,7 @@
  */
 
 import { sha256 } from "../protocol/hash.js";
+import { readJsonFile, writeJsonAtomic } from "../persistence/durable-state.js";
 
 export interface TaskFingerprint {
   readonly taskHash: string;
@@ -90,6 +91,10 @@ interface FrozenFingerprint {
   readonly frozenAt: number;
 }
 
+export interface FingerprintRegistryOptions {
+  readonly statePath?: string;
+}
+
 /**
  * 已冻结 fingerprint 的内存 registry。
  * 跟 WorkspaceRegistry / ProfileRegistry 一致,跟 fingerprint 一起放 execution/。
@@ -98,6 +103,20 @@ interface FrozenFingerprint {
  */
 export class FingerprintRegistry {
   private readonly frozen = new Map<string, FrozenFingerprint>();
+  private readonly statePath: string | undefined;
+
+  constructor(options: FingerprintRegistryOptions = {}) {
+    this.statePath = options.statePath;
+    if (this.statePath === undefined) return;
+    const loaded = readJsonFile<Record<string, FrozenFingerprint>>(this.statePath);
+    if (loaded === undefined) return;
+    for (const [taskId, value] of Object.entries(loaded)) {
+      if (typeof value.frozenAt !== "number" || value.fingerprint === undefined) {
+        throw new Error(`invalid fingerprint entry for task "${taskId}"`);
+      }
+      this.frozen.set(taskId, value);
+    }
+  }
 
   /**
    * 冻结一个 task 的 fingerprint。二次 freeze 抛 ALREADY_FROZEN,
@@ -110,10 +129,16 @@ export class FingerprintRegistry {
         `fingerprint for task "${taskId}" already frozen`,
       );
     }
-    this.frozen.set(taskId, {
+    const frozen: FrozenFingerprint = {
       fingerprint,
       frozenAt: Date.now(),
-    });
+    };
+    if (this.statePath !== undefined) {
+      const next = Object.fromEntries(this.frozen.entries());
+      next[taskId] = frozen;
+      writeJsonAtomic(this.statePath, next);
+    }
+    this.frozen.set(taskId, frozen);
     return fingerprint;
   }
 
@@ -130,6 +155,11 @@ export class FingerprintRegistry {
    * 本轮 reducer 不调用,只暴露给将来的 recovery 流程。
    */
   reset(taskId: string): void {
+    if (this.statePath !== undefined) {
+      const next = Object.fromEntries(this.frozen.entries());
+      delete next[taskId];
+      writeJsonAtomic(this.statePath, next);
+    }
     this.frozen.delete(taskId);
   }
 

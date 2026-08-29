@@ -29,6 +29,7 @@ const LocalConfigSchema = z
     verification_profiles: z.array(VerificationProfileConfigSchema),
     worktree_root: absolutePath,
     artifact_root: absolutePath,
+    state_root: absolutePath.optional(),
     mcode_path: absolutePath.optional(),
     review_timeout_ms: z.number().int().positive().default(1_800_000),
   })

@@ -43,6 +43,9 @@ export type TaskEventType =
   | "verification.failed"
   // Review
   | "review.requested"
+  | "review.accept.prepared"
+  | "patch.applied"
+  | "review.accept.completed"
   | "review.decision.accept"
   | "review.decision.revise"
   | "review.decision.block"

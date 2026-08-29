@@ -19,10 +19,13 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { mkdirSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { sha256 } from "../protocol/hash.js";
 import type { TaskFingerprint } from "../execution/fingerprint.js";
 import type { TaskEvent, TaskEventPayload, TaskEventType } from "./events.js";
+import { appendJsonLine, readJsonLines } from "../persistence/durable-state.js";
 
 /**
  * EventStore.append 的输入。seq / prevHash / hash 由 store 自动填。
@@ -40,7 +43,7 @@ export interface TaskEventInput {
 }
 
 export class EventStoreError extends Error {
-  readonly code: "PREV_HASH_MISMATCH" | "HASH_MISMATCH";
+  readonly code: "PREV_HASH_MISMATCH" | "HASH_MISMATCH" | "PERSISTENCE_FAILED";
   constructor(
     code: EventStoreError["code"],
     message: string,
@@ -78,15 +81,45 @@ export interface ChainVerificationResult {
   readonly reason?: "PREV_HASH_MISMATCH" | "HASH_MISMATCH";
 }
 
+export interface EventStoreOptions {
+  readonly logDirectory?: string;
+}
+
 export class EventStore {
   private readonly events: TaskEvent[] = [];
+  private readonly logDirectory: string | undefined;
+
+  constructor(options: EventStoreOptions = {}) {
+    this.logDirectory = options.logDirectory;
+    if (this.logDirectory === undefined) return;
+
+    mkdirSync(this.logDirectory, { recursive: true });
+    const files = readdirSync(this.logDirectory)
+      .filter((file) => file.endsWith(".jsonl"))
+      .sort();
+    for (const file of files) {
+      const path = join(this.logDirectory, file);
+      const loaded = readJsonLines<TaskEvent>(path);
+      const verification = verifyChain(loaded);
+      if (!verification.valid) {
+        throw new EventStoreError(
+          "PERSISTENCE_FAILED",
+          `event log chain is invalid in ${path} at sequence ${verification.brokenAtSeq ?? "unknown"}`,
+        );
+      }
+      this.events.push(...loaded);
+    }
+  }
 
   /**
    * Append 一个事件。seq / prevHash / hash 自动填。
    * 返回填好 metadata 的完整事件。
    */
   append(input: TaskEventInput): TaskEvent {
-    const prev = this.events[this.events.length - 1];
+    const attemptEvents = this.logDirectory === undefined
+      ? this.events
+      : this.events.filter((event) => event.attemptId === input.attemptId);
+    const prev = attemptEvents[attemptEvents.length - 1];
     const seq = prev ? prev.seq + 1 : 1;
     const prevHash: string | null = prev ? prev.hash : null;
     const partial: Omit<TaskEvent, "hash"> = {
@@ -104,6 +137,10 @@ export class EventStore {
     };
     const hash = computeEventHash(partial);
     const event: TaskEvent = { ...partial, hash };
+    if (this.logDirectory !== undefined) {
+      const path = join(this.logDirectory, `${encodeURIComponent(input.attemptId)}.jsonl`);
+      appendJsonLine(path, event);
+    }
     this.events.push(event);
     return event;
   }

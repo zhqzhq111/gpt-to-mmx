@@ -233,7 +233,7 @@ function eventTypeFromDecision(decision: ReviewDecision): TaskEventType {
   }
 }
 
-function toSignature(review: Review): ReviewSignature {
+export function reviewSignature(review: Review): ReviewSignature {
   return {
     reviewId: review.reviewId,
     reviewBundleId: review.reviewBundleId,
@@ -253,7 +253,7 @@ export function validateReview(
   bundle: ReviewBundle,
   context: ValidateReviewContext,
 ): ValidateReviewResult {
-  const guardCheck = context.replayGuard.check(toSignature(review));
+  const guardCheck = context.replayGuard.check(reviewSignature(review));
   if (guardCheck.kind === "idempotent") {
     return {
       kind: "idempotent",
@@ -393,7 +393,7 @@ export function applyReview(
   });
 
   // 6. Record to guard
-  context.replayGuard.record(toSignature(review));
+  context.replayGuard.record(reviewSignature(review));
 
   return {
     kind: "applied",

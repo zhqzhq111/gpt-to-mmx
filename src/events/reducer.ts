@@ -49,6 +49,9 @@ const FINGERPRINT_TRANSITION_EVENTS = new Set<string>([
   "review.decision.accept",
   "review.decision.revise",
   "review.decision.block",
+  "review.accept.prepared",
+  "patch.applied",
+  "review.accept.completed",
 ]);
 
 /**
