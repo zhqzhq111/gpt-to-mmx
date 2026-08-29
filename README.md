@@ -106,6 +106,10 @@ C:\Users\zhq\.codex\skills\gpt-to-mmx
 - diff 指纹现在基于规范化的工作区文件内容，不会因新增文件从未跟踪变为已暂存而误报 worktree 变化。
 - 独立验证完成后会重新采集最终 diff，验证过程中生成的文件会进入 review evidence 和冻结 patch。
 
+## G2M v2 Phase 0
+
+v2 的十项持久化、恢复、证据一致性、跨进程协调和存储契约已冻结于 [Phase 0 Spec Freeze](/F:/gpt-mmx/docs/v2/phase-0-spec-freeze.md)。未完成该规范对应的评审前，不进入 v2 Phase 1 实现。
+
 ## 目录
 
 ```text
