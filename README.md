@@ -108,7 +108,7 @@ C:\Users\zhq\.codex\skills\gpt-to-mmx
 
 ## G2M v2 Phase 0
 
-v2 的十项持久化、恢复、证据一致性、跨进程协调和存储契约已冻结于 [Phase 0 Spec Freeze](/F:/gpt-mmx/docs/v2/phase-0-spec-freeze.md)。未完成该规范对应的评审前，不进入 v2 Phase 1 实现。
+v2 的十项持久化、恢复、证据一致性、跨进程协调和存储契约已冻结于 [Phase 0 Spec Freeze](docs/v2/phase-0-spec-freeze.md)。未完成该规范对应的评审前，不进入 v2 Phase 1 实现。
 
 ## 目录
 
