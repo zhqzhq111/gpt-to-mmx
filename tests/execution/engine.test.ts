@@ -239,7 +239,7 @@ describe("G2MExecutionEngine", () => {
 
     expect(pending.bundle.workspaceEvidence.diff.changedFiles).toContainEqual({
       path: "verification.log",
-      status: "?",
+      status: "A",
     });
   });
 

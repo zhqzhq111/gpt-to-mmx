@@ -86,6 +86,16 @@ function makeBaseline(overrides: Partial<WorkspaceBaseline> = {}): WorkspaceBase
   };
 }
 
+function makePatch() {
+  return {
+    baseRevision: "HEAD",
+    patchHash: "p".repeat(64),
+    patchText: "diff --git a/a.ts b/a.ts\n+new\n",
+    changedFiles: ["a.ts"],
+    empty: false,
+  };
+}
+
 function makeVerification(
   overrides: Partial<VerificationResult> = {},
 ): VerificationResult {
@@ -117,6 +127,7 @@ function makeInput(overrides: Partial<BuildBundleInput> = {}): BuildBundleInput 
     workspaceEvidence: {
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
     },
     verificationEvidence: { verification: makeVerification() },
     workerRuntime: { runtime: "mcode", version: "0.2.7", model: "minimax/MiniMax-M3" },
@@ -128,6 +139,11 @@ describe("buildReviewBundle", () => {
   it("sets protocolVersion to g2m.code-review-bundle.v1", () => {
     const bundle = buildReviewBundle(makeInput());
     expect(bundle.protocolVersion).toBe(REVIEW_BUNDLE_PROTOCOL_VERSION);
+  });
+
+  it("includes the frozen patch content used for review", () => {
+    const bundle = buildReviewBundle(makeInput());
+    expect(bundle.workspaceEvidence.patch).toEqual(makePatch());
   });
 
   it("auto-generates bundleId if not provided", () => {
@@ -186,12 +202,14 @@ describe("computeResultHash (plan §45 binding)", () => {
       workerSummary: makeWorkerResult(),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     const b = computeResultHash({
       workerSummary: makeWorkerResult(),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     expect(a).toBe(b);
@@ -203,12 +221,14 @@ describe("computeResultHash (plan §45 binding)", () => {
       workerSummary: makeWorkerResult(),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     const modified = computeResultHash({
       workerSummary: makeWorkerResult({ summary: "different" }),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     expect(baseline).not.toBe(modified);
@@ -219,12 +239,14 @@ describe("computeResultHash (plan §45 binding)", () => {
       workerSummary: makeWorkerResult(),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     const modified = computeResultHash({
       workerSummary: makeWorkerResult(),
       diff: makeDiff({ fullDiff: "different" }),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     expect(baseline).not.toBe(modified);
@@ -235,12 +257,14 @@ describe("computeResultHash (plan §45 binding)", () => {
       workerSummary: makeWorkerResult(),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification(),
     });
     const modified = computeResultHash({
       workerSummary: makeWorkerResult(),
       diff: makeDiff(),
       baseline: makeBaseline(),
+      patch: makePatch(),
       verification: makeVerification({ status: "failed" }),
     });
     expect(baseline).not.toBe(modified);
@@ -293,6 +317,7 @@ describe("buildReviewBundle — auto warnings", () => {
         workspaceEvidence: {
           diff: makeDiff({ protectedFilesTouched: ["tests/foo.test.ts"] }),
           baseline: makeBaseline(),
+          patch: makePatch(),
         },
       }),
     );
@@ -311,6 +336,7 @@ describe("buildReviewBundle — auto warnings", () => {
             ],
           }),
           baseline: makeBaseline(),
+          patch: makePatch(),
         },
       }),
     );

@@ -151,7 +151,17 @@ function makeBundleInput(task: CodeTaskV1): BuildBundleInput {
     taskHash: taskHash(task),
     executionId: EXECUTION_ID,
     workerSummary: makeWorkerResult(),
-    workspaceEvidence: { diff: makeDiff(), baseline: makeBaseline() },
+    workspaceEvidence: {
+      diff: makeDiff(),
+      baseline: makeBaseline(),
+      patch: {
+        baseRevision: "HEAD",
+        patchHash: "p".repeat(64),
+        patchText: "diff --git a/a.ts b/a.ts\n+new\n",
+        changedFiles: ["a.ts"],
+        empty: false,
+      },
+    },
     verificationEvidence: { verification: makeVerification() },
     workerRuntime: { runtime: "mcode", version: "0.2.7", model: "minimax/MiniMax-M3" },
   };

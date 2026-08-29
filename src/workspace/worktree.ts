@@ -38,6 +38,7 @@ export interface WorktreePatch {
   readonly worktreeId: string;
   readonly baseRevision: string;
   readonly patchPath: string;
+  readonly patchText: string;
   readonly patchHash: string;
   readonly changedFiles: readonly string[];
   readonly empty: boolean;
@@ -240,6 +241,7 @@ export async function collectWorktreePatch(
     worktreeId: handle.worktreeId,
     baseRevision: handle.baseRevision,
     patchPath,
+    patchText,
     patchHash,
     changedFiles: Object.freeze(changedFiles),
     empty: patchText.length === 0,

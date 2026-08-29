@@ -31,6 +31,14 @@ import type { DiffResult } from "../evidence/diff.js";
 import type { WorkspaceBaseline } from "../workspace/baseline.js";
 import type { VerificationResult } from "../evidence/verification.js";
 
+export interface FrozenPatchEvidence {
+  readonly baseRevision: string;
+  readonly patchHash: string;
+  readonly patchText: string;
+  readonly changedFiles: readonly string[];
+  readonly empty: boolean;
+}
+
 export const REVIEW_BUNDLE_PROTOCOL_VERSION = "g2m.code-review-bundle.v1" as const;
 
 export type WorkerRuntimeName = "mcode" | "fake" | "unknown";
@@ -57,6 +65,7 @@ export interface ReviewBundle {
   readonly workspaceEvidence: {
     readonly diff: DiffResult;
     readonly baseline: WorkspaceBaseline;
+    readonly patch: FrozenPatchEvidence;
   };
   readonly verificationEvidence: {
     readonly verification: VerificationResult;
@@ -73,6 +82,7 @@ export interface BuildBundleInput {
   readonly workspaceEvidence: {
     readonly diff: DiffResult;
     readonly baseline: WorkspaceBaseline;
+    readonly patch: FrozenPatchEvidence;
   };
   readonly verificationEvidence: {
     readonly verification: VerificationResult;
@@ -90,12 +100,14 @@ export function computeResultHash(input: {
   readonly workerSummary: WorkerResult;
   readonly diff: DiffResult;
   readonly baseline: WorkspaceBaseline;
+  readonly patch: FrozenPatchEvidence;
   readonly verification: VerificationResult;
 }): string {
   return sha256({
     workerSummary: input.workerSummary,
     diff: input.diff,
     baseline: input.baseline,
+    patch: input.patch,
     verification: input.verification,
   });
 }
@@ -175,6 +187,7 @@ export function buildReviewBundle(input: BuildBundleInput): ReviewBundle {
     workerSummary: input.workerSummary,
     diff: input.workspaceEvidence.diff,
     baseline: input.workspaceEvidence.baseline,
+    patch: input.workspaceEvidence.patch,
     verification: input.verificationEvidence.verification,
   });
   const warnings = deriveWarnings(

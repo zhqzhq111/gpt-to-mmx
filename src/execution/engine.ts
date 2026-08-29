@@ -438,6 +438,7 @@ export class G2MExecutionEngine {
         verification,
       );
 
+      const patch = await collectWorktreePatch(worktree, this.options.artifactRoot);
       const diff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
       recordWorkspaceEvidence(
         this.options.evidenceStore,
@@ -484,13 +485,22 @@ export class G2MExecutionEngine {
         );
       }
 
-      const patch = await collectWorktreePatch(worktree, this.options.artifactRoot);
       const bundle = buildReviewBundle({
         task,
         taskHash: stableTaskHash,
         executionId,
         workerSummary: workerResult,
-        workspaceEvidence: { diff, baseline },
+        workspaceEvidence: {
+          diff,
+          baseline,
+          patch: {
+            baseRevision: patch.baseRevision,
+            patchHash: patch.patchHash,
+            patchText: patch.patchText,
+            changedFiles: patch.changedFiles,
+            empty: patch.empty,
+          },
+        },
         verificationEvidence: { verification },
         workerRuntime: this.options.workerRuntime,
       });
