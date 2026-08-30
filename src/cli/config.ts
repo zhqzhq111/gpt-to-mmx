@@ -33,6 +33,35 @@ const WorkspaceLeaseConfigSchema = z
   })
   .strict();
 
+const MAX_RUNTIME_BYTES = 1_073_741_824;
+const MAX_RUNTIME_EVENTS = 1_000_000;
+const MAX_RUNTIME_DURATION_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export const DEFAULT_RUNTIME_HARDENING = {
+  max_worker_stdout_bytes: 33_554_432,
+  max_worker_stderr_bytes: 8_388_608,
+  max_stream_json_line_bytes: 4_194_304,
+  max_worker_events: 100_000,
+  max_verification_stdout_bytes: 16_777_216,
+  max_verification_stderr_bytes: 16_777_216,
+  max_probe_output_bytes: 2_097_152,
+  repair_reclaim_guard_stale_ms: 30_000,
+} as const;
+
+const RuntimeHardeningConfigSchema = z
+  .object({
+    max_worker_stdout_bytes: z.number().int().positive().max(MAX_RUNTIME_BYTES).default(DEFAULT_RUNTIME_HARDENING.max_worker_stdout_bytes),
+    max_worker_stderr_bytes: z.number().int().positive().max(MAX_RUNTIME_BYTES).default(DEFAULT_RUNTIME_HARDENING.max_worker_stderr_bytes),
+    max_stream_json_line_bytes: z.number().int().positive().max(MAX_RUNTIME_BYTES).default(DEFAULT_RUNTIME_HARDENING.max_stream_json_line_bytes),
+    max_worker_events: z.number().int().positive().max(MAX_RUNTIME_EVENTS).default(DEFAULT_RUNTIME_HARDENING.max_worker_events),
+    max_verification_stdout_bytes: z.number().int().positive().max(MAX_RUNTIME_BYTES).default(DEFAULT_RUNTIME_HARDENING.max_verification_stdout_bytes),
+    max_verification_stderr_bytes: z.number().int().positive().max(MAX_RUNTIME_BYTES).default(DEFAULT_RUNTIME_HARDENING.max_verification_stderr_bytes),
+    max_probe_output_bytes: z.number().int().positive().max(MAX_RUNTIME_BYTES).default(DEFAULT_RUNTIME_HARDENING.max_probe_output_bytes),
+    repair_reclaim_guard_stale_ms: z.number().int().positive().max(MAX_RUNTIME_DURATION_MS).default(DEFAULT_RUNTIME_HARDENING.repair_reclaim_guard_stale_ms),
+  })
+  .strict()
+  .default(DEFAULT_RUNTIME_HARDENING);
+
 const StoragePolicySchema = z.object({
   min_free_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.min_free_bytes),
   safety_margin_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.safety_margin_bytes),
@@ -55,6 +84,8 @@ const LocalConfigSchema = z
     state_root: absolutePath.optional(),
     workspace_lease: WorkspaceLeaseConfigSchema.optional(),
     storage: StoragePolicySchema.default(DEFAULT_STORAGE_POLICY),
+    runtime_hardening: RuntimeHardeningConfigSchema,
+    mcode_model: z.string().min(1).optional(),
     mcode_path: absolutePath.optional(),
     review_timeout_ms: z.number().int().positive().default(1_800_000),
   })

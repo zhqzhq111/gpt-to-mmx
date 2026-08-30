@@ -17,6 +17,7 @@ function config(root: string): G2MLocalConfig {
     workspaces: [{ workspace_id: "ws-1", path: join(root, "workspace") }],
     verification_profiles: [], worktree_root: join(root, "worktrees"), artifact_root: join(root, "artifacts"), state_root: join(root, "state"),
     storage: { min_free_bytes: 0, safety_margin_bytes: 0, default_execution_reservation_bytes: 100, max_total_bytes: 0, max_artifact_bytes: 0, max_worktree_bytes: 0, completed_retention_days: 30, reservation_ttl_ms: 60_000, monitor_interval_ms: 1_000 },
+    runtime_hardening: { max_worker_stdout_bytes: 33_554_432, max_worker_stderr_bytes: 8_388_608, max_stream_json_line_bytes: 4_194_304, max_worker_events: 100_000, max_verification_stdout_bytes: 16_777_216, max_verification_stderr_bytes: 16_777_216, max_probe_output_bytes: 2_097_152, repair_reclaim_guard_stale_ms: 30_000 },
     review_timeout_ms: 60_000,
   };
 }
