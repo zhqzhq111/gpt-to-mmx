@@ -42,6 +42,20 @@ export interface ProjectionFailure {
   readonly reason: string;
 }
 
+/**
+ * Plan §35 / §40. Partial ACCEPT executions are intentionally deferred to
+ * the Accept Reconciler instead of being auto-transitioned to
+ * RECOVERY_REQUIRED. The startup report carries the affected workspaces so
+ * the CLI can refuse new runs on the same workspace.
+ */
+export type PartialAcceptKind = "PREPARED" | "APPLY_STARTED" | "APPLIED";
+
+export interface AcceptRecoveryBlockedWorkspace {
+  readonly workspaceId: string;
+  readonly executionId: string;
+  readonly partialAcceptKind: PartialAcceptKind;
+}
+
 export interface StartupRecoveryReport {
   readonly detectedCases: number;
   /** Execution IDs intentionally left for explicit recovery handling. */
@@ -50,6 +64,13 @@ export interface StartupRecoveryReport {
   readonly alreadyHeldExecutionIds: readonly string[];
   readonly reportOnlyIssues: readonly RecoveryIssue[];
   readonly projectionFailures: readonly ProjectionFailure[];
+  /**
+   * Workspaces blocked by an unresolved partial ACCEPT execution. New G2M
+   * runs against one of these workspaces must refuse with
+   * `WORKSPACE_ACCEPT_RECOVERY_REQUIRED` until the operator runs
+   * `g2m recover --execution-id ...`.
+   */
+  readonly acceptRecoveryBlockedWorkspaces: readonly AcceptRecoveryBlockedWorkspace[];
 }
 
 function issueSort(left: RecoveryIssue, right: RecoveryIssue): number {
@@ -111,6 +132,31 @@ function hasRecoveryRequired(events: readonly TaskEvent[]): boolean {
   return events.some((event) => event.type === "recovery.required");
 }
 
+function derivePartialAcceptKind(
+  state: TaskState,
+  events: readonly TaskEvent[],
+): PartialAcceptKind {
+  if (state === "ACCEPT_PREPARED") {
+    return events.some((event) => event.type === "patch.apply.started")
+      ? "APPLY_STARTED"
+      : "PREPARED";
+  }
+  if (state === "PATCH_APPLIED") return "APPLIED";
+  throw new Error(`derivePartialAcceptKind called with non-partial state: ${state}`);
+}
+
+function workspaceIdFromEvents(
+  events: readonly TaskEvent[],
+): string | undefined {
+  const taskEvent = events.find((event) => event.type === "task.created");
+  if (taskEvent === undefined) return undefined;
+  const task = taskEvent.payload["task"];
+  if (!task || typeof task !== "object") return undefined;
+  const scope = (task as { workspace_scope?: { workspace_id?: unknown } }).workspace_scope;
+  if (scope === undefined) return undefined;
+  return typeof scope.workspace_id === "string" ? scope.workspace_id : undefined;
+}
+
 function fingerprintMatches(
   summary: RecoveryExecutionSummary,
   fingerprintRegistry: FingerprintRegistry,
@@ -137,6 +183,7 @@ export function runStartupRecovery(options: StartupRecoveryOptions): StartupReco
   const transitionedExecutionIds: string[] = [];
   const alreadyHeldExecutionIds: string[] = [];
   const projectionFailures: ProjectionFailure[] = [];
+  const blockedWorkspaces: AcceptRecoveryBlockedWorkspace[] = [];
 
   for (const executionId of executionIds) {
     if (excluded.has(executionId)) continue;
@@ -151,6 +198,24 @@ export function runStartupRecovery(options: StartupRecoveryOptions): StartupReco
       continue;
     }
     if (!summary.appendable || summary.state === null || !isActive(summary.state)) continue;
+
+    // Phase 6 §36-§37: defer partial ACCEPT to the Accept Reconciler.
+    // Do NOT append `recovery.required` — the reconciler will reconcile
+    // (or refuse) once the operator proves the previous process is gone.
+    if (summary.state === "ACCEPT_PREPARED" || summary.state === "PATCH_APPLIED") {
+      const workspaceId = workspaceIdFromEvents([...summary.events, ...persistedEvents]);
+      if (workspaceId !== undefined) {
+        blockedWorkspaces.push({
+          workspaceId,
+          executionId,
+          partialAcceptKind: derivePartialAcceptKind(summary.state, [
+            ...summary.events,
+            ...persistedEvents,
+          ]),
+        });
+      }
+      continue;
+    }
 
     const taskId = summary.taskId ?? summary.events[0]?.taskId;
     if (taskId === undefined) {
@@ -224,5 +289,8 @@ export function runStartupRecovery(options: StartupRecoveryOptions): StartupReco
     alreadyHeldExecutionIds,
     reportOnlyIssues: options.report.issues.filter((issue) => issue.severity === "REPORT_ONLY").slice().sort(issueSort),
     projectionFailures,
+    acceptRecoveryBlockedWorkspaces: blockedWorkspaces.slice().sort((left, right) =>
+      left.workspaceId.localeCompare(right.workspaceId) || left.executionId.localeCompare(right.executionId),
+    ),
   };
 }

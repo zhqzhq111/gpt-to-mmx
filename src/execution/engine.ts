@@ -46,9 +46,10 @@ import { captureBaseline } from "../workspace/baseline.js";
 import { WorkspaceLock, type LockHandle } from "../workspace/lock.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import {
-  applyAcceptedPatch,
+  applyPreflightedPatch,
   collectWorktreePatch,
   createTemporaryWorktree,
+  preflightAcceptedPatch,
   removeTemporaryWorktree,
   type ApplyAcceptedPatchResult,
   type TemporaryWorktreeHandle,
@@ -141,6 +142,84 @@ interface MutableExecutionState {
 function workerSessionPolicy(policy: SessionPolicy): WorkerInvocation["sessionPolicy"] {
   if (policy.mode === "new") return { mode: "new" };
   return { mode: "attach", verifiedSessionId: policy.verified_session_id };
+}
+
+/**
+ * Phase 6: freeze the bound Review JSON as an immutable execution artifact.
+ * Acceptance reads `review.json` to verify Review binding and recover after
+ * a crash between `review.accept.prepared` and the actual apply.
+ */
+async function freezeAcceptReviewArtifact(
+  artifactRoot: string,
+  executionId: string,
+  review: Review,
+): Promise<{ readonly path: string; readonly sha256: string; readonly bytes: number }> {
+  const path = resolve(artifactRoot, executionId, "review.json");
+  const bytes = Buffer.from(`${JSON.stringify(review, null, 2)}\n`, "utf8");
+  return writeImmutableArtifact(path, bytes);
+}
+
+/**
+ * Phase 6 ACCEPT outcome artifact (plan §29). Frozen BEFORE `patch.applied`
+ * so the Journal and the artifact agree on the same result even if the
+ * process dies immediately after writing the Journal line.
+ */
+interface AcceptOutcomeArtifact {
+  readonly schema_version: 1;
+  readonly task_id: string;
+  readonly execution_id: string;
+  readonly decision: "ACCEPT";
+  readonly state: "ACCEPTED";
+  readonly patch_status: "applied" | "no_changes";
+  readonly patch_blob_hash: string;
+  readonly change_set_hash: string;
+  readonly review_id: string;
+  readonly review_bundle_id: string;
+}
+
+function buildAcceptOutcome(
+  taskId: string,
+  executionId: string,
+  review: Review,
+  applied: ApplyAcceptedPatchResult,
+): AcceptOutcomeArtifact {
+  return {
+    schema_version: 1,
+    task_id: taskId,
+    execution_id: executionId,
+    decision: "ACCEPT",
+    state: "ACCEPTED",
+    patch_status: applied.status,
+    patch_blob_hash: applied.patchBlobHash,
+    change_set_hash: applied.expectedChangeSetHash,
+    review_id: review.reviewId,
+    review_bundle_id: review.reviewBundleId,
+  };
+}
+
+/**
+ * Phase 6: freeze the ACCEPT apply-evidence artifact (plan §27). Schema is
+ * deterministic so Normal Path and Recovery Path generate the same bytes
+ * for the same inputs.
+ */
+function buildApplyEvidence(
+  executionId: string,
+  baseRevision: string,
+  applied: ApplyAcceptedPatchResult,
+  recoveryMode: boolean,
+): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    execution_id: executionId,
+    patch_blob_hash: applied.patchBlobHash,
+    expected_change_set_hash: applied.expectedChangeSetHash,
+    actual_change_set_hash: applied.actualChangeSetHash,
+    base_revision: baseRevision,
+    target_path: applied.targetPath,
+    status: applied.status,
+    recovery_mode: recoveryMode,
+    applied_at: applied.appliedAt,
+  };
 }
 
 function buildWorkerPrompt(task: CodeTaskV1): string {
@@ -647,6 +726,16 @@ export class G2MExecutionEngine {
       let newState: CompletedReviewExecution["state"];
       if (review.decision === "ACCEPT") {
         const transaction: MutableExecutionState = { state: pending.state };
+        // Phase 6 §8: freeze `review.json` BEFORE any other accept evidence so
+        // the recovery scanner always has the bound Review bytes available.
+        const reviewArtifact = await freezeAcceptReviewArtifact(
+          this.options.artifactRoot,
+          pending.executionId,
+          review,
+        );
+        // Phase 6 §9: enriched review.accept.prepared binding (Review +
+        // Review Artifact + Patch + Base Revision). CRITICAL flush happens
+        // inside `appendAndReduce`.
         this.appendAndReduce(transaction, {
           taskId: review.taskId,
           executionId: review.executionId,
@@ -655,29 +744,86 @@ export class G2MExecutionEngine {
             reviewId: review.reviewId,
             reviewBundleId: review.reviewBundleId,
             reviewHash: review.reviewHash,
+            review_artifact_path: "review.json",
+            review_artifact_hash: reviewArtifact.sha256,
             patch_blob_hash: pending.patch.patchBlobHash,
             change_set_hash: pending.patch.changeSetHash,
+            base_revision: pending.worktree.baseRevision,
           },
           fingerprint: pending.fingerprint,
         });
-        const appliedPatch = await applyAcceptedPatch(
+        // Phase 6 §11: preflight does NOT mutate the Git workspace. After
+        // this call we may safely append `patch.apply.started` to the
+        // Journal before doing the real apply.
+        const preflight = await preflightAcceptedPatch(
           pending.worktree,
           pending.patch,
           pending.worktree.repositoryPath,
         );
+        // Phase 6 §6 / §7: `patch.apply.started` is a CRITICAL lifecycle
+        // event. Its payload binds the Frozen Patch, expected change set,
+        // base revision, and Review triple so the recovery scanner can
+        // confirm "what was about to be applied" after any crash.
+        this.appendAndReduce(transaction, {
+          taskId: review.taskId,
+          executionId: review.executionId,
+          type: "patch.apply.started",
+          payload: {
+            patch_blob_hash: preflight.patchBlobHash,
+            change_set_hash: preflight.expectedChangeSetHash,
+            base_revision: preflight.baseRevision,
+            review_id: review.reviewId,
+            review_bundle_id: review.reviewBundleId,
+            review_hash: review.reviewHash,
+          },
+          fingerprint: pending.fingerprint,
+        });
+        // Phase 6 §12: real apply. `preflight.patchBytes` is already
+        // validated so this is the only place we touch the target.
+        const appliedPatch = await applyPreflightedPatch(preflight);
         patchStatus = appliedPatch.status;
-        const applyEvidence = {
-          patch_blob_hash: appliedPatch.patchBlobHash,
-          expected_change_set_hash: appliedPatch.expectedChangeSetHash,
-          actual_change_set_hash: appliedPatch.actualChangeSetHash,
-          target_path: appliedPatch.targetPath,
-          status: appliedPatch.status,
-          applied_at: appliedPatch.appliedAt,
-        };
+        // Phase 6 §27: apply-evidence.json is immutable evidence of the
+        // post-apply state. `recovery_mode=false` because we are on the
+        // normal path; the Recovery Path writes the same schema with
+        // `recovery_mode=true` (see Phase 6 Task 3).
         const applyEvidenceArtifact = await writeImmutableArtifact(
           resolve(this.options.artifactRoot, pending.executionId, "apply-evidence.json"),
-          Buffer.from(`${JSON.stringify(applyEvidence, null, 2)}\n`, "utf8"),
+          Buffer.from(
+            `${JSON.stringify(
+              buildApplyEvidence(
+                pending.executionId,
+                preflight.baseRevision,
+                appliedPatch,
+                false,
+              ),
+              null,
+              2,
+            )}\n`,
+            "utf8",
+          ),
         );
+        // Phase 6 §28-§29: outcome.json is the deterministic result
+        // descriptor. Frozen BEFORE `patch.applied` so a crash immediately
+        // after the Journal line still leaves the artifact on disk.
+        const outcomeArtifact = await writeImmutableArtifact(
+          resolve(this.options.artifactRoot, pending.executionId, "outcome.json"),
+          Buffer.from(
+            `${JSON.stringify(
+              buildAcceptOutcome(
+                pending.task.task_id,
+                pending.executionId,
+                review,
+                appliedPatch,
+              ),
+              null,
+              2,
+            )}\n`,
+            "utf8",
+          ),
+        );
+        // Phase 6 §30: `patch.applied` payload now binds both the
+        // apply-evidence hash and the outcome hash so recovery can verify
+        // the post-apply invariant without re-running anything.
         this.appendAndReduce(transaction, {
           taskId: review.taskId,
           executionId: review.executionId,
@@ -687,12 +833,15 @@ export class G2MExecutionEngine {
             expected_change_set_hash: appliedPatch.expectedChangeSetHash,
             actual_change_set_hash: appliedPatch.actualChangeSetHash,
             apply_evidence_hash: applyEvidenceArtifact.sha256,
+            outcome_hash: outcomeArtifact.sha256,
             status: appliedPatch.status,
             targetPath: appliedPatch.targetPath,
           },
           fingerprint: pending.fingerprint,
         });
-        this.options.replayGuard.record(reviewSignature(review));
+        // Phase 6 §31: review.accept.completed is the terminal commit
+        // point. Its payload binds the full result so the Journal is
+        // self-sufficient for recovery.
         this.appendAndReduce(transaction, {
           taskId: review.taskId,
           executionId: review.executionId,
@@ -701,9 +850,17 @@ export class G2MExecutionEngine {
             reviewId: review.reviewId,
             reviewBundleId: review.reviewBundleId,
             reviewHash: review.reviewHash,
+            patch_blob_hash: appliedPatch.patchBlobHash,
+            change_set_hash: appliedPatch.expectedChangeSetHash,
+            apply_evidence_hash: applyEvidenceArtifact.sha256,
+            outcome_hash: outcomeArtifact.sha256,
           },
           fingerprint: pending.fingerprint,
         });
+        // Phase 6 §32: ReplayGuard is a derived anti-replay cache. It
+        // MUST never lead the Journal — record only after
+        // review.accept.completed is durable.
+        this.options.replayGuard.record(reviewSignature(review));
         newState = "ACCEPTED";
       } else if (review.decision === "BLOCK") {
         await removeTemporaryWorktree(pending.worktree);
@@ -714,6 +871,22 @@ export class G2MExecutionEngine {
         newState = "REVISION_REQUESTED";
       }
       if (review.decision !== "ACCEPT") {
+        // Phase 6 §28: outcome.json is the immutable terminal descriptor,
+        // frozen BEFORE the decision event so the Journal and the artifact
+        // agree on the same result. For REVISE / BLOCK the binding does not
+        // carry the Frozen Patch triple — only the decision summary.
+        const terminalOutcome = {
+          schema_version: 1,
+          task_id: pending.task.task_id,
+          execution_id: pending.executionId,
+          decision: review.decision,
+          state: newState,
+          patch_status: patchStatus,
+        };
+        await writeImmutableArtifact(
+          resolve(this.options.artifactRoot, pending.executionId, "outcome.json"),
+          Buffer.from(`${JSON.stringify(terminalOutcome, null, 2)}\n`, "utf8"),
+        );
         const applied = applyBoundReview(review, pending.bundle, reviewContext);
         if (applied.kind === "applied") {
           this.projectDurable(applied.event, applied.newState);

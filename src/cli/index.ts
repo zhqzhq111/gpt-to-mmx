@@ -5,22 +5,25 @@ import { join, resolve } from "node:path";
 
 import { EvidenceStore } from "../evidence/store.js";
 import { EventStore } from "../events/store.js";
+import { reduce } from "../events/reducer.js";
 import { G2MExecutionEngine, G2MExecutionEngineError } from "../execution/engine.js";
 import { fingerprintHash, FingerprintRegistry } from "../execution/fingerprint.js";
+import type { TaskState } from "../execution/state-machine.js";
 import { ProfileRegistry } from "../policy/verification.js";
 import { StateDatabase } from "../projection/database.js";
 import { ExecutionProjector } from "../projection/execution-projector.js";
 import { backfillProjection } from "../projection/backfill.js";
+import { runAcceptRecovery, isPartialAccept, type AcceptProcessStatus } from "../recovery/accept-reconciler.js";
 import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
 import { scanRecovery } from "../recovery/scanner.js";
 import { runStartupRecovery } from "../recovery/startup.js";
+import type { TaskEvent } from "../events/events.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
 import { MCodeAdapter } from "../workers/mcode/adapter.js";
 import { WorkspaceLock } from "../workspace/lock.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { captureBaseline } from "../workspace/baseline.js";
-import { computeWorkingTreeChangeSet } from "../workspace/change-set.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
 import { createReviewForBundle, writeJsonAtomic } from "./review-file.js";
 
@@ -238,10 +241,10 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
     const review = await waitForReview(reviewPath, config.review_timeout_ms);
     const completed = await engine.applyReview(pending, review);
     const outcomePath = resolve(runRoot, "outcome.json");
-    await Promise.all([
-      writeJsonAtomic(outcomePath, completed),
-      writeJsonAtomic(eventsPath, eventStore.getByAttemptId(pending.executionId)),
-    ]);
+    // Phase 6 §28: outcome.json is now an immutable execution artifact frozen
+    // by the engine BEFORE `patch.applied` is appended. The CLI no longer
+    // writes it here — it only mirrors the events journal for the caller.
+    await writeJsonAtomic(eventsPath, eventStore.getByAttemptId(pending.executionId));
     emit({ type: "g2m.completed", outcome_path: outcomePath, ...completed });
   } finally {
     eventStoreToClose?.close();
@@ -290,6 +293,21 @@ function parseProcessStatus(value: string): ProcessStatus {
     throw new Error("--process-status must be one of: " + allowed.join(", "));
   }
   return value as ProcessStatus;
+}
+
+function replayAcceptState(
+  events: readonly TaskEvent[],
+  fingerprintRegistry: FingerprintRegistry,
+): TaskState | null {
+  let state: TaskState | null = null;
+  for (const event of events) {
+    try {
+      state = reduce(state, event, { fingerprintRegistry });
+    } catch {
+      return state;
+    }
+  }
+  return state;
 }
 
 async function recoverCommand(options: ReadonlyMap<string, string>): Promise<void> {
@@ -352,115 +370,44 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
   const patchApplied = events.find((event) => event.type === "patch.applied");
   const completed = events.find((event) => event.type === "review.accept.completed");
   if ((prepared !== undefined || patchApplied !== undefined) && completed === undefined) {
-    const preparedPatchHash =
-      prepared?.payload["patch_blob_hash"] ?? prepared?.payload["patchHash"];
-    const expectedPatchHash =
-      bundle?.workspaceEvidence?.patch?.patchBlobHash ??
-      bundle?.workspaceEvidence?.patch?.patchHash;
-    const expectedChangeSetHash = bundle?.workspaceEvidence?.patch?.changeSetHash;
-    const changedFiles = bundle?.workspaceEvidence?.patch?.changedFiles;
-    const expectedBaseRevision =
-      workspaceEvidence?.type === "workspace"
-        ? workspaceEvidence.diff.baseRevision
-        : undefined;
-    const targetChangeSet =
-      expectedBaseRevision !== undefined &&
-      currentBaseline.baseRevision === expectedBaseRevision &&
-      Array.isArray(changedFiles) &&
-      changedFiles.every((path) => typeof path === "string")
-        ? await computeWorkingTreeChangeSet(
-            workspace.path,
-            expectedBaseRevision,
-            changedFiles as string[],
-            resolve(config.artifact_root, executionId),
-          )
-        : undefined;
-    const targetMatches =
-      processStatus !== "alive" &&
-      processStatus !== "unknown" &&
-      targetChangeSet !== undefined &&
-      typeof expectedChangeSetHash === "string" &&
-      targetChangeSet.hash === expectedChangeSetHash &&
-      typeof expectedPatchHash === "string" &&
-      preparedPatchHash === expectedPatchHash;
-    if (targetMatches) {
-      if (patchApplied === undefined) {
-        eventStore.append({
-          taskId,
-          attemptId: executionId,
-          type: "patch.applied",
-          payload: {
-            patch_blob_hash: expectedPatchHash,
-            expected_change_set_hash: expectedChangeSetHash,
-            actual_change_set_hash: targetChangeSet.hash,
-            status: "reconciled",
-            targetPath: workspace.path,
-          },
-          ...(frozen !== undefined ? { fingerprint: frozen } : {}),
-        });
-      }
-      const reviewId = prepared?.payload["reviewId"];
-      const reviewBundleId = prepared?.payload["reviewBundleId"];
-      const reviewHash = prepared?.payload["reviewHash"];
-      if (
-        typeof reviewId !== "string" ||
-        typeof reviewBundleId !== "string" ||
-        typeof reviewHash !== "string"
-      ) {
-        throw new Error("prepared ACCEPT event has incomplete review binding");
-      }
-      if (replayGuard.get(reviewBundleId) === undefined) {
-        replayGuard.record({
-          reviewId,
-          reviewBundleId,
-          reviewHash,
-          decision: "ACCEPT",
-        });
-      }
-      eventStore.append({
-        taskId,
-        attemptId: executionId,
-        type: "review.accept.completed",
-        payload: { reviewId, reviewBundleId, reviewHash },
-        ...(frozen !== undefined ? { fingerprint: frozen } : {}),
+    // Phase 6 Task 4: delegate partial ACCEPT recovery to the Accept
+    // Reconciler (plan §43-§44). It owns resume / reconcile / refuse
+    // based on durable Frozen Patch + Journal + target classification.
+    void bundle; void currentBaseline; void fingerprintEvent; void frozen; void fingerprintMatch;
+    const { ExecutionProjector } = await import("../projection/execution-projector.js");
+    const { runAcceptRecovery, isPartialAccept } = await import("../recovery/accept-reconciler.js");
+    const replayedState = replayAcceptState(events, fingerprintRegistry);
+    if (!isPartialAccept(replayedState)) {
+      // Falls through to the generic recovery resolver below.
+    } else {
+      const projector = new ExecutionProjector(projectionDatabase);
+      const result = await runAcceptRecovery({
+        executionId,
+        processStatus: processStatus as AcceptProcessStatus,
+        events,
+        repositoryPath: workspace.path,
+        artifactRoot: config.artifact_root,
+        temporaryRoot: resolve(config.artifact_root, executionId),
+        eventStore,
+        projector,
+        replayGuard,
+        fingerprintRegistry,
       });
       emit({
         type: "g2m.recovery.resolved",
         execution_id: executionId,
         task_id: taskId,
-        verdict: "RECOVERY_RECONCILED",
-        reason: "ACCEPT transaction matched the frozen patch on disk",
-        suggestedNextState: "ACCEPTED",
-        safeToRetry: false,
-        safeToResume: false,
-        canAutoContinueNextTask: true,
+        verdict: result.verdict,
+        reason: result.reason,
+        target_state: result.targetState,
+        original_state: result.originalState,
+        final_state: result.finalState,
+        appended_events: result.appendedEvents,
+        ...(result.applyEvidenceHash !== undefined ? { apply_evidence_hash: result.applyEvidenceHash } : {}),
+        ...(result.outcomeHash !== undefined ? { outcome_hash: result.outcomeHash } : {}),
       });
       return;
     }
-
-    const reason =
-      "ACCEPT transaction is incomplete and the target repository does not match the frozen patch";
-    if (!events.some((event) => event.type === "recovery.required")) {
-      eventStore.append({
-        taskId,
-        attemptId: executionId,
-        type: "recovery.required",
-        payload: { reason },
-        ...(frozen !== undefined ? { fingerprint: frozen } : {}),
-      });
-    }
-    emit({
-      type: "g2m.recovery.resolved",
-      execution_id: executionId,
-      task_id: taskId,
-      verdict: "UNKNOWN",
-      reason,
-      suggestedNextState: "RECOVERY_REQUIRED",
-      safeToRetry: false,
-      safeToResume: false,
-      canAutoContinueNextTask: false,
-    });
-    return;
   }
 
   const resolution = resolveRecovery({

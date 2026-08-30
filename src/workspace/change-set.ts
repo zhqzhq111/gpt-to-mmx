@@ -136,3 +136,34 @@ export async function computeWorkingTreeChangeSet(
     await rm(indexFile, { force: true }).catch(() => undefined);
   }
 }
+
+/**
+ * Phase 6 full working-tree change set — unlike `computeWorkingTreeChangeSet`
+ * (which only adds the Frozen Patch's declared `changedFiles`), this stages
+ * the entire working tree against the base revision so the recovery scanner
+ * can detect unrelated user edits, partial patch writes, or extra files.
+ *
+ * Used by the Accept Reconciler to verify that "target == reviewed result"
+ * before completing ACCEPT, and to classify `EXACT_EXPECTED_CHANGE_SET` vs
+ * `DIVERGED`. The temporary index file is removed in `finally` and never
+ * touches the real repository index.
+ */
+export async function computeFullWorkingTreeChangeSet(
+  repositoryPath: string,
+  baseRevision: string,
+  temporaryRoot: string,
+): Promise<ChangeSetResult> {
+  const indexFile = join(temporaryRoot, `full-change-set-${randomUUID()}.index`);
+  const options = { indexFile } as const;
+  try {
+    await gitBytes(repositoryPath, ["read-tree", baseRevision], options);
+    // `git add -A` without a pathspec stages every modification in the
+    // working tree, including untracked files, so the resulting index
+    // represents the full diff against `baseRevision` — not just the
+    // Frozen Patch's declared files.
+    await gitBytes(repositoryPath, ["add", "-A"], options);
+    return await computeIndexedChangeSet(repositoryPath, baseRevision, options);
+  } finally {
+    await rm(indexFile, { force: true }).catch(() => undefined);
+  }
+}

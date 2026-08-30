@@ -68,6 +68,33 @@ export interface ApplyAcceptedPatchResult {
   readonly appliedAt: number;
 }
 
+/**
+ * Phase 6 preflight — all the read-only checks the engine must complete
+ * BEFORE emitting a durable `patch.apply.started` event. The target Git
+ * workspace is NOT mutated by this function. After preflight succeeds, the
+ * caller is expected to:
+ *
+ *   1. `eventStore.append({ type: "patch.apply.started", ... })` so a crash
+ *      mid-apply can be reconciled against the Frozen Patch.
+ *   2. Call `applyPreflightedPatch(preflight)` to perform the actual apply.
+ *
+ * The preflight result is immutable and carries everything `applyPreflightedPatch`
+ * needs (including the already-read patch bytes), so the two calls can be
+ * separated by Journal writes without re-reading the patch artifact.
+ */
+export interface AcceptedPatchPreflight {
+  readonly repositoryPath: string;
+  readonly baseRevision: string;
+  readonly patchPath: string;
+  readonly patchBlobHash: string;
+  readonly expectedChangeSetHash: string;
+  readonly changedFiles: readonly string[];
+  readonly patchBytes: Buffer;
+  readonly targetPath: string;
+  /** Directory where the temporary `git index` file lives for change-set computation. */
+  readonly temporaryRoot: string;
+}
+
 export class TemporaryWorktreeError extends Error {
   readonly code:
     | "INVALID_INPUT"
@@ -300,11 +327,11 @@ export async function collectWorktreePatch(
   });
 }
 
-export async function applyAcceptedPatch(
+export async function preflightAcceptedPatch(
   handle: TemporaryWorktreeHandle,
   patch: WorktreePatch,
   targetPath: string,
-): Promise<ApplyAcceptedPatchResult> {
+): Promise<AcceptedPatchPreflight> {
   const patchBytes = await readFile(patch.patchPath).catch((error) => {
     throw new TemporaryWorktreeError("PATCH_FAILED", "cannot read patch artifact", error);
   });
@@ -349,57 +376,104 @@ export async function applyAcceptedPatch(
     );
   }
 
-  if (patch.empty) {
+  return Object.freeze({
+    repositoryPath: targetRoot,
+    baseRevision: handle.baseRevision,
+    patchPath: patch.patchPath,
+    patchBlobHash: patch.patchBlobHash,
+    expectedChangeSetHash: patch.changeSetHash,
+    changedFiles: patch.changedFiles,
+    patchBytes: Buffer.from(patchBytes),
+    targetPath: targetRoot,
+    temporaryRoot: dirname(patch.patchPath),
+  });
+}
+
+/**
+ * Phase 6 apply — runs `git apply --check` / `git apply` and computes the
+ * full working-tree change set. Caller MUST have emitted
+ * `patch.apply.started` to the Journal BEFORE calling this; recovery
+ * assumes the event is durable so it can distinguish
+ * "apply never started" from "apply succeeded, journal tail missing".
+ */
+export async function applyPreflightedPatch(
+  preflight: AcceptedPatchPreflight,
+): Promise<ApplyAcceptedPatchResult> {
+  if (preflight.changedFiles.length === 0) {
+    // No changes expected: verify the working tree is still CLEAN_BASE.
     const actualChangeSet = await computeWorkingTreeChangeSet(
-      targetRoot,
-      patch.baseRevision,
-      patch.changedFiles,
-      dirname(patch.patchPath),
+      preflight.repositoryPath,
+      preflight.baseRevision,
+      preflight.changedFiles,
+      preflight.temporaryRoot,
     );
-    if (actualChangeSet.hash !== patch.changeSetHash) {
+    if (actualChangeSet.hash !== preflight.expectedChangeSetHash) {
       throw new TemporaryWorktreeError(
         "PATCH_RESULT_MISMATCH",
-        `empty patch result hash ${actualChangeSet.hash} differs from expected ${patch.changeSetHash}`,
+        `empty patch result hash ${actualChangeSet.hash} differs from expected ${preflight.expectedChangeSetHash}`,
       );
     }
     return Object.freeze({
       status: "no_changes",
-      targetPath: targetRoot,
-      patchHash: patch.patchBlobHash,
-      patchBlobHash: patch.patchBlobHash,
-      expectedChangeSetHash: patch.changeSetHash,
+      targetPath: preflight.targetPath,
+      patchHash: preflight.patchBlobHash,
+      patchBlobHash: preflight.patchBlobHash,
+      expectedChangeSetHash: preflight.expectedChangeSetHash,
       actualChangeSetHash: actualChangeSet.hash,
-      changedFiles: patch.changedFiles,
+      changedFiles: preflight.changedFiles,
       appliedAt: Date.now(),
     });
   }
 
-  await git(targetRoot, ["apply", "--check", "--binary", patch.patchPath], "APPLY_CHECK_FAILED");
-  await git(targetRoot, ["apply", "--binary", patch.patchPath], "APPLY_FAILED");
+  await git(
+    preflight.repositoryPath,
+    ["apply", "--check", "--binary", preflight.patchPath],
+    "APPLY_CHECK_FAILED",
+  );
+  await git(
+    preflight.repositoryPath,
+    ["apply", "--binary", preflight.patchPath],
+    "APPLY_FAILED",
+  );
 
   const actualChangeSet = await computeWorkingTreeChangeSet(
-    targetRoot,
-    patch.baseRevision,
-    patch.changedFiles,
-    dirname(patch.patchPath),
+    preflight.repositoryPath,
+    preflight.baseRevision,
+    preflight.changedFiles,
+    preflight.temporaryRoot,
   );
-  if (actualChangeSet.hash !== patch.changeSetHash) {
+  if (actualChangeSet.hash !== preflight.expectedChangeSetHash) {
     throw new TemporaryWorktreeError(
       "PATCH_RESULT_MISMATCH",
-      `applied change set hash ${actualChangeSet.hash} differs from expected ${patch.changeSetHash}`,
+      `applied change set hash ${actualChangeSet.hash} differs from expected ${preflight.expectedChangeSetHash}`,
     );
   }
 
   return Object.freeze({
     status: "applied",
-    targetPath: targetRoot,
-    patchHash: patch.patchBlobHash,
-    patchBlobHash: patch.patchBlobHash,
-    expectedChangeSetHash: patch.changeSetHash,
+    targetPath: preflight.targetPath,
+    patchHash: preflight.patchBlobHash,
+    patchBlobHash: preflight.patchBlobHash,
+    expectedChangeSetHash: preflight.expectedChangeSetHash,
     actualChangeSetHash: actualChangeSet.hash,
-    changedFiles: patch.changedFiles,
+    changedFiles: preflight.changedFiles,
     appliedAt: Date.now(),
   });
+}
+
+/**
+ * Backward-compatible wrapper — runs preflight + apply as a single call.
+ * Engine ACCEPT path should normally split this into preflight + a
+ * `patch.apply.started` event + apply, but the legacy combined entry point
+ * remains available for tests and the existing internal callers.
+ */
+export async function applyAcceptedPatch(
+  handle: TemporaryWorktreeHandle,
+  patch: WorktreePatch,
+  targetPath: string,
+): Promise<ApplyAcceptedPatchResult> {
+  const preflight = await preflightAcceptedPatch(handle, patch, targetPath);
+  return applyPreflightedPatch(preflight);
 }
 
 export async function removeTemporaryWorktree(

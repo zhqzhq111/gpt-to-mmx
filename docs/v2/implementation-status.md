@@ -517,6 +517,124 @@ permission-behavior probes. The Phase 5 CLI E2E covers an active Journal being
 safe-held exactly once, healthy runs continuing, and repeated startup avoiding
 duplicate recovery events.
 
+## Phase 6 — Crash-safe ACCEPT
+
+Status: complete.
+
+### Architecture
+
+Crash-safe ACCEPT closes the last correctness gap in the G2M v2 lifecycle:
+a partial ACCEPT execution — one whose previous process died after writing
+`review.accept.prepared` but before `review.accept.completed` is durable —
+must be provably correctable on restart. Phase 6 introduces the **Accept
+Reconciler** and the new durable `patch.apply.started` event, and binds
+every correctness-critical artifact (review, frozen patch, apply-evidence,
+outcome) to the Journal by hash.
+
+The recovery scanner now classifies three partial-ACCEPT kinds
+(`PARTIAL_ACCEPT_PREPARED`, `PARTIAL_ACCEPT_APPLY_STARTED`,
+`PARTIAL_ACCEPT_APPLIED`) so the startup path can distinguish them. The
+startup safe-hold deliberately defers partial ACCEPT to the explicit
+`g2m recover --execution-id X` flow — auto-`recovery.required` would make
+`ACCEPTED` unreachable, since the terminal event has not yet been written.
+Startup reports `acceptRecoveryBlockedWorkspaces` so the CLI can refuse
+new G2M runs against an unresolved partial ACCEPT in the same workspace
+without blocking unrelated workspaces (plan §40-§42).
+
+### Files
+
+- `src/events/events.ts` — added `patch.apply.started` to the
+  `TaskEventType` union.
+- `src/events/store.ts` — added `patch.apply.started` to the
+  `CRITICAL_TYPES` set so every CRITICAL barrier flushes it.
+- `src/execution/state-machine.ts` — `ACCEPT_PREPARED` now self-loops on
+  `patch.apply.started`, preserving the "still in ACCEPT_PREPARED" status
+  while the apply runs.
+- `src/workspace/worktree.ts` — split `applyAcceptedPatch` into
+  `preflightAcceptedPatch` (read-only target / patch validation) and
+  `applyPreflightedPatch` (the actual `git apply` + change-set verify).
+  `applyAcceptedPatch` is now a thin wrapper for backward compatibility
+  with the engine and existing tests.
+- `src/workspace/change-set.ts` — added
+  `computeFullWorkingTreeChangeSet`, which stages `git add -A` (no
+  pathspec) against the frozen base so the reconciler can detect
+  unrelated user edits, partial patch writes, or extra files.
+- `src/recovery/accept-reconciler.ts` — the Phase 6 Accept Reconciler.
+  Implements the full disposition table from plan §17:
+  `NOT_PARTIAL_ACCEPT`, `ALREADY_ACCEPTED`, `PROCESS_NOT_PROVEN_GONE`,
+  `RESUMED_AND_ACCEPTED`, `RECONCILED_AND_ACCEPTED`, `RECOVERY_REQUIRED`.
+  Zero mutations when `processStatus ∈ {alive, unknown}`. SHA-256 verifies
+  every correctness-critical artifact before any target write.
+- `src/recovery/scanner.ts` — added `PARTIAL_ACCEPT_APPLY_STARTED` to
+  `RecoveryIssueKind` and `ISSUE_PRIORITY`, and tightened the
+  partial-accept classifier so it now reports
+  `apply.started && !applied` separately from
+  `prepared && !apply.started`.
+- `src/recovery/startup.ts` — added `PartialAcceptKind`,
+  `AcceptRecoveryBlockedWorkspace`, and
+  `acceptRecoveryBlockedWorkspaces` on the report. The startup
+  safe-hold now skips partial ACCEPT (no auto-`recovery.required`).
+- `src/cli/index.ts` — `g2m recover` now delegates to
+  `runAcceptRecovery` when the execution is in `ACCEPT_PREPARED` or
+  `PATCH_APPLIED`, emitting the new `g2m.accept.recovery` event shape.
+  All non-partial executions still fall back to `resolveRecovery`.
+- `src/execution/engine.ts` — refactored the ACCEPT branch:
+  - Freezes `review.json` as an immutable execution artifact BEFORE
+    `review.accept.prepared`.
+  - Emits `patch.apply.started` (CRITICAL) BETWEEN preflight and the
+    real `git apply` so a crash mid-apply is distinguishable from
+    "apply never started".
+  - Freezes `apply-evidence.json` and `outcome.json` BEFORE
+    `patch.applied`, satisfying Phase 0 Artifact-First (plan §28-§30).
+  - `review.accept.completed` payload now binds the full result
+    (review + patch + apply-evidence + outcome hashes).
+  - `ReplayGuard.record` moved AFTER `review.accept.completed` is
+    durable (plan §32-§33). The guard is a derived anti-replay cache;
+    the Journal is the authority.
+  - REVISE / BLOCK decisions now also freeze `outcome.json` so the
+    scanner's `MISSING_OUTCOME` check is satisfied for every terminal
+    execution.
+- `src/projection/execution-projector.ts` — `projectArtifact` now also
+  records the `apply-evidence.json` and `outcome.json` artifacts when
+  `patch.applied` is projected. State cursor and reducer advance
+  unchanged.
+
+### Journal ordering (plan §5)
+
+The normal ACCEPT path is now:
+
+```
+validateReview → freeze review.json → review.accept.prepared (CRITICAL)
+→ preflight → patch.apply.started (CRITICAL) → git apply --check
+→ git apply --binary → apply-evidence.json → outcome.json
+→ patch.applied (CRITICAL) → review.accept.completed (CRITICAL)
+→ ReplayGuard.record (AFTER journal) → best-effort worktree cleanup.
+```
+
+### Recovery disposition table (plan §20-§25)
+
+```
+state              target                    verdict
+ACCEPT_PREPARED    CLEAN_BASE                RESUMED_AND_ACCEPTED
+PATCH_APPLIED      EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED
+ACCEPT_PREPARED    EXACT_EXPECTED_CHANGE_SET RECOVERY_REQUIRED
+PATCH_APPLIED      CLEAN_BASE                RECOVERY_REQUIRED
+PATCH_APPLIED/...  DIVERGED                  RECOVERY_REQUIRED
+PATCH_APPLIED/...  HEAD_MOVED                RECOVERY_REQUIRED
+any                alive / unknown           PROCESS_NOT_PROVEN_GONE
+any                review.accept.completed   ALREADY_ACCEPTED (no-op)
+```
+
+### Verification
+
+- `npm run typecheck` → exit 0.
+- `npm run build` → exit 0.
+- `npm test` → **425 passed, 5 skipped, 0 failed** across **38 test files
+  passed and 3 skipped** (10 new tests in
+  `tests/recovery/accept-reconciler.test.ts` cover the disposition table,
+  frozen-patch tampering, review.json tampering, and idempotent recovery).
+- The five pre-existing real-mcode skips remain unchanged.
+
 ## Remaining phases
 
 Crash-safe ACCEPT, cross-process lease, Process Supervisor, Storage Manager,

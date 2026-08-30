@@ -283,23 +283,69 @@ export class ExecutionProjector implements ExecutionProjection {
   }
 
   private projectArtifact(event: TaskEvent): void {
-    if (event.type !== "patch.frozen") return;
-    const artifactId = textPayload(event, "artifact_id", "artifactId");
-    const path = textPayload(event, "artifact_path", "artifactPath");
-    const hash = textPayload(event, "patch_blob_hash", "patchBlobHash");
-    const bytes = event.payload["patch_bytes"] ?? event.payload["patchBytes"];
-    if (artifactId === undefined || path === undefined || hash === undefined || typeof bytes !== "number") {
-      throw new Error("patch.frozen has incomplete artifact bindings");
+    if (event.type === "patch.frozen") {
+      const artifactId = textPayload(event, "artifact_id", "artifactId");
+      const path = textPayload(event, "artifact_path", "artifactPath");
+      const hash = textPayload(event, "patch_blob_hash", "patchBlobHash");
+      const bytes = event.payload["patch_bytes"] ?? event.payload["patchBytes"];
+      if (artifactId === undefined || path === undefined || hash === undefined || typeof bytes !== "number") {
+        throw new Error("patch.frozen has incomplete artifact bindings");
+      }
+      this.database.prepare(`
+        INSERT INTO artifacts(artifact_id, execution_id, kind, path, sha256, bytes, immutable)
+        VALUES (?, ?, 'frozen.patch', ?, ?, ?, 1)
+        ON CONFLICT(artifact_id) DO UPDATE SET
+          execution_id = excluded.execution_id,
+          path = excluded.path,
+          sha256 = excluded.sha256,
+          bytes = excluded.bytes
+      `).run(artifactId, event.attemptId, path, hash, bytes);
+      return;
     }
+    // Phase 6 §48: `patch.applied` binds apply-evidence and outcome
+    // artifacts. Project them so the SQLite projection reflects the
+    // immutable evidence the engine froze.
+    if (event.type === "patch.applied") {
+      const applyEvidenceHash = textPayload(event, "apply_evidence_hash", "applyEvidenceHash");
+      const outcomeHash = textPayload(event, "outcome_hash", "outcomeHash");
+      if (applyEvidenceHash !== undefined) {
+        this.upsertBoundArtifact(
+          `apply-evidence-${event.attemptId}`,
+          event.attemptId,
+          "apply-evidence.json",
+          "apply-evidence",
+          applyEvidenceHash,
+        );
+      }
+      if (outcomeHash !== undefined) {
+        this.upsertBoundArtifact(
+          `outcome-${event.attemptId}`,
+          event.attemptId,
+          "outcome.json",
+          "outcome",
+          outcomeHash,
+        );
+      }
+    }
+  }
+
+  private upsertBoundArtifact(
+    artifactId: string,
+    executionId: string,
+    path: string,
+    kind: string,
+    hash: string,
+  ): void {
+    // `bytes` is unknown from the event payload (the file is on disk); the
+    // immutable flag is 1 because both artifacts are frozen by the engine.
     this.database.prepare(`
       INSERT INTO artifacts(artifact_id, execution_id, kind, path, sha256, bytes, immutable)
-      VALUES (?, ?, 'frozen.patch', ?, ?, ?, 1)
+      VALUES (?, ?, ?, ?, ?, 0, 1)
       ON CONFLICT(artifact_id) DO UPDATE SET
         execution_id = excluded.execution_id,
         path = excluded.path,
-        sha256 = excluded.sha256,
-        bytes = excluded.bytes
-    `).run(artifactId, event.attemptId, path, hash, bytes);
+        sha256 = excluded.sha256
+    `).run(artifactId, executionId, kind, path, hash);
   }
 
   private projectReview(event: TaskEvent): void {

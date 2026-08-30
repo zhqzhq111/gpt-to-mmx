@@ -159,6 +159,7 @@ const TRANSITIONS: Readonly<
     "recovery.required": "RECOVERY_REQUIRED",
   },
   ACCEPT_PREPARED: {
+    "patch.apply.started": "ACCEPT_PREPARED",
     "patch.applied": "PATCH_APPLIED",
     "recovery.required": "RECOVERY_REQUIRED",
   },

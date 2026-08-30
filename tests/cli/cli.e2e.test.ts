@@ -144,7 +144,7 @@ describeWindows("G2M CLI handoff E2E", () => {
       const outcome = JSON.parse(
         await readFile(join(artifacts, runDirectory!.name, "outcome.json"), "utf8"),
       ) as { state: string; patchStatus: string };
-      expect(outcome).toMatchObject({ state: "BLOCKED", patchStatus: "discarded" });
+      expect(outcome).toMatchObject({ state: "BLOCKED", patch_status: "discarded" });
       expect(await git(repo, ["status", "--porcelain"])).toBe("");
       const executionDirectories = await readdir(join(state, "executions"));
       expect(executionDirectories.length).toBeGreaterThan(0);

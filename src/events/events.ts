@@ -45,6 +45,7 @@ export type TaskEventType =
   // Review
   | "review.requested"
   | "review.accept.prepared"
+  | "patch.apply.started"
   | "patch.applied"
   | "review.accept.completed"
   | "review.decision.accept"

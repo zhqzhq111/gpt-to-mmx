@@ -20,6 +20,7 @@ export type RecoveryIssueKind =
   | "ARTIFACT_HASH_MISMATCH"
   | "MISSING_OUTCOME"
   | "PARTIAL_ACCEPT_PREPARED"
+  | "PARTIAL_ACCEPT_APPLY_STARTED"
   | "PARTIAL_ACCEPT_APPLIED"
   | "RETAINED_WORKTREE_CANDIDATE"
   | "LOCK_REQUIRES_VALIDATION";
@@ -66,6 +67,7 @@ const ISSUE_PRIORITY: Readonly<Record<RecoveryIssueKind, number>> = {
   ARTIFACT_HASH_MISMATCH: 60,
   MISSING_OUTCOME: 70,
   PARTIAL_ACCEPT_PREPARED: 80,
+  PARTIAL_ACCEPT_APPLY_STARTED: 85,
   PARTIAL_ACCEPT_APPLIED: 90,
   RETAINED_WORKTREE_CANDIDATE: 100,
   LOCK_REQUIRES_VALIDATION: 110,
@@ -411,15 +413,24 @@ export function scanRecovery(options: RecoveryScanOptions): RecoveryScanReport {
       });
     }
     const prepared = events.some((event) => event.type === "review.accept.prepared");
+    const applyStarted = events.some((event) => event.type === "patch.apply.started");
     const applied = events.some((event) => event.type === "patch.applied");
     const completed = events.some((event) => event.type === "review.accept.completed");
-    if (prepared && !applied) {
+    if (prepared && !applyStarted && !applied) {
       addIssue(issues, {
         kind: "PARTIAL_ACCEPT_PREPARED",
         severity,
         executionId,
-        reason: "review.accept.prepared has no patch.applied event",
+        reason: "review.accept.prepared has no patch.apply.started event",
         evidence: events.filter((event) => event.type === "review.accept.prepared").map((event) => eventEvidence(executionId, event)),
+      });
+    } else if (applyStarted && !applied) {
+      addIssue(issues, {
+        kind: "PARTIAL_ACCEPT_APPLY_STARTED",
+        severity,
+        executionId,
+        reason: "patch.apply.started has no patch.applied event",
+        evidence: events.filter((event) => event.type === "patch.apply.started").map((event) => eventEvidence(executionId, event)),
       });
     } else if (applied && !completed) {
       addIssue(issues, {

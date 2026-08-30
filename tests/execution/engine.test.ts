@@ -292,8 +292,9 @@ describe("G2MExecutionEngine", () => {
 
     expect(completed.state).toBe("ACCEPTED");
     expect(completed.patchStatus).toBe("applied");
-    expect(eventStore.getByTaskId(task.task_id).slice(-3).map((event) => event.type)).toEqual([
+    expect(eventStore.getByTaskId(task.task_id).slice(-4).map((event) => event.type)).toEqual([
       "review.accept.prepared",
+      "patch.apply.started",
       "patch.applied",
       "review.accept.completed",
     ]);
