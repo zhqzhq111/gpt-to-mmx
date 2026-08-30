@@ -17,7 +17,10 @@ import { promisify } from "node:util";
 
 import { runVerification } from "../../src/evidence/verification.js";
 import { ProcessSupervisor } from "../../src/process/supervisor.js";
-import type { PlatformProcessController } from "../../src/process/platform.js";
+import {
+  createPlatformProcessController,
+  type PlatformProcessController,
+} from "../../src/process/platform.js";
 import { sha256 } from "../../src/protocol/hash.js";
 import type { VerificationProfile } from "../../src/policy/verification.js";
 
@@ -141,6 +144,38 @@ describe("runVerification", () => {
         timeoutMs: 50,
       }),
       "ws-unknown-termination",
+      tempDir,
+      { processSupervisor: new ProcessSupervisor({ platformController: controller }) },
+    );
+
+    expect(r.status).toBe("termination_unconfirmed");
+    expect(r.termination).toMatchObject({ confirmedGone: false });
+  }, 10_000);
+
+  it("maps a failed Windows taskkill with a disappearing root to termination_unconfirmed", async () => {
+    let probeCalls = 0;
+    const controller = createPlatformProcessController({
+      platform: "win32",
+      dependencies: {
+        probe: () => probeCalls++ === 0 ? "alive" : "gone",
+        runTaskkill: async (pid) => {
+          try { process.kill(pid); } catch { /* cleanup is best effort */ }
+          return { success: false, error: "taskkill reported failure" };
+        },
+        sleep: async () => undefined,
+        now: (() => {
+          let value = 0;
+          return () => ++value;
+        })(),
+      },
+    });
+    const r = await runVerification(
+      makeProfile({
+        id: "failed-taskkill",
+        args: ["-e", "setInterval(() => {}, 10000)"],
+        timeoutMs: 50,
+      }),
+      "ws-failed-taskkill",
       tempDir,
       { processSupervisor: new ProcessSupervisor({ platformController: controller }) },
     );

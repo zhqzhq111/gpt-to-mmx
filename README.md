@@ -128,7 +128,7 @@ detached process group 的 `SIGTERM` → `SIGKILL`；timeout/cancel 只有在终
 `RECOVERY_REQUIRED`，保留 Lease/worktree，并禁止收集 patch/final diff。
 
 Phase 8 最终 Gate：`npm run typecheck`、`npm run build`、`git diff --check`
-通过；`npm test` 为 `476 passed / 5 skipped / 0 failed`；Lease process E2E
+通过；`npm test` 为 `479 passed / 5 skipped / 0 failed`；Lease process E2E
 为 `3/3`，Process Supervisor parent→grandchild E2E 为 `3/3`。
 
 ## 目录

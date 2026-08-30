@@ -99,4 +99,56 @@ describe("platform process termination", () => {
     });
     expect(calls).toEqual([[4321, false], [4321, true]]);
   });
+
+  it("does not confirm gone when graceful taskkill fails even if the root PID disappears", async () => {
+    const controller = createPlatformProcessController({
+      platform: "win32",
+      dependencies: {
+        probe: sequenceProbe(["alive", "gone"]),
+        runTaskkill: async () => ({ success: false, error: "graceful taskkill failed" }),
+        sleep: async () => undefined,
+        now: (() => {
+          let value = 0;
+          return () => ++value;
+        })(),
+      },
+    });
+
+    const result = await controller.terminate(4321, {
+      gracefulTerminationMs: 20,
+      forceTerminationMs: 20,
+    });
+
+    expect(result.confirmedGone).toBe(false);
+    expect(result.error).toContain("graceful taskkill failed");
+  });
+
+  it("does not confirm gone when forced taskkill fails even if the root PID disappears", async () => {
+    let call = 0;
+    const controller = createPlatformProcessController({
+      platform: "win32",
+      dependencies: {
+        probe: sequenceProbe(["alive", "alive", "alive", "alive", "alive", "gone"]),
+        runTaskkill: async () => {
+          call += 1;
+          return call === 1
+            ? { success: true }
+            : { success: false, error: "forced taskkill failed" };
+        },
+        sleep: async () => undefined,
+        now: (() => {
+          let value = 0;
+          return () => ++value;
+        })(),
+      },
+    });
+
+    const result = await controller.terminate(4321, {
+      gracefulTerminationMs: 20,
+      forceTerminationMs: 20,
+    });
+
+    expect(result.confirmedGone).toBe(false);
+    expect(result.error).toContain("forced taskkill failed");
+  });
 });

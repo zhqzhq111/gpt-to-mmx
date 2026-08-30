@@ -132,7 +132,7 @@ function makeController(
           const forced = await runTaskkill(pid, true, options.forceTerminationMs);
           const status = await waitForGone(probe, pid, options.forceTerminationMs, sleep, now);
           return {
-            confirmedGone: status === "gone",
+            confirmedGone: forced.success && status === "gone",
             gracefulAttempted: false,
             forcedAttempted: true,
             strategy: "windows_taskkill",
@@ -144,7 +144,7 @@ function makeController(
         let status = await waitForGone(probe, pid, options.gracefulTerminationMs, sleep, now);
         if (status === "gone") {
           return {
-            confirmedGone: true,
+            confirmedGone: graceful.success,
             gracefulAttempted: true,
             forcedAttempted: false,
             strategy: "windows_taskkill",
@@ -158,7 +158,7 @@ function makeController(
           ? errorText([graceful.error, forced.error])
           : undefined;
         return {
-          confirmedGone: status === "gone",
+          confirmedGone: forced.success && status === "gone",
           gracefulAttempted: true,
           forcedAttempted: true,
           strategy: "windows_taskkill",
