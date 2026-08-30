@@ -6,10 +6,12 @@ import { describe, it, expect } from "vitest";
 
 import {
   computeTaskFingerprint,
+  buildFingerprintV2Artifact,
   fingerprintHash,
   FingerprintRegistry,
   FingerprintRegistryError,
   type TaskFingerprint,
+  validateFingerprintV2Artifact,
 } from "../../src/execution/fingerprint.js";
 
 function makeFP(overrides: Partial<TaskFingerprint> = {}): TaskFingerprint {
@@ -143,5 +145,42 @@ describe("FingerprintRegistry", () => {
     expect(reg.size()).toBe(2);
     expect(reg.get("task-1")?.mcodeVersion).toBe("0.2.7");
     expect(reg.get("task-2")?.mcodeVersion).toBe("0.2.8");
+  });
+});
+
+describe("fingerprint v2 artifact", () => {
+  it("binds runtime, policy, and worker schema evidence while preserving v1", () => {
+    const fingerprint = computeTaskFingerprint(
+      {
+        taskHash: "task-hash",
+        workspaceId: "ws-A",
+        baseRevision: "HEAD",
+        maxSteps: 20,
+        timeoutMs: 60_000,
+        permissionProfile: "coding_standard",
+      },
+      {
+        mcodeVersion: "1.0.0",
+        model: null,
+        adapterContractVersion: "g2m-worker-v2",
+        runtimeCapabilitySnapshotHash: "cap-hash",
+        runtimeIdentityHash: "runtime-hash",
+        protectedPolicyHash: "policy-hash",
+        workerSummarySchemaHash: "schema-hash",
+      },
+    );
+    const artifact = buildFingerprintV2Artifact({
+      taskId: "task-1",
+      executionId: "exec-1",
+      fingerprint,
+    });
+    expect(artifact.fingerprint_version).toBe(2);
+    expect(artifact.model).toBeNull();
+    expect(validateFingerprintV2Artifact(artifact)).toBe(true);
+    expect(() => buildFingerprintV2Artifact({
+      taskId: "task-1",
+      executionId: "exec-1",
+      fingerprint: makeFP(),
+    })).toThrow(/v2/i);
   });
 });

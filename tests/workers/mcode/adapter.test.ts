@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,7 @@ import {
   AdapterError,
   type WorkerInvocation,
 } from "../../../src/workers/coding-worker.js";
+import { sha256 } from "../../../src/protocol/hash.js";
 
 function makeInvocation(
   overrides: Partial<WorkerInvocation> = {},
@@ -310,4 +311,20 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
     },
     15_000,
   );
+
+  it("revalidates the launcher identity before spawn", async () => {
+    const adapter = new MCodeAdapter();
+    const snapshot = await adapter.probe();
+    const identity = await adapter.getRuntimeIdentity!(sha256(snapshot));
+    expect(identity.identity_hash).toMatch(/^[a-f0-9]{64}$/);
+    const original = await readFile(mockCmdPath);
+    try {
+      await writeFile(mockCmdPath, Buffer.concat([original, Buffer.from("\r\n")]));
+      await expect(adapter.revalidateRuntimeIdentity!(identity)).rejects.toMatchObject({
+        code: "RUNTIME_DRIFT",
+      });
+    } finally {
+      await writeFile(mockCmdPath, original);
+    }
+  }, 15_000);
 });

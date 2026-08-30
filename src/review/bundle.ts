@@ -54,7 +54,7 @@ export type WorkerRuntimeName = "mcode" | "fake" | "unknown";
 export interface WorkerRuntimeInfo {
   readonly runtime: WorkerRuntimeName;
   readonly version: string;
-  readonly model: string;
+  readonly model: string | null;
 }
 
 export interface ReviewBundle {

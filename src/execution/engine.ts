@@ -60,12 +60,16 @@ import {
 } from "../workspace/worktree.js";
 import {
   computeTaskFingerprint,
+  fingerprintHash,
   FingerprintRegistry,
+  buildFingerprintV2Artifact,
   type TaskFingerprint,
 } from "./fingerprint.js";
 import type { TaskState } from "./state-machine.js";
 import { StorageAdmissionError, type StorageManager, type StorageReservationHandle } from "../storage/reservation.js";
 import type { StorageMonitor, StorageMonitorHandle } from "../storage/monitor.js";
+import { buildProtectedPolicy } from "../runtime/protected-policy.js";
+import { resolveProgramIdentity } from "../runtime/program-identity.js";
 
 export interface G2MExecutionEngineOptions {
   readonly workspaceRegistry: WorkspaceRegistry;
@@ -84,6 +88,10 @@ export interface G2MExecutionEngineOptions {
   readonly artifactRoot: string;
   readonly storageManager?: StorageManager;
   readonly storageMonitor?: StorageMonitor;
+  readonly stateRoot?: string;
+  readonly runtimeHardening?: Readonly<Record<string, number>>;
+  readonly storagePolicyHash?: string;
+  readonly leasePolicyHash?: string;
 }
 
 export interface PendingReviewExecution {
@@ -289,7 +297,9 @@ export class G2MExecutionEngine {
         artifactPath: resolve(this.options.artifactRoot, event.attemptId),
         runtime: this.options.workerRuntime.runtime,
         runtimeVersion: this.options.workerRuntime.version,
-        model: this.options.workerRuntime.model,
+        ...(this.options.workerRuntime.model !== null
+          ? { model: this.options.workerRuntime.model }
+          : {}),
       });
     } catch (error) {
       this.options.eventStore.append({
@@ -449,6 +459,49 @@ export class G2MExecutionEngine {
       await this.snapshotStorage(executionId, worktree.worktreePath);
       const baseline = await captureBaseline(worktree.worktreePath);
       const stableTaskHash = taskHash(task);
+      const runtimeCapabilitySnapshotHash = sha256(runtimeSnapshot);
+      const runtimeIdentity = this.options.worker.getRuntimeIdentity === undefined
+        ? undefined
+        : await this.options.worker.getRuntimeIdentity(runtimeCapabilitySnapshotHash);
+      const verificationIdentity = profile === undefined
+        ? {
+            id: "none",
+            resolved_program: "",
+            program_identity_hash: sha256(""),
+            program_bytes: 0,
+            args: [],
+            timeout_ms: 0,
+          }
+        : {
+            id: profile.id,
+            args: profile.args,
+            timeout_ms: profile.timeoutMs,
+            ...(profile.env !== undefined ? { env: profile.env } : {}),
+            ...(await resolveProgramIdentity(profile.program)),
+          };
+      const protectedPolicy = runtimeIdentity === undefined
+        ? undefined
+        : buildProtectedPolicy({
+            task_id: task.task_id,
+            execution_id: executionId,
+            workspace_id: task.workspace_scope.workspace_id,
+            canonical_workspace_path: workspace.canonicalPath,
+            base_revision: worktree.baseRevision,
+            artifact_root: this.options.artifactRoot,
+            worktree_root: this.options.worktreeRoot,
+            state_root: this.options.stateRoot ?? resolve(this.options.artifactRoot, "state"),
+            permission_policy: task.permission_policy,
+            requested_capabilities: task.requested_capabilities,
+            limits: {
+              max_steps: task.limits.max_steps,
+              timeout_ms: task.limits.timeout_ms,
+            },
+            verification_profile: verificationIdentity,
+            runtime_identity_hash: runtimeIdentity.identity_hash,
+            output_limits: this.options.runtimeHardening ?? {},
+            storage_policy_hash: this.options.storagePolicyHash ?? sha256(this.options.storageManager?.storagePolicy ?? {}),
+            lease_policy_hash: this.options.leasePolicyHash ?? sha256({}),
+          });
       const fingerprint = computeTaskFingerprint(
         {
           taskHash: stableTaskHash,
@@ -460,11 +513,31 @@ export class G2MExecutionEngine {
         },
         {
           mcodeVersion: runtimeSnapshot.version ?? this.options.workerRuntime.version,
-          model: this.options.workerRuntime.model,
-          adapterContractVersion: this.options.adapterContractVersion,
-          runtimeCapabilitySnapshotHash: sha256(runtimeSnapshot),
+          model: runtimeIdentity?.model ?? (this.options.workerRuntime.model || null),
+          adapterContractVersion: runtimeIdentity?.adapter_contract_version ?? this.options.adapterContractVersion,
+          runtimeCapabilitySnapshotHash,
+          ...(runtimeIdentity !== undefined ? { runtimeIdentityHash: runtimeIdentity.identity_hash } : {}),
+          ...(protectedPolicy !== undefined ? { protectedPolicyHash: protectedPolicy.policy_hash } : {}),
+          ...(runtimeIdentity !== undefined ? { workerSummarySchemaHash: runtimeIdentity.worker_summary_schema_hash } : {}),
         },
       );
+      let fingerprintArtifactHash: string | undefined;
+      if (runtimeIdentity !== undefined && protectedPolicy !== undefined) {
+        const executionArtifactRoot = resolve(this.options.artifactRoot, executionId);
+        await writeImmutableArtifact(
+          resolve(executionArtifactRoot, "runtime-identity.json"),
+          Buffer.from(`${JSON.stringify(runtimeIdentity, null, 2)}\n`, "utf8"),
+        );
+        await writeImmutableArtifact(
+          resolve(executionArtifactRoot, "protected-policy.json"),
+          Buffer.from(`${JSON.stringify(protectedPolicy, null, 2)}\n`, "utf8"),
+        );
+        const fingerprintArtifact = await writeImmutableArtifact(
+          resolve(executionArtifactRoot, "fingerprint.json"),
+          Buffer.from(`${JSON.stringify(buildFingerprintV2Artifact({ taskId: task.task_id, executionId, fingerprint }), null, 2)}\n`, "utf8"),
+        );
+        fingerprintArtifactHash = fingerprintArtifact.sha256;
+      }
       const invocation: WorkerInvocation = {
         executionId,
         prompt: buildWorkerPrompt(task),
@@ -476,6 +549,9 @@ export class G2MExecutionEngine {
           timeoutMs: task.limits.timeout_ms,
         },
         sessionPolicy: workerSessionPolicy(task.session_policy),
+        ...(runtimeIdentity !== undefined
+          ? { expectedRuntimeIdentityHash: runtimeIdentity.identity_hash }
+          : {}),
       };
 
       try {
@@ -493,6 +569,12 @@ export class G2MExecutionEngine {
         taskId: task.task_id,
         executionId,
         type: "agent.spawn.started",
+        payload: {
+          ...(runtimeIdentity !== undefined ? { runtime_identity_hash: runtimeIdentity.identity_hash } : {}),
+          ...(protectedPolicy !== undefined ? { protected_policy_hash: protectedPolicy.policy_hash } : {}),
+          ...(fingerprintArtifactHash !== undefined ? { fingerprint_artifact_hash: fingerprintArtifactHash } : {}),
+          fingerprint_hash: fingerprintHash(fingerprint),
+        },
         fingerprint,
       });
 

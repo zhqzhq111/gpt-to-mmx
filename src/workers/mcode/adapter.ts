@@ -33,6 +33,15 @@ import {
   parseStreamJsonLine,
   type StreamJsonEvent,
 } from "./stream-json-parser.js";
+import { sha256 } from "../../protocol/hash.js";
+import {
+  buildRuntimeIdentity,
+  type RuntimeIdentity,
+} from "../../runtime/identity.js";
+import {
+  WORKER_SUMMARY_SCHEMA,
+  WORKER_SUMMARY_SCHEMA_HASH,
+} from "../../runtime/worker-summary.js";
 
 interface MCodeExecutionState {
   readonly process: ManagedProcess;
@@ -56,10 +65,17 @@ export class MCodeAdapter implements CodingWorkerAdapter {
   constructor(options: {
     readonly policy?: LocalPermissionPolicy;
     readonly processSupervisor?: ProcessSupervisor;
+    readonly model?: string;
+    readonly maxProbeOutputBytes?: number;
   } = {}) {
     this.policy = options.policy ?? new LocalPermissionPolicy();
     this.processSupervisor = options.processSupervisor ?? new ProcessSupervisor();
+    this.model = options.model;
+    this.maxProbeOutputBytes = options.maxProbeOutputBytes;
   }
+
+  private readonly model: string | undefined;
+  private readonly maxProbeOutputBytes: number | undefined;
 
   async probe(): Promise<RuntimeCapabilitySnapshot> {
     const d = await this.getDescriptor();
@@ -93,6 +109,37 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     };
   }
 
+  async getRuntimeIdentity(capabilitySnapshotHash: string): Promise<RuntimeIdentity> {
+    return buildRuntimeIdentity({
+      descriptor: await this.getDescriptor(),
+      capabilitySnapshotHash,
+      workerSummarySchemaHash: WORKER_SUMMARY_SCHEMA_HASH,
+      ...(this.model !== undefined ? { model: this.model } : {}),
+    });
+  }
+
+  async revalidateRuntimeIdentity(expected: RuntimeIdentity): Promise<void> {
+    const descriptor = await resolveMCode({
+      explicitPath: expected.resolved_executable_path,
+      ...(this.maxProbeOutputBytes !== undefined
+        ? { maxProbeOutputBytes: this.maxProbeOutputBytes }
+        : {}),
+      processSupervisor: this.processSupervisor,
+    });
+    const current = buildRuntimeIdentity({
+      descriptor,
+      capabilitySnapshotHash: expected.capability_snapshot_hash,
+      workerSummarySchemaHash: expected.worker_summary_schema_hash,
+      ...(this.model !== undefined ? { model: this.model } : {}),
+    });
+    if (current.identity_hash !== expected.identity_hash) {
+      throw new AdapterError(
+        "RUNTIME_DRIFT",
+        `mcode runtime identity changed before spawn (expected ${expected.identity_hash}, got ${current.identity_hash})`,
+      );
+    }
+  }
+
   async start(invocation: WorkerInvocation): Promise<void> {
     const id = invocation.executionId;
     if (this.executions.has(id)) {
@@ -102,6 +149,18 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     }
 
     const descriptor = await this.getDescriptor();
+    if (invocation.expectedRuntimeIdentityHash !== undefined) {
+      const snapshot = await this.probe();
+      const expected = await this.getRuntimeIdentity(sha256(snapshot));
+      if (expected.identity_hash !== invocation.expectedRuntimeIdentityHash) {
+        throw new AdapterError(
+          "RUNTIME_DRIFT",
+          `mcode runtime identity binding does not match the execution fingerprint`,
+          { executionId: id },
+        );
+      }
+      await this.revalidateRuntimeIdentity(expected);
+    }
     const effective = this.policy.decide(
       invocation.permissionPolicy,
       invocation.requestedCapabilities,
@@ -114,6 +173,8 @@ export class MCodeAdapter implements CodingWorkerAdapter {
       timeoutMs: effective.effectiveTimeoutMs,
       maxSteps: effective.effectiveMaxSteps,
       outputFormat: "stream-json",
+      outputSchema: WORKER_SUMMARY_SCHEMA,
+      ...(this.model !== undefined ? { model: this.model } : {}),
     });
 
     const managed = this.processSupervisor.spawn({

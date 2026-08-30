@@ -11,6 +11,7 @@
  */
 
 import type { PermissionPolicy, ExecutionLimits } from "./policy.js";
+import type { RuntimeIdentity } from "../runtime/identity.js";
 
 /**
  * Worker 一次完整执行的 id,由 Adapter 在 start() 时生成,G2M Core 在后续
@@ -46,6 +47,8 @@ export interface WorkerInvocation {
   };
   readonly limits: ExecutionLimits;
   readonly sessionPolicy: SessionPolicy;
+  /** Phase 12 binding checked immediately before the external process spawn. */
+  readonly expectedRuntimeIdentityHash?: string;
 }
 
 /**
@@ -121,6 +124,7 @@ export type AdapterErrorCode =
   | "TIMED_OUT"
   | "CANCELLED"
   | "UNKNOWN"
+  | "RUNTIME_DRIFT"
   | "NOT_IMPLEMENTED";
 
 export class AdapterError extends Error {
@@ -162,6 +166,12 @@ export interface CodingWorkerAdapter {
    * UNVERIFIED 变成 VERIFIED 的依据(plan 第 19 节)。
    */
   probe(): Promise<RuntimeCapabilitySnapshot>;
+
+  /** Optional Phase 12 runtime evidence exposed by hardened adapters. */
+  getRuntimeIdentity?(capabilitySnapshotHash: string): Promise<RuntimeIdentity>;
+
+  /** Re-probe and compare the frozen runtime immediately before spawn. */
+  revalidateRuntimeIdentity?(expected: RuntimeIdentity): Promise<void>;
 
   /**
    * 启动一次执行。start 成功后 G2M Core 通过 collectResult() 拿结果。

@@ -35,6 +35,7 @@ import { buildOperationalSnapshot } from "../operations/snapshot.js";
 import { runDoctor } from "../operations/doctor.js";
 import { executeRepair, planRepair } from "../operations/repair.js";
 import { renderJson, renderText } from "../operations/format.js";
+import { sha256 } from "../protocol/hash.js";
 
 interface ParsedArguments {
   readonly command: string;
@@ -293,10 +294,14 @@ async function configureEngine(
       fingerprintRegistry,
       replayGuard,
       worker,
-      workerRuntime: { runtime: "mcode", version: workerVersion, model: "configured" },
-      adapterContractVersion: "g2m-worker-v1",
+      workerRuntime: { runtime: "mcode", version: workerVersion, model: config.mcode_model ?? null },
+      adapterContractVersion: "g2m-worker-v2",
       worktreeRoot: config.worktree_root,
       artifactRoot: config.artifact_root,
+      stateRoot,
+      runtimeHardening: config.runtime_hardening,
+      storagePolicyHash: sha256(config.storage),
+      leasePolicyHash: sha256(config.workspace_lease ?? {}),
       storageManager,
       storageMonitor,
     });
@@ -399,7 +404,10 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
   if (config.mcode_path !== undefined) process.env["G2M_MCODE_PATH"] = config.mcode_path;
 
   try {
-    const worker = new MCodeAdapter();
+    const worker = new MCodeAdapter({
+      ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
+      maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
+    });
     const runtime = await worker.probe();
     const { engine, eventStore, evidenceStore, projectionDatabase } = await configureEngine(
       config,
@@ -507,7 +515,10 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
   let eventStoreToClose: EventStore | undefined;
   let projectionDatabaseToClose: StateDatabase | undefined;
   try {
-    const worker = new MCodeAdapter();
+    const worker = new MCodeAdapter({
+      ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
+      maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
+    });
     const configured = await configureEngine(config, worker, "recovery", {
       excludeExecutionIds: [executionId],
     });

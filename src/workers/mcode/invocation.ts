@@ -29,7 +29,8 @@ export interface MCodeInvocationInputs {
   readonly timeoutMs: number;
   readonly maxSteps: number;
   readonly outputFormat?: MCodeOutputFormat;
-  readonly outputSchema?: Record<string, unknown>;
+  readonly outputSchema?: Readonly<Record<string, unknown>>;
+  readonly model?: string;
   readonly file?: string;
   readonly sessionId?: string;
 }
@@ -81,6 +82,7 @@ export function buildMCodeInvocation(
     // 这一轮 inline 模式,跟 mcode 真实契约对齐等 Phase 4 实测。
     args.push("--output-schema", JSON.stringify(inputs.outputSchema));
   }
+  if (inputs.model !== undefined) args.push("--model", inputs.model);
   if (inputs.file !== undefined) {
     args.push("--file", inputs.file);
   }

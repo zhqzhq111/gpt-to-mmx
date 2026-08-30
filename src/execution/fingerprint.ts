@@ -20,16 +20,20 @@ import { sha256 } from "../protocol/hash.js";
 import { readJsonFile, writeJsonAtomic } from "../persistence/durable-state.js";
 
 export interface TaskFingerprint {
+  readonly fingerprintVersion?: 1 | 2;
   readonly taskHash: string;
   readonly workspaceId: string;
   readonly baseRevision: string;
   readonly mcodeVersion: string;
-  readonly model: string;
+  readonly model: string | null;
   readonly permissionProfile: string;
   readonly maxSteps: number;
   readonly timeoutMs: number;
   readonly adapterContractVersion: string;
   readonly runtimeCapabilitySnapshotHash: string;
+  readonly runtimeIdentityHash?: string;
+  readonly protectedPolicyHash?: string;
+  readonly workerSummarySchemaHash?: string;
 }
 
 /**
@@ -51,16 +55,19 @@ export interface ComputeFingerprintInput {
 
 export interface ComputeFingerprintRuntime {
   readonly mcodeVersion: string;
-  readonly model: string;
+  readonly model: string | null;
   readonly adapterContractVersion: string;
   readonly runtimeCapabilitySnapshotHash: string;
+  readonly runtimeIdentityHash?: string;
+  readonly protectedPolicyHash?: string;
+  readonly workerSummarySchemaHash?: string;
 }
 
 export function computeTaskFingerprint(
   task: ComputeFingerprintInput,
   runtime: ComputeFingerprintRuntime,
 ): TaskFingerprint {
-  return {
+  const fingerprint: TaskFingerprint = {
     taskHash: task.taskHash,
     workspaceId: task.workspaceId,
     baseRevision: task.baseRevision,
@@ -72,6 +79,84 @@ export function computeTaskFingerprint(
     adapterContractVersion: runtime.adapterContractVersion,
     runtimeCapabilitySnapshotHash: runtime.runtimeCapabilitySnapshotHash,
   };
+  if (runtime.runtimeIdentityHash !== undefined) {
+    return {
+      ...fingerprint,
+      fingerprintVersion: 2,
+      runtimeIdentityHash: runtime.runtimeIdentityHash,
+      ...(runtime.protectedPolicyHash !== undefined ? { protectedPolicyHash: runtime.protectedPolicyHash } : {}),
+      ...(runtime.workerSummarySchemaHash !== undefined ? { workerSummarySchemaHash: runtime.workerSummarySchemaHash } : {}),
+    };
+  }
+  return fingerprint;
+}
+
+export const FINGERPRINT_V2_SCHEMA_VERSION = "g2m.fingerprint.v2" as const;
+
+export interface FingerprintV2Artifact {
+  readonly schema_version: typeof FINGERPRINT_V2_SCHEMA_VERSION;
+  readonly fingerprint_version: 2;
+  readonly task_id: string;
+  readonly execution_id: string;
+  readonly task_hash: string;
+  readonly workspace_id: string;
+  readonly base_revision: string;
+  readonly mcode_version: string;
+  readonly model: string | null;
+  readonly model_pinned: boolean;
+  readonly permission_profile: string;
+  readonly max_steps: number;
+  readonly timeout_ms: number;
+  readonly adapter_contract_version: string;
+  readonly runtime_capability_snapshot_hash: string;
+  readonly runtime_identity_hash: string;
+  readonly protected_policy_hash: string;
+  readonly worker_summary_schema_hash: string;
+  readonly fingerprint_hash: string;
+}
+
+type FingerprintV2Content = Omit<FingerprintV2Artifact, "fingerprint_hash">;
+
+export function buildFingerprintV2Artifact(input: {
+  readonly taskId: string;
+  readonly executionId: string;
+  readonly fingerprint: TaskFingerprint;
+}): FingerprintV2Artifact {
+  const fingerprint = input.fingerprint;
+  if (
+    fingerprint.fingerprintVersion !== 2 ||
+    fingerprint.runtimeIdentityHash === undefined ||
+    fingerprint.protectedPolicyHash === undefined ||
+    fingerprint.workerSummarySchemaHash === undefined
+  ) {
+    throw new Error("fingerprint v2 requires runtime, policy, and worker schema bindings");
+  }
+  const content: FingerprintV2Content = {
+    schema_version: FINGERPRINT_V2_SCHEMA_VERSION,
+    fingerprint_version: 2,
+    task_id: input.taskId,
+    execution_id: input.executionId,
+    task_hash: fingerprint.taskHash,
+    workspace_id: fingerprint.workspaceId,
+    base_revision: fingerprint.baseRevision,
+    mcode_version: fingerprint.mcodeVersion,
+    model: fingerprint.model,
+    model_pinned: fingerprint.model !== null,
+    permission_profile: fingerprint.permissionProfile,
+    max_steps: fingerprint.maxSteps,
+    timeout_ms: fingerprint.timeoutMs,
+    adapter_contract_version: fingerprint.adapterContractVersion,
+    runtime_capability_snapshot_hash: fingerprint.runtimeCapabilitySnapshotHash,
+    runtime_identity_hash: fingerprint.runtimeIdentityHash,
+    protected_policy_hash: fingerprint.protectedPolicyHash,
+    worker_summary_schema_hash: fingerprint.workerSummarySchemaHash,
+  };
+  return Object.freeze({ ...content, fingerprint_hash: sha256(content) });
+}
+
+export function validateFingerprintV2Artifact(artifact: FingerprintV2Artifact): boolean {
+  const { fingerprint_hash: _ignored, ...content } = artifact;
+  return sha256(content) === artifact.fingerprint_hash;
 }
 
 export class FingerprintRegistryError extends Error {
