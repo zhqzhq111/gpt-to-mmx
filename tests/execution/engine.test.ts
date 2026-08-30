@@ -617,6 +617,48 @@ describe("G2MExecutionEngine", () => {
     expect(event?.payload["workerErrorCode"]).toBe("RUNTIME_DRIFT");
   });
 
+  it("preserves VERIFICATION_RUNTIME_DRIFT and proves the changed launcher did not run", async () => {
+    const launcher = join(tempRoot, "verification-launcher.cmd");
+    const marker = join(tempRoot, "verification-ran.txt");
+    const original = ["@echo off", `echo ran>\"${marker}\"`, "exit /b 0", ""].join("\r\n");
+    await writeFile(launcher, original, "utf8");
+    profileRegistry.register({
+      id: "drifting_tests",
+      workspaceId: "demo",
+      description: "launcher changes after worker spawn",
+      program: launcher,
+      args: [],
+      timeoutMs: 10_000,
+      registeredAt: 0,
+    });
+
+    class LauncherDriftWorker extends EditingWorker {
+      override async start(invocation: WorkerInvocation): Promise<void> {
+        await super.start(invocation);
+        await writeFile(launcher, `${original}\r\n`, "utf8");
+      }
+    }
+
+    const driftingTask = {
+      ...task,
+      task_id: "task-verification-runtime-drift",
+      verification_profile: "drifting_tests",
+    } satisfies CodeTaskV1;
+    const runner = engine(new LauncherDriftWorker());
+
+    await expect(runner.execute(driftingTask)).rejects.toMatchObject({
+      code: "VERIFICATION_RUNTIME_DRIFT",
+    });
+    await expect(readFile(marker)).rejects.toThrow();
+    expect(workspaceLock.isHeld("demo")).toBe(false);
+    const event = eventStore.getByTaskId(driftingTask.task_id).at(-1);
+    expect(event?.type).toBe("verification.failed");
+    expect(event?.payload).toMatchObject({
+      code: "VERIFICATION_RUNTIME_DRIFT",
+      reason: "verification executable identity changed before run",
+    });
+  });
+
   it("moves an unknown worker outcome to RECOVERY_REQUIRED and preserves the worktree", async () => {
     const runner = engine(new FakeMCodeAdapter({ behavior: "processCrash" }));
     let caught: unknown;

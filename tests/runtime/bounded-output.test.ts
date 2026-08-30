@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 
 import { BoundedOutput } from "../../src/runtime/bounded-output.js";
 
@@ -26,5 +27,18 @@ describe("bounded runtime output", () => {
   it("rejects invalid limits", () => {
     expect(() => new BoundedOutput(0)).toThrow(/positive/i);
     expect(() => new BoundedOutput(Number.MAX_SAFE_INTEGER)).toThrow(/at most|maximum/i);
+  });
+
+  it("freezes evidence for the captured byte prefix", () => {
+    const output = new BoundedOutput(5);
+    output.push("hello world");
+
+    expect(output.evidence()).toEqual({
+      capturedBytes: 5,
+      totalBytes: 11,
+      truncated: true,
+      capturedByteSha256: createHash("sha256").update("hello").digest("hex"),
+    });
+    expect(Object.isFrozen(output.evidence())).toBe(true);
   });
 });

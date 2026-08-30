@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -271,6 +272,8 @@ describe("runVerification", () => {
       stderrBytes: r.stderrBytes,
       stdoutTruncated: r.stdoutTruncated,
       stderrTruncated: r.stderrTruncated,
+      stdoutEvidence: r.stdoutEvidence,
+      stderrEvidence: r.stderrEvidence,
       errorMessage: r.errorMessage,
     });
     expect(r.resultHash).toBe(expected);
@@ -354,6 +357,20 @@ describe("runVerification", () => {
     expect(r.stderrTruncated).toBe(true);
     expect(r.stdout.length).toBe(32);
     expect(r.stderr.length).toBe(32);
+    expect(r.stdoutEvidence).toEqual({
+      capturedBytes: 32,
+      totalBytes: 1000,
+      truncated: true,
+      capturedByteSha256: createHash("sha256").update("x".repeat(32)).digest("hex"),
+    });
+    expect(r.stderrEvidence).toEqual({
+      capturedBytes: 32,
+      totalBytes: 1000,
+      truncated: true,
+      capturedByteSha256: createHash("sha256").update("y".repeat(32)).digest("hex"),
+    });
+    expect(Object.isFrozen(r.stdoutEvidence)).toBe(true);
+    expect(Object.isFrozen(r.stderrEvidence)).toBe(true);
   });
 
   it("refuses a changed verification launcher before it runs", async () => {

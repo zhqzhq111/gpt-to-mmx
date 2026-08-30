@@ -12,6 +12,7 @@
 
 import type { PermissionPolicy, ExecutionLimits } from "./policy.js";
 import type { RuntimeIdentity } from "../runtime/identity.js";
+import type { BoundedOutputEvidence } from "../runtime/bounded-output.js";
 
 /**
  * Worker 一次完整执行的 id,由 Adapter 在 start() 时生成,G2M Core 在后续
@@ -73,6 +74,8 @@ export interface WorkerResult {
   readonly remainingRisks: readonly string[];
   readonly blockedReason?: string;
   readonly rawEventLogRef?: string;
+  /** Bounded diagnostic stderr captured separately from the control stream. */
+  readonly diagnosticStderr?: BoundedOutputEvidence;
 }
 
 export interface TestAttempt {

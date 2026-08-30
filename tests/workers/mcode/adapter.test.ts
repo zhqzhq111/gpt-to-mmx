@@ -91,6 +91,7 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
         "if defined RUNTIME_DRIFT_MARKER echo spawned>\"%RUNTIME_DRIFT_MARKER%\"",
         "if \"%MOCK_BEHAVIOR%\"==\"malformed\" (",
         "  echo definitely-not-json",
+        "  ping 127.0.0.1 -n 6 >nul",
         "  exit /b 0",
         ")",
         "if \"%MOCK_BEHAVIOR%\"==\"overflow\" (",
@@ -100,6 +101,9 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
         "if \"%MOCK_BEHAVIOR%\"==\"fail\" (",
         "  echo something bad 1>&2",
         "  exit /b 7",
+        ")",
+        "if \"%MOCK_BEHAVIOR%\"==\"stderr\" (",
+        "  echo diagnostic-overflow 1>&2",
         ")",
         "if \"%MOCK_BEHAVIOR%\"==\"noresult\" (",
         "  echo {\"type\":\"system\",\"event\":\"init\",\"session_id\":\"mcode-noresult\"}",
@@ -217,6 +221,27 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
       await expect(adapter.collectResult(inv.executionId)).rejects.toMatchObject({
         code: "FAILED",
       });
+    },
+    15_000,
+  );
+
+  it(
+    "drains and freezes bounded worker stderr without invalidating a valid result",
+    async () => {
+      process.env["MOCK_BEHAVIOR"] = "stderr";
+      const adapter = new MCodeAdapter({ maxWorkerStderrBytes: 8 });
+      const invocation = makeInvocation();
+      await adapter.start(invocation);
+      const result = await adapter.collectResult(invocation.executionId);
+
+      expect(result.summary).toBe("Mocked success");
+      expect(result.diagnosticStderr).toMatchObject({
+        capturedBytes: 8,
+        totalBytes: expect.any(Number),
+        truncated: true,
+        capturedByteSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+      expect(Object.isFrozen(result.diagnosticStderr)).toBe(true);
     },
     15_000,
   );
@@ -398,6 +423,33 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
     await expect(adapter.collectResult(invocation.executionId)).rejects.toMatchObject({
       code: "UNKNOWN",
       message: expect.stringMatching(/protocol/i),
+    });
+  }, 15_000);
+
+  it("keeps protocol termination uncertainty as UNKNOWN", async () => {
+    process.env["MOCK_BEHAVIOR"] = "malformed";
+    const controller: PlatformProcessController = {
+      strategy: "windows_taskkill",
+      isAlive: () => "alive",
+      terminate: async (pid) => {
+        try { process.kill(pid); } catch { /* cleanup is best effort */ }
+        return {
+          confirmedGone: false,
+          gracefulAttempted: true,
+          forcedAttempted: true,
+          strategy: "windows_taskkill",
+          error: "protocol cleanup was not confirmed",
+        };
+      },
+    };
+    const adapter = new MCodeAdapter({
+      processSupervisor: new ProcessSupervisor({ platformController: controller }),
+    });
+    const invocation = makeInvocation();
+    await adapter.start(invocation);
+    await expect(adapter.collectResult(invocation.executionId)).rejects.toMatchObject({
+      code: "UNKNOWN",
+      message: expect.stringMatching(/termination could not be confirmed/i),
     });
   }, 15_000);
 

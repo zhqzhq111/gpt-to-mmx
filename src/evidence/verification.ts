@@ -7,7 +7,7 @@
  */
 
 import { sha256 } from "../protocol/hash.js";
-import { BoundedOutput } from "../runtime/bounded-output.js";
+import { BoundedOutput, type BoundedOutputEvidence } from "../runtime/bounded-output.js";
 import { resolveProgramIdentity, type ProgramIdentity } from "../runtime/program-identity.js";
 import {
   ProcessSupervisor,
@@ -58,6 +58,8 @@ export interface VerificationResult {
   readonly stderrBytes?: number;
   readonly stdoutTruncated?: boolean;
   readonly stderrTruncated?: boolean;
+  readonly stdoutEvidence?: BoundedOutputEvidence;
+  readonly stderrEvidence?: BoundedOutputEvidence;
   readonly durationMs: number;
   readonly startedAt: number;
   readonly finishedAt: number;
@@ -91,6 +93,8 @@ function hashablePayload(r: VerificationResult): unknown {
     ...(r.stderrBytes !== undefined ? { stderrBytes: r.stderrBytes } : {}),
     ...(r.stdoutTruncated !== undefined ? { stdoutTruncated: r.stdoutTruncated } : {}),
     ...(r.stderrTruncated !== undefined ? { stderrTruncated: r.stderrTruncated } : {}),
+    ...(r.stdoutEvidence !== undefined ? { stdoutEvidence: r.stdoutEvidence } : {}),
+    ...(r.stderrEvidence !== undefined ? { stderrEvidence: r.stderrEvidence } : {}),
     errorMessage: r.errorMessage,
     ...(r.termination !== undefined
       ? {
@@ -133,6 +137,8 @@ function makeSkippedResult(
     stderrBytes: 0,
     stdoutTruncated: false,
     stderrTruncated: false,
+    stdoutEvidence: new BoundedOutput(1).evidence(),
+    stderrEvidence: new BoundedOutput(1).evidence(),
     durationMs: 0,
     startedAt: now,
     finishedAt: now,
@@ -149,6 +155,8 @@ interface RunOutcome {
   readonly stderrBytes: number;
   readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
+  readonly stdoutEvidence: BoundedOutputEvidence;
+  readonly stderrEvidence: BoundedOutputEvidence;
   readonly errorMessage?: string;
   readonly termination?: VerificationTermination;
 }
@@ -179,6 +187,8 @@ function classifyProcessOutcome(
     stderrBytes: stderrOutput.totalBytes,
     stdoutTruncated: stdoutOutput.truncated,
     stderrTruncated: stderrOutput.truncated,
+    stdoutEvidence: stdoutOutput.evidence(),
+    stderrEvidence: stderrOutput.evidence(),
   };
   if (outcome.kind === "exited") {
     return {
@@ -248,6 +258,8 @@ async function runProfile(
           stderrBytes: 0,
           stdoutTruncated: false,
           stderrTruncated: false,
+          stdoutEvidence: new BoundedOutput(1).evidence(),
+          stderrEvidence: new BoundedOutput(1).evidence(),
           durationMs: Date.now() - startedAt,
           startedAt,
           finishedAt: Date.now(),
@@ -271,6 +283,8 @@ async function runProfile(
         stderrBytes: 0,
         stdoutTruncated: false,
         stderrTruncated: false,
+        stdoutEvidence: new BoundedOutput(1).evidence(),
+        stderrEvidence: new BoundedOutput(1).evidence(),
         durationMs: Date.now() - startedAt,
         startedAt,
         finishedAt: Date.now(),
@@ -353,6 +367,8 @@ async function runProfile(
     stderrBytes: outcome.stderrBytes,
     stdoutTruncated: outcome.stdoutTruncated,
     stderrTruncated: outcome.stderrTruncated,
+    stdoutEvidence: outcome.stdoutEvidence,
+    stderrEvidence: outcome.stderrEvidence,
     durationMs: finishedAt - startedAt,
     startedAt,
     finishedAt,

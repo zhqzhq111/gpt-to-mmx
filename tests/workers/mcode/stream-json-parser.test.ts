@@ -110,4 +110,35 @@ describe("real mcode stream-json contract", () => {
     }));
     expect(() => normalizeWorkerEvents([invalid], { strictSummary: true })).toThrow(/files_changed|array|string/i);
   });
+
+  it("strict mode rejects unknown summary fields and malformed test entries", () => {
+    const unknownField = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: JSON.stringify({
+          summary: "done",
+          files_changed: [],
+          tests: [],
+          remaining_risks: [],
+          unexpected: true,
+        }),
+      },
+    }));
+    expect(() => normalizeWorkerEvents([unknownField], { strictSummary: true })).toThrow(/unknown/i);
+
+    const malformedTest = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: JSON.stringify({
+          summary: "done",
+          files_changed: [],
+          tests: [{ name: "broken", status: "passed", extra: true }],
+          remaining_risks: [],
+        }),
+      },
+    }));
+    expect(() => normalizeWorkerEvents([malformedTest], { strictSummary: true })).toThrow(/unknown|test/i);
+  });
 });

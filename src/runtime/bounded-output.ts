@@ -1,4 +1,13 @@
+import { createHash } from "node:crypto";
+
 const MAX_BUFFER_LIMIT = 1_073_741_824;
+
+export interface BoundedOutputEvidence {
+  readonly capturedBytes: number;
+  readonly totalBytes: number;
+  readonly truncated: boolean;
+  readonly capturedByteSha256: string;
+}
 
 export class BoundedOutputError extends Error {
   constructor(message: string) {
@@ -47,4 +56,13 @@ export class BoundedOutput {
   get capturedBytes(): number { return this.retainedBytes; }
   get totalBytes(): number { return this.seenBytes; }
   get truncated(): boolean { return this.didTruncate; }
+
+  evidence(): BoundedOutputEvidence {
+    return Object.freeze({
+      capturedBytes: this.capturedBytes,
+      totalBytes: this.totalBytes,
+      truncated: this.truncated,
+      capturedByteSha256: createHash("sha256").update(this.captured()).digest("hex"),
+    });
+  }
 }

@@ -36,6 +36,7 @@ import {
   StreamJsonDecoder,
 } from "./stream-json-decoder.js";
 import { sha256 } from "../../protocol/hash.js";
+import { BoundedOutput } from "../../runtime/bounded-output.js";
 import {
   buildRuntimeIdentity,
   type RuntimeIdentity,
@@ -48,6 +49,7 @@ import {
 interface MCodeExecutionState {
   readonly executionId: ExecutionId;
   readonly maxWorkerStdoutBytes: number;
+  readonly maxWorkerStderrBytes: number;
   readonly maxStreamJsonLineBytes: number;
   readonly maxWorkerEvents: number;
   readonly process: ManagedProcess;
@@ -55,12 +57,15 @@ interface MCodeExecutionState {
   readonly completionPromise: Promise<void>;
   readonly resolveCompletion: () => void;
   readonly processOutcomePromise: Promise<ProcessOutcome>;
+  readonly stderrOutput: BoundedOutput;
   cancelRequested: boolean;
   terminalError?: AdapterError;
+  protocolTerminationPromise?: Promise<{ readonly confirmedGone: boolean; readonly error?: string }>;
 }
 
 const WATCHDOG_GRACE_MS = 1_000;
 const DEFAULT_WORKER_STDOUT_BYTES = 33_554_432;
+const DEFAULT_WORKER_STDERR_BYTES = 8_388_608;
 const DEFAULT_STREAM_JSON_LINE_BYTES = 4_194_304;
 const DEFAULT_WORKER_EVENTS = 100_000;
 
@@ -76,6 +81,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     readonly model?: string;
     readonly maxProbeOutputBytes?: number;
     readonly maxWorkerStdoutBytes?: number;
+    readonly maxWorkerStderrBytes?: number;
     readonly maxStreamJsonLineBytes?: number;
     readonly maxWorkerEvents?: number;
   } = {}) {
@@ -84,6 +90,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     this.model = options.model;
     this.maxProbeOutputBytes = options.maxProbeOutputBytes;
     this.maxWorkerStdoutBytes = options.maxWorkerStdoutBytes;
+    this.maxWorkerStderrBytes = options.maxWorkerStderrBytes;
     this.maxStreamJsonLineBytes = options.maxStreamJsonLineBytes;
     this.maxWorkerEvents = options.maxWorkerEvents;
   }
@@ -91,6 +98,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
   private readonly model: string | undefined;
   private readonly maxProbeOutputBytes: number | undefined;
   private readonly maxWorkerStdoutBytes: number | undefined;
+  private readonly maxWorkerStderrBytes: number | undefined;
   private readonly maxStreamJsonLineBytes: number | undefined;
   private readonly maxWorkerEvents: number | undefined;
 
@@ -211,6 +219,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     const state: MCodeExecutionState = {
       executionId: id,
       maxWorkerStdoutBytes: this.maxWorkerStdoutBytes ?? DEFAULT_WORKER_STDOUT_BYTES,
+      maxWorkerStderrBytes: this.maxWorkerStderrBytes ?? DEFAULT_WORKER_STDERR_BYTES,
       maxStreamJsonLineBytes: this.maxStreamJsonLineBytes ?? DEFAULT_STREAM_JSON_LINE_BYTES,
       maxWorkerEvents: this.maxWorkerEvents ?? DEFAULT_WORKER_EVENTS,
       process: managed,
@@ -218,6 +227,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
       completionPromise,
       resolveCompletion,
       processOutcomePromise: managed.wait(),
+      stderrOutput: new BoundedOutput(this.maxWorkerStderrBytes ?? DEFAULT_WORKER_STDERR_BYTES),
       cancelRequested: false,
     };
     this.executions.set(id, state);
@@ -264,7 +274,17 @@ export class MCodeAdapter implements CodingWorkerAdapter {
       state.processOutcomePromise.then((outcome) => ({ kind: "process" as const, outcome })),
     ]);
 
-    if (state.terminalError !== undefined) throw state.terminalError;
+    if (state.terminalError !== undefined) {
+      const termination = await state.protocolTerminationPromise;
+      if (termination !== undefined && !termination.confirmedGone) {
+        throw new AdapterError(
+          "UNKNOWN",
+          `worker stream-json protocol failed and termination could not be confirmed${termination.error !== undefined ? `: ${termination.error}` : ""}`,
+          { executionId, cause: state.terminalError },
+        );
+      }
+      throw state.terminalError;
+    }
     if (state.cancelRequested) {
       throw new AdapterError(
         "CANCELLED",
@@ -314,6 +334,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
         ...outcome.result,
         executionId,
         ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
+        diagnosticStderr: state.stderrOutput.evidence(),
       };
     }
 
@@ -371,17 +392,20 @@ function attachOutput(state: MCodeExecutionState): void {
         { executionId: state.executionId, cause: error },
       );
       state.resolveCompletion();
+      state.protocolTerminationPromise = state.process.terminate("cleanup");
     }
-    void state.process.terminate("cleanup");
   };
   state.process.stdout?.on("data", (chunk: Buffer | string) => {
+    if (state.terminalError !== undefined) return;
     try {
       for (const event of decoder.push(chunk)) recordEvent(state, event);
     } catch (error) {
       protocolFailure(error);
     }
   });
-  state.process.stderr?.on("data", () => undefined);
+  state.process.stderr?.on("data", (chunk: Buffer | string) => {
+    state.stderrOutput.push(chunk);
+  });
   void state.processOutcomePromise.then(() => {
     if (state.terminalError !== undefined) return;
     try {
@@ -393,6 +417,7 @@ function attachOutput(state: MCodeExecutionState): void {
 }
 
 function recordEvent(state: MCodeExecutionState, event: StreamJsonEvent): void {
+  if (state.terminalError !== undefined) return;
   state.events.push(event);
   if (event.type === "exec.completed") state.resolveCompletion();
 }

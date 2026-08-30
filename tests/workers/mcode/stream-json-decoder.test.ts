@@ -24,6 +24,30 @@ describe("incremental stream-json decoder", () => {
     expect(decoder.finish()).toMatchObject([{ type: "result", status: "success" }]);
   });
 
+  it("preserves UTF-8 code points and CRLF split across byte chunks", () => {
+    const line = Buffer.from(`${JSON.stringify({ type: "assistant", text: "你" })}\r\n`, "utf8");
+    const decoder = new StreamJsonDecoder({ maxLineBytes: 1_024, maxTotalBytes: 2_048, maxEvents: 10 });
+    const utf8Start = line.indexOf(Buffer.from("你", "utf8"));
+    const events = [
+      decoder.push(line.subarray(0, utf8Start)),
+      decoder.push(line.subarray(utf8Start, utf8Start + 1)),
+      decoder.push(line.subarray(utf8Start + 1, line.length - 1)),
+      decoder.push(line.subarray(line.length - 1)),
+      decoder.finish(),
+    ].flat();
+
+    expect(events).toEqual([{ type: "assistant", text: "你" }]);
+  });
+
+  it("ignores empty lines while preserving one final unterminated line", () => {
+    const decoder = new StreamJsonDecoder({ maxLineBytes: 1_024, maxTotalBytes: 2_048, maxEvents: 10 });
+    expect(decoder.push("\n\r\n")).toEqual([]);
+    expect(decoder.push(validResult)).toEqual([]);
+    expect(decoder.finish()).toMatchObject([{ type: "result", status: "success" }]);
+    expect(decoder.finish()).toEqual([]);
+    expect(decoder.eventCount).toBe(1);
+  });
+
   it("parses the final non-newline-terminated line exactly once", () => {
     const decoder = new StreamJsonDecoder({ maxLineBytes: 1_024, maxTotalBytes: 2_048, maxEvents: 10 });
     decoder.push(`${validResult}\n`);

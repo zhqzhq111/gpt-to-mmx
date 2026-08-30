@@ -131,6 +131,7 @@ export class G2MExecutionEngineError extends Error {
     | "WORKER_CANCELLED"
     | "RECOVERY_REQUIRED"
     | "CAPABILITY_VIOLATION"
+    | "VERIFICATION_RUNTIME_DRIFT"
     | "VERIFICATION_FAILED"
     | "STORAGE_ADMISSION_DENIED"
     | "STORAGE_LIMIT_EXCEEDED"
@@ -858,6 +859,24 @@ export class G2MExecutionEngine {
           payload: { resultHash: verification.resultHash },
           fingerprint,
         });
+      } else if (verification.status === "runtime_drift") {
+        const reason = "verification executable identity changed before run";
+        this.appendAndReduce(mutable, {
+          taskId: task.task_id,
+          executionId,
+          type: "verification.failed",
+          payload: {
+            code: "VERIFICATION_RUNTIME_DRIFT",
+            reason,
+            verificationStatus: verification.status,
+            resultHash: verification.resultHash,
+          },
+          fingerprint,
+        });
+        throw new G2MExecutionEngineError(
+          "VERIFICATION_RUNTIME_DRIFT",
+          reason,
+        );
       } else {
         this.appendAndReduce(mutable, {
           taskId: task.task_id,
