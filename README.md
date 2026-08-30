@@ -93,6 +93,29 @@ npm run g2m -- gc --config <config.json>
 npm run g2m -- gc --config <config.json> --apply
 ```
 
+运维命令提供统一的状态、诊断和受限修复接口。`status` 与 `doctor` 都是
+严格只读的，不会触发 Engine startup recovery、Projection backfill、Lease
+reconciliation、Storage reconciliation 或 GC resume：
+
+```powershell
+npm run g2m -- status --config <config.json>
+npm run g2m -- status --config <config.json> --format json
+npm run g2m -- doctor --config <config.json> --format json
+```
+
+`repair` 默认只生成计划；只有显式 `--apply` 才会执行一个白名单动作：
+`projection-rebuild`、`gc-resume` 或 `storage-reconcile`。不支持
+`--all`、`--force` 或任何绕过 Journal、Recovery、Lease、SQLite 校验的选项。
+apply 会在 Repair Lock 内重新生成并校验 plan；如果锁前后的持久状态发生
+变化，会返回 `REPAIR_PLAN_STALE`，不会执行旧 plan。Repair Lock 带有
+heartbeat、同主机 dead-PID stale reclaim 和 operation ownership 校验；live、
+unknown 或 foreign owner 都会被拒绝。修复后应再次运行 `doctor`：
+
+```powershell
+npm run g2m -- repair --config <config.json> --action projection-rebuild
+npm run g2m -- repair --config <config.json> --action projection-rebuild --apply --format json
+```
+
 ## Codex Skill
 
 Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
@@ -170,6 +193,7 @@ src/
 ├── execution/                 State Machine、Fingerprint、Execution Engine
 ├── review/                    Bundle、Ingress、Replay Guard
 ├── recovery/                  UNKNOWN / RECOVERY_REQUIRED Resolver
+├── operations/                status / doctor / allowlisted repair
 └── workers/mcode/             Resolver、Adapter、Parser、Normalizer
 
 _skill/

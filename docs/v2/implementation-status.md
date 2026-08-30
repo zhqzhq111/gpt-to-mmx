@@ -868,6 +868,31 @@ The six existing skips remain the real mcode/permission probes. Phase 10 does
 not add a background GC daemon, generic force deletion, broad orphan cleanup,
 or Phase 11 operational commands.
 
+## Phase 11 — Operational CLI
+
+Status: **COMPLETE / SEALED** on branch `codex/phase-11-operational-cli`.
+
+The operational layer exposes read-only `g2m status` and `g2m doctor`, plus
+explicit-apply `g2m repair`. Snapshot collection never calls
+`configureEngine()` or its mutating startup sequence. It reads Journal,
+filesystem manifests, lease files, reservation records, projection metadata,
+Recovery Scanner results, and GC candidate results without creating missing
+directories or repairing state merely by observing it.
+
+Repair is serialized and durably audited. The lock heartbeat is refreshed during
+long repairs; reclaim requires same-host stale evidence plus a proven-dead PID,
+and release is conditional on the current operation ID. A fresh plan is built
+after lock acquisition and compared with the pre-lock precondition hash, so a
+changed plan returns `REPAIR_PLAN_STALE` without dispatching the stale action.
+The only Phase 11 actions are
+`projection-rebuild`, `gc-resume`, and `storage-reconcile`; there is no generic
+force option, `--all`, Journal rewrite, or lease reclaim action. JSON output uses
+the stable `g2m.status.v1`, `g2m.doctor.v1`, `g2m.repair-plan.v1`, and
+`g2m.repair-result.v1` schemas with snake_case fields. Doctor evaluates raw
+volume availability, reservation load, configured free-space floors, and
+managed-storage maximums rather than a clamped derived value.
+
 ## Remaining phases
 
-GC, operational CLI, runtime hardening, and CI matrices.
+- Phase 12 — Runtime Hardening
+- Phase 13 — CI / Regression
