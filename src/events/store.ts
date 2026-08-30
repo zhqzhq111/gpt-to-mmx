@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { TaskFingerprint } from "../execution/fingerprint.js";
@@ -150,6 +150,49 @@ export interface JournalRecoveryIssue {
   readonly executionId: string;
   readonly path: string;
   readonly kind: "TRUNCATED_TAIL";
+}
+
+export type SingleExecutionLoadResult =
+  | { readonly kind: "ok"; readonly events: readonly TaskEvent[]; readonly tailStatus: "COMPLETE" | "TRUNCATED_TAIL" }
+  | { readonly kind: "load-error"; readonly error: string };
+
+/**
+ * Load a single execution's journal without touching any other execution.
+ * Returns the events plus tail status on success, or a structured error
+ * (invalid JSON, broken chain, attempt-id mismatch, missing file, or any
+ * thrown restore/schema-mismatch error) on failure. Used by the projection
+ * rebuild so one corrupted journal cannot abort the rest of the rebuild.
+ */
+export function loadSingleExecutionJournal(
+  path: string,
+  expectedExecutionId: string,
+): SingleExecutionLoadResult {
+  if (!existsSync(path)) {
+    return { kind: "load-error", error: `journal file is missing: ${path}` };
+  }
+  try {
+    const raw = readJournal<PersistedTaskEvent>(path);
+    const events = raw.records.map(restoreEvent);
+    if (events.some((event) => event.attemptId !== expectedExecutionId)) {
+      return {
+        kind: "load-error",
+        error: `journal execution binding does not match its directory: ${path}`,
+      };
+    }
+    const verification = verifyChain(events);
+    if (!verification.valid) {
+      return {
+        kind: "load-error",
+        error: `event log chain is invalid in ${path} at sequence ${verification.brokenAtSeq ?? "unknown"}`,
+      };
+    }
+    return { kind: "ok", events, tailStatus: raw.tailStatus };
+  } catch (error) {
+    // Any thrown error inside readJournal / restoreEvent / verifyChain
+    // (e.g. unsupported journal schema_version) is funneled into the same
+    // load-error bucket so a single bad journal cannot abort the rebuild.
+    return { kind: "load-error", error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export class EventStore {

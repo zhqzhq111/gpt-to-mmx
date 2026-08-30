@@ -100,7 +100,18 @@ function configureEngine(
   let projection: ExecutionProjection;
   try {
     projectionDatabase = new StateDatabase(join(stateRoot, "g2m-state.sqlite"));
-    projection = new ExecutionProjector(projectionDatabase);
+    const projector = new ExecutionProjector(projectionDatabase);
+    // Seed the `workspaces` table from trusted CLI config. The Journal does
+    // not carry workspace identity — this projection row comes purely from
+    // local configuration and is refreshed on every CLI invocation.
+    projector.seedWorkspaces(
+      config.workspaces.map((entry) => ({
+        workspaceId: entry.workspace_id,
+        canonicalPath: entry.path,
+      })),
+      Date.now(),
+    );
+    projection = projector;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     projection = {

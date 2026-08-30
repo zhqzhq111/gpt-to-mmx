@@ -105,4 +105,77 @@ describe("ExecutionProjector", () => {
     expect(projector.execution("execution-1")).toBeUndefined();
     database.close();
   });
+
+  it("closes a recovery case when recovery.reconciled is projected", async () => {
+    const { database, projector, events } = await setup();
+    const created = events.append({
+      taskId: "task-1", attemptId: "execution-1", type: "task.created", payload: {}, timestampMs: 10,
+    });
+    projector.project(created, "PLANNED");
+    const required = events.append({
+      taskId: "task-1",
+      attemptId: "execution-1",
+      type: "recovery.required",
+      payload: { reason: "worker outcome unknown" },
+      timestampMs: 20,
+    });
+    projector.project(required, "RECOVERY_REQUIRED");
+    const reconciled = events.append({
+      taskId: "task-1",
+      attemptId: "execution-1",
+      type: "recovery.reconciled",
+      payload: { reason: "matched frozen patch" },
+      timestampMs: 30,
+    });
+    projector.project(reconciled, "RECOVERY_REQUIRED");
+
+    expect(projector.recoveryCase("execution-1")).toMatchObject({
+      execution_id: "execution-1",
+      status: "RESOLVED",
+      reason: "worker outcome unknown",
+      created_at: 20,
+      resolved_at: 30,
+    });
+    // Recovery-domain event must not advance the lifecycle state
+    expect(projector.execution("execution-1")?.state).toBe("RECOVERY_REQUIRED");
+    // Recovery-domain event must not be written to the projection again
+    expect(
+      database.prepare("SELECT count(*) AS n FROM recovery_cases WHERE execution_id = ?")
+        .get("execution-1"),
+    ).toEqual({ n: 1 });
+    database.close();
+  });
+
+  it("seeds the workspaces table from trusted config without affecting executions", async () => {
+    const { database, projector } = await setup();
+
+    projector.seedWorkspaces([
+      { workspaceId: "ws-1", canonicalPath: "C:/repos/one" },
+      { workspaceId: "ws-2", canonicalPath: "C:/repos/two" },
+    ], 5_000);
+
+    expect(
+      database.prepare("SELECT canonical_path, updated_at FROM workspaces WHERE workspace_id = ?")
+        .get("ws-1"),
+    ).toEqual({ canonical_path: "C:/repos/one", updated_at: 5_000 });
+    expect(
+      database.prepare("SELECT count(*) AS n FROM workspaces").get(),
+    ).toEqual({ n: 2 });
+
+    // UPSERT — re-seeding refreshes canonical_path and updated_at only
+    projector.seedWorkspaces(
+      [{ workspaceId: "ws-1", canonicalPath: "C:/repos/one-renamed" }],
+      9_000,
+    );
+    expect(
+      database.prepare("SELECT canonical_path, updated_at FROM workspaces WHERE workspace_id = ?")
+        .get("ws-1"),
+    ).toEqual({ canonical_path: "C:/repos/one-renamed", updated_at: 9_000 });
+    // ws-2 is preserved because UPSERT never deletes
+    expect(
+      database.prepare("SELECT canonical_path FROM workspaces WHERE workspace_id = ?")
+        .get("ws-2"),
+    ).toEqual({ canonical_path: "C:/repos/two" });
+    database.close();
+  });
 });

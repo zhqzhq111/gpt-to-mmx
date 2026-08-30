@@ -26,15 +26,23 @@ export class StateDatabase {
   private closed = false;
 
   constructor(readonly path: string) {
+    let opened: DatabaseSync | undefined;
     try {
       if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-      this.database = new DatabaseSync(path, { timeout: 5_000 });
-      this.database.exec("PRAGMA journal_mode = WAL");
-      this.database.exec("PRAGMA synchronous = NORMAL");
-      this.database.exec("PRAGMA busy_timeout = 5000");
-      this.database.exec(FROZEN_SCHEMA_SQL);
+      opened = new DatabaseSync(path, { timeout: 5_000 });
+      opened.exec("PRAGMA journal_mode = WAL");
+      opened.exec("PRAGMA synchronous = NORMAL");
+      opened.exec("PRAGMA busy_timeout = 5000");
+      opened.exec(FROZEN_SCHEMA_SQL);
+      this.database = opened;
       this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
     } catch (error) {
+      // Close the SQLite handle on any failure so the underlying file
+      // lock is released (otherwise a follow-up `rm` / `rename` against
+      // the same path would fail with EBUSY on Windows).
+      if (opened !== undefined) {
+        try { opened.close(); } catch { /* swallow close error during cleanup */ }
+      }
       throw new ProjectionDatabaseError(`cannot open projection database: ${path}`, error);
     }
   }

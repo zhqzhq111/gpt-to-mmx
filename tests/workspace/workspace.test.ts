@@ -11,7 +11,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -21,6 +22,13 @@ import { WorkspaceLock, WorkspaceLockError } from "../../src/workspace/lock.js";
 import { captureBaseline, BaselineError } from "../../src/workspace/baseline.js";
 
 const execFileAsync = promisify(execFile);
+
+// tests/setup.ts routes os.tmpdir() into the G2M repository, so creating the
+// `plainDir` fixture under the default temp would be recognised by git as a
+// subdirectory of the repository itself. To verify the `NOT_GIT_REPO` contract
+// the fixture must be allocated outside the repo.
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const outsideRoot = resolve(repositoryRoot, "..", ".g2m-workspace-tests");
 
 describe("WorkspaceRegistry", () => {
   it("register + get round-trip", () => {
@@ -141,6 +149,7 @@ describe("WorkspaceLock", () => {
 describe("captureBaseline", () => {
   let tmpRoot: string;
   let repoDir: string;
+  let outsideDir: string;
 
   beforeAll(async () => {
     tmpRoot = await mkdtemp(join(tmpdir(), "g2m-baseline-"));
@@ -157,10 +166,15 @@ describe("captureBaseline", () => {
     await writeFile(join(repoDir, "README.md"), "hello\n");
     await execFileAsync("git", ["add", "README.md"], { cwd: repoDir });
     await execFileAsync("git", ["commit", "-m", "init"], { cwd: repoDir });
+
+    // 准备仓库外 fixture,验证 NOT_GIT_REPO
+    await mkdir(outsideRoot, { recursive: true });
+    outsideDir = await mkdtemp(join(outsideRoot, "g2m-baseline-"));
   });
 
   afterAll(async () => {
     await rm(tmpRoot, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
   });
 
   it("captures a clean baseline (plan §16 MVP Clean Worktree)", async () => {
@@ -185,7 +199,7 @@ describe("captureBaseline", () => {
   });
 
   it("throws NOT_GIT_REPO for a non-git directory", async () => {
-    const plainDir = join(tmpRoot, "plain");
+    const plainDir = join(outsideDir, "plain");
     await mkdir(plainDir, { recursive: true });
     await expect(captureBaseline(plainDir)).rejects.toBeInstanceOf(BaselineError);
     await expect(captureBaseline(plainDir)).rejects.toThrow(/not.*git|git.*failed/i);

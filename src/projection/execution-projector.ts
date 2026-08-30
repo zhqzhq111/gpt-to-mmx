@@ -3,6 +3,11 @@ import { fingerprintHash } from "../execution/fingerprint.js";
 import type { TaskState } from "../execution/state-machine.js";
 import { StateDatabase } from "./database.js";
 
+export interface WorkspaceSeed {
+  readonly workspaceId: string;
+  readonly canonicalPath: string;
+}
+
 export interface ProjectionMetadata {
   readonly artifactPath?: string;
   readonly worktreePath?: string;
@@ -105,6 +110,29 @@ export class ExecutionProjector implements ExecutionProjection {
     return this.database.prepare(
       "SELECT * FROM recovery_cases WHERE execution_id = ?",
     ).get(executionId) as RecoveryCaseRow | undefined;
+  }
+
+  /**
+   * Seed the `workspaces` table from trusted CLI configuration. The Journal
+   * does not capture workspace identity because workspace bindings come from
+   * the local config file, not from the execution. The projector is the
+   * canonical writer for the projection, so this method lives here and is
+   * reused by `rebuildProjection`.
+   *
+   * UPSERT semantics: re-seeding refreshes `canonical_path` and `updated_at`
+   * but does not delete rows the caller did not include.
+   */
+  seedWorkspaces(workspaces: readonly WorkspaceSeed[], nowMs: number): void {
+    if (workspaces.length === 0) return;
+    const statement = this.database.prepare(`
+      INSERT INTO workspaces(workspace_id, canonical_path, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(workspace_id) DO UPDATE SET
+        canonical_path = excluded.canonical_path,
+        updated_at = excluded.updated_at
+    `);
+    for (const workspace of workspaces) {
+      statement.run(workspace.workspaceId, workspace.canonicalPath, nowMs);
+    }
   }
 
   private createExecution(
