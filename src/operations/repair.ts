@@ -161,7 +161,11 @@ export async function executeRepair(options: RepairOptions & { readonly apply: t
   if (!plan.permitted) {
     return { ...resultBase, status: "REFUSED", result: null, reasons: plan.reasons };
   }
-  const lock = await acquireRepairLock(stateRoot(options.config), { operationId: plan.operationId, nowMs: plan.generatedAt });
+  const lock = await acquireRepairLock(stateRoot(options.config), {
+    operationId: plan.operationId,
+    nowMs: plan.generatedAt,
+    reclaimGuardStaleMs: options.config.runtime_hardening.repair_reclaim_guard_stale_ms,
+  });
   try {
     const freshPlan = await planRepair({ ...options, operationId: plan.operationId }, dependencies);
     const stale = plan.action !== freshPlan.action || plan.executionId !== freshPlan.executionId || plan.permitted !== freshPlan.permitted || plan.target !== freshPlan.target || plan.preconditionHash !== freshPlan.preconditionHash || JSON.stringify(plan.reasons) !== JSON.stringify(freshPlan.reasons);

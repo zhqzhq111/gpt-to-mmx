@@ -22,7 +22,7 @@ function run(mode, configPath) {
   });
 }
 
-async function fixture(prefix, journalCount = 0) {
+async function fixture(prefix, journalCount = 0, reclaimGuardStaleMs) {
   const root = await mkdtemp(join(tmpdir(), prefix));
   const stateRoot = join(root, "state");
   const configPath = join(root, "config.json");
@@ -45,6 +45,7 @@ async function fixture(prefix, journalCount = 0) {
     protocol_version: "g2m.local-config.v1",
     workspaces: [{ workspace_id: "ws-1", path: join(root, "workspace") }],
     verification_profiles: [], worktree_root: join(root, "worktrees"), artifact_root: join(root, "artifacts"), state_root: stateRoot,
+    ...(reclaimGuardStaleMs === undefined ? {} : { runtime_hardening: { repair_reclaim_guard_stale_ms: reclaimGuardStaleMs } }),
   }), "utf8");
   return { root, stateRoot, configPath };
 }
@@ -146,4 +147,38 @@ test("unknown and foreign repair owners are refused by a real repair process", a
     const foreignResult = await run("repair", f.configPath);
     assert.equal(foreignResult.code, 1);
   } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("configured repair reclaim guard threshold changes stale-guard behavior", async () => {
+  const stale = await fixture("g2m-operations-process-guard-stale-", 0, 1);
+  const fresh = await fixture("g2m-operations-process-guard-fresh-", 0, 7 * 24 * 60 * 60 * 1_000);
+  async function seed(f) {
+    const handle = spawn(process.execPath, [child, "hold-lock", f.configPath, "crashed-owner"], { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    let line = "";
+    await new Promise((resolvePromise, reject) => {
+      const timer = setTimeout(() => reject(new Error("repair owner did not start")), 10_000);
+      handle.stdout.once("data", (chunk) => { clearTimeout(timer); line = String(chunk).trim(); resolvePromise(); });
+      handle.once("error", reject);
+    });
+    handle.kill();
+    await new Promise((resolvePromise) => handle.once("close", resolvePromise));
+    const owner = JSON.parse(line);
+    const lock = JSON.parse(await readFile(owner.path, "utf8"));
+    lock.heartbeat_at = 0;
+    await writeFile(owner.path, JSON.stringify(lock) + "\n", "utf8");
+    const guard = await run("write-guard", f.configPath);
+    assert.equal(guard.code, 0, guard.stderr);
+  }
+  try {
+    await seed(stale);
+    const reclaimed = await run("repair", stale.configPath);
+    assert.equal(reclaimed.code, 0, reclaimed.stderr);
+
+    await seed(fresh);
+    const refused = await run("repair", fresh.configPath);
+    assert.equal(refused.code, 1);
+    await stat(join(fresh.stateRoot, "repair", "repair.lock.reclaim"));
+  } finally {
+    await Promise.all([rm(stale.root, { recursive: true, force: true }), rm(fresh.root, { recursive: true, force: true })]);
+  }
 });
