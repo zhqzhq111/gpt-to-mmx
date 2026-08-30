@@ -339,6 +339,45 @@ describe("resolveRecovery — Process still alive", () => {
   });
 });
 
+describe("resolveRecovery — Process status unknown", () => {
+  it("returns UNKNOWN before clean-workspace reconciliation", () => {
+    const r = resolveRecovery(makeInput({
+      events: makeEventsUpToAgentSpawn(),
+      currentState: "RUNNING",
+      processStatus: "unknown",
+      workspaceDirty: false,
+    }));
+    expect(r.verdict).toBe("UNKNOWN");
+    expect(r.reason).toBe("process status is unknown; recovery must not assume the worker has exited");
+    expect(r.safeToRetry).toBe(false);
+    expect(r.safeToResume).toBe(false);
+    expect(r.canAutoContinueNextTask).toBe(false);
+  });
+
+  it("returns UNKNOWN before using a persisted worker result", () => {
+    const r = resolveRecovery(makeInput({
+      events: makeEventsUpToAgentSpawn(),
+      currentState: "RUNNING",
+      processStatus: "unknown",
+      workerResult: makeWorkerResult(),
+      workspaceDirty: false,
+    }));
+    expect(r.verdict).toBe("UNKNOWN");
+    expect(r.reason).toBe("process status is unknown; recovery must not assume the worker has exited");
+  });
+
+  it("returns UNKNOWN before reconciling a terminal caller state", () => {
+    const r = resolveRecovery(makeInput({
+      currentState: "ACCEPTED",
+      processStatus: "unknown",
+      workspaceDirty: false,
+    }));
+    expect(r.verdict).toBe("UNKNOWN");
+    expect(r.reason).toBe("process status is unknown; recovery must not assume the worker has exited");
+    expect(r.suggestedNextState).toBe("RECOVERY_REQUIRED");
+  });
+});
+
 describe("resolveRecovery — Hash chain broken (plan §46)", () => {
   it("returns UNKNOWN when payload is tampered", () => {
     const events = makeCompleteHappyPathEvents();

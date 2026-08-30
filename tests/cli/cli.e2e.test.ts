@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
+import { EventStore } from "../../src/events/store.js";
 import { main } from "../../src/cli/index.js";
 import { StateDatabase } from "../../src/projection/database.js";
 import { ExecutionProjector } from "../../src/projection/execution-projector.js";
@@ -350,6 +351,229 @@ describeWindows("G2M CLI handoff E2E", () => {
         standaloneReviewPath,
       ]);
       await expect(readFile(join(root, "probe-state", "g2m-state.sqlite"))).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("continues a healthy new run when an unrelated Journal is quarantined", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-cli-quarantine-e2e-"));
+    const repo = join(root, "repo");
+    const artifacts = join(root, "artifacts");
+    const state = join(root, "state");
+    const worktrees = join(root, "worktrees");
+    const reviewPath = join(root, "review.json");
+    const configPath = join(root, "config.json");
+    const taskPath = join(root, "task.json");
+    const mockPath = join(root, "mcode.cmd");
+    const quarantinedJournal = join(state, "executions", "unrelated-corrupt", "state-events.ndjson");
+
+    try {
+      await mkdir(repo, { recursive: true });
+      await git(repo, ["init", "--initial-branch=main"]);
+      await git(repo, ["config", "user.email", "g2m@test.local"]);
+      await git(repo, ["config", "user.name", "G2M Test"]);
+      await writeFile(join(repo, "README.md"), "# fixture\n", "utf8");
+      await git(repo, ["add", "."]);
+      await git(repo, ["commit", "-m", "baseline"]);
+      await mkdir(join(state, "executions", "unrelated-corrupt"), { recursive: true });
+      await writeFile(quarantinedJournal, "not-json\n", "utf8");
+      const quarantinedBefore = await readFile(quarantinedJournal);
+      await writeFile(
+        mockPath,
+        [
+          "@echo off",
+          "if \"%~1\"==\"--version\" (echo 0.2.7-test& exit /b 0)",
+          "if \"%~1\"==\"--help\" (echo Usage: mcode ^<command^>& exit /b 0)",
+          "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo Usage: mcode exec& exit /b 0)",
+          "if \"%~1\"==\"exec\" goto :exec",
+          "exit /b 1",
+          ":exec",
+          "echo {\"schemaVersion\":1,\"sequence\":1,\"timestampMs\":1,\"runId\":\"run-cli\",\"sessionId\":\"mvs_cli\",\"turnId\":\"turn-cli\",\"type\":\"exec.started\"}",
+          "echo {\"schemaVersion\":1,\"sequence\":2,\"timestampMs\":2,\"runId\":\"run-cli\",\"sessionId\":\"mvs_cli\",\"turnId\":\"turn-cli\",\"type\":\"exec.completed\",\"result\":{\"schemaVersion\":1,\"type\":\"exec.result\",\"runId\":\"run-cli\",\"sessionId\":\"mvs_cli\",\"turnId\":\"turn-cli\",\"status\":\"succeeded\",\"output\":\"{\\\"summary\\\":\\\"No changes\\\",\\\"files_changed\\\":[],\\\"tests\\\":[],\\\"remaining_risks\\\":[]}\",\"model\":{},\"usage\":{},\"durationMs\":1}}",
+          "exit /b 0",
+          "",
+        ].join("\r\n"),
+        "utf8",
+      );
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          protocol_version: "g2m.local-config.v1",
+          workspaces: [{ workspace_id: "cli-demo", path: repo }],
+          verification_profiles: [],
+          worktree_root: worktrees,
+          artifact_root: artifacts,
+          state_root: state,
+          mcode_path: mockPath,
+          review_timeout_ms: 20_000,
+        }),
+        "utf8",
+      );
+      await writeFile(
+        taskPath,
+        JSON.stringify({
+          protocol_version: "g2m.code-task.v1",
+          task_id: "cli-quarantine-task",
+          workspace_scope: {
+            workspace_id: "cli-demo",
+            base_revision: "HEAD",
+            require_clean_worktree: true,
+          },
+          goal: "Inspect the repository without changing it.",
+          constraints: ["Do not modify files."],
+          requested_capabilities: { read: true, write: false, test: false, network: false },
+          permission_policy: "read_only",
+          limits: { max_steps: 5, timeout_ms: 30_000 },
+          verification_profile: "none",
+          acceptance_criteria: ["No files change."],
+          session_policy: { mode: "new" },
+        }),
+        "utf8",
+      );
+
+      const running = main(["run", "--config", configPath, "--task", taskPath, "--review", reviewPath]);
+      const bundlePath = await waitForBundle(artifacts);
+      await main(["review", "--bundle", bundlePath, "--decision", "BLOCK", "--output", reviewPath]);
+      await running;
+
+      const runDirectories = await readdir(artifacts, { withFileTypes: true });
+      const runDirectory = runDirectories.find((entry) => entry.isDirectory());
+      expect(runDirectory).toBeDefined();
+      expect(JSON.parse(await readFile(join(artifacts, runDirectory!.name, "outcome.json"), "utf8")))
+        .toMatchObject({ state: "BLOCKED" });
+      expect(await readFile(quarantinedJournal)).toEqual(quarantinedBefore);
+      expect(await readdir(join(state, "executions"))).toEqual(
+        expect.arrayContaining(["unrelated-corrupt", runDirectory!.name]),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("safe-holds an active Journal once before allowing a healthy run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-cli-recovery-e2e-"));
+    const repo = join(root, "repo");
+    const artifacts = join(root, "artifacts");
+    const state = join(root, "state");
+    const worktrees = join(root, "worktrees");
+    const reviewPath = join(root, "review.json");
+    const configPath = join(root, "config.json");
+    const taskPath = join(root, "task.json");
+    const mockPath = join(root, "mcode.cmd");
+    const oldExecutionId = "old-active-execution";
+    const secondTaskPath = join(root, "second-task.json");
+    const oldTaskId = "old-active-task";
+
+    try {
+      await mkdir(repo, { recursive: true });
+      await git(repo, ["init", "--initial-branch=main"]);
+      await git(repo, ["config", "user.email", "g2m@test.local"]);
+      await git(repo, ["config", "user.name", "G2M Test"]);
+      await writeFile(join(repo, "README.md"), "# fixture\n", "utf8");
+      await git(repo, ["add", "."]);
+      await git(repo, ["commit", "-m", "baseline"]);
+
+      const oldEvents = new EventStore({
+        executionDirectory: join(state, "executions"),
+      });
+      oldEvents.append({
+        taskId: oldTaskId,
+        attemptId: oldExecutionId,
+        type: "task.created",
+        payload: { task: { task_id: oldTaskId } },
+        timestampMs: 1,
+      });
+      oldEvents.append({ taskId: oldTaskId, attemptId: oldExecutionId, type: "task.validation.started", payload: {} });
+      oldEvents.append({ taskId: oldTaskId, attemptId: oldExecutionId, type: "task.validation.passed", payload: {} });
+      oldEvents.append({ taskId: oldTaskId, attemptId: oldExecutionId, type: "workspace.lock.requested", payload: {} });
+      oldEvents.append({ taskId: oldTaskId, attemptId: oldExecutionId, type: "workspace.lock.acquired", payload: {} });
+      oldEvents.append({ taskId: oldTaskId, attemptId: oldExecutionId, type: "agent.spawn.started", payload: {} });
+      oldEvents.close();
+      const oldJournalPath = join(state, "executions", oldExecutionId, "state-events.ndjson");
+      const oldJournalBefore = await readFile(oldJournalPath);
+
+      await writeFile(
+        mockPath,
+        [
+          "@echo off",
+          "if \"%~1\"==\"--version\" (echo 0.2.7-test& exit /b 0)",
+          "if \"%~1\"==\"--help\" (echo Usage: mcode ^<command^>& exit /b 0)",
+          "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo Usage: mcode exec& exit /b 0)",
+          "if \"%~1\"==\"exec\" goto :exec",
+          "exit /b 1",
+          ":exec",
+          "echo {\"schemaVersion\":1,\"sequence\":1,\"timestampMs\":1,\"runId\":\"run-cli\",\"sessionId\":\"mvs_cli\",\"turnId\":\"turn-cli\",\"type\":\"exec.started\"}",
+          "echo {\"schemaVersion\":1,\"sequence\":2,\"timestampMs\":2,\"runId\":\"run-cli\",\"sessionId\":\"mvs_cli\",\"turnId\":\"turn-cli\",\"type\":\"exec.completed\",\"result\":{\"schemaVersion\":1,\"type\":\"exec.result\",\"runId\":\"run-cli\",\"sessionId\":\"mvs_cli\",\"turnId\":\"turn-cli\",\"status\":\"succeeded\",\"output\":\"{\\\"summary\\\":\\\"No changes\\\",\\\"files_changed\\\":[],\\\"tests\\\":[],\\\"remaining_risks\\\":[]}\",\"model\":{},\"usage\":{},\"durationMs\":1}}",
+          "exit /b 0",
+          "",
+        ].join("\r\n"),
+        "utf8",
+      );
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          protocol_version: "g2m.local-config.v1",
+          workspaces: [{ workspace_id: "cli-demo", path: repo }],
+          verification_profiles: [],
+          worktree_root: worktrees,
+          artifact_root: artifacts,
+          state_root: state,
+          mcode_path: mockPath,
+          review_timeout_ms: 20_000,
+        }),
+        "utf8",
+      );
+      await writeFile(
+        taskPath,
+        JSON.stringify({
+          protocol_version: "g2m.code-task.v1",
+          task_id: "healthy-after-recovery",
+          workspace_scope: { workspace_id: "cli-demo", base_revision: "HEAD", require_clean_worktree: true },
+          goal: "Inspect the repository without changing it.",
+          constraints: ["Do not modify files."],
+          requested_capabilities: { read: true, write: false, test: false, network: false },
+          permission_policy: "read_only",
+          limits: { max_steps: 5, timeout_ms: 30_000 },
+          verification_profile: "none",
+          acceptance_criteria: ["No files change."],
+          session_policy: { mode: "new" },
+        }),
+        "utf8",
+      );
+
+      const running = main(["run", "--config", configPath, "--task", taskPath, "--review", reviewPath]);
+      const bundlePath = await waitForBundle(artifacts);
+      await main(["review", "--bundle", bundlePath, "--decision", "BLOCK", "--output", reviewPath]);
+      await running;
+
+      const journalAfterFirst = await readFile(oldJournalPath);
+      expect(journalAfterFirst).not.toEqual(oldJournalBefore);
+      const firstRecords = journalAfterFirst.toString("utf8").trim().split(/\r?\n/)
+        .map((line) => JSON.parse(line) as { type: string; durability: string });
+      expect(firstRecords.filter((record) => record.type === "recovery.required")).toHaveLength(1);
+      expect(firstRecords.at(-1)).toMatchObject({ type: "recovery.required", durability: "CRITICAL" });
+
+      const projection = new StateDatabase(join(state, "g2m-state.sqlite"));
+      expect(new ExecutionProjector(projection).execution(oldExecutionId)).toMatchObject({
+        state: "RECOVERY_REQUIRED",
+      });
+      projection.close();
+
+      const secondTask = JSON.parse(await readFile(taskPath, "utf8")) as Record<string, unknown>;
+      secondTask["task_id"] = "healthy-after-recovery-second";
+      await writeFile(secondTaskPath, JSON.stringify(secondTask), "utf8");
+      const secondRunning = main(["run", "--config", configPath, "--task", secondTaskPath, "--review", reviewPath]);
+      const secondBundle = await waitForBundle(artifacts, [bundlePath]);
+      await main(["review", "--bundle", secondBundle, "--decision", "BLOCK", "--output", reviewPath]);
+      await secondRunning;
+
+      const journalAfterSecond = await readFile(oldJournalPath);
+      const secondRecords = journalAfterSecond.toString("utf8").trim().split(/\r?\n/)
+        .map((line) => JSON.parse(line) as { type: string });
+      expect(secondRecords.filter((record) => record.type === "recovery.required")).toHaveLength(1);
+      expect(journalAfterSecond).not.toContain("retry");
+      expect(journalAfterSecond).not.toContain("resume");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

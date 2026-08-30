@@ -9,12 +9,11 @@ import { G2MExecutionEngine, G2MExecutionEngineError } from "../execution/engine
 import { fingerprintHash, FingerprintRegistry } from "../execution/fingerprint.js";
 import { ProfileRegistry } from "../policy/verification.js";
 import { StateDatabase } from "../projection/database.js";
-import {
-  ExecutionProjector,
-  type ExecutionProjection,
-} from "../projection/execution-projector.js";
+import { ExecutionProjector } from "../projection/execution-projector.js";
 import { backfillProjection } from "../projection/backfill.js";
 import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
+import { scanRecovery } from "../recovery/scanner.js";
+import { runStartupRecovery } from "../recovery/startup.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
 import { MCodeAdapter } from "../workers/mcode/adapter.js";
@@ -64,10 +63,15 @@ async function loadConfig(path: string): Promise<G2MLocalConfig> {
   return parseLocalConfig(await readJson(path));
 }
 
+interface ConfigureEngineOptions {
+  readonly excludeExecutionIds?: readonly string[];
+}
+
 function configureEngine(
   config: G2MLocalConfig,
   worker: MCodeAdapter,
   workerVersion: string,
+  options: ConfigureEngineOptions = {},
 ): {
   readonly engine: G2MExecutionEngine;
   readonly eventStore: EventStore;
@@ -75,30 +79,12 @@ function configureEngine(
   readonly fingerprintRegistry: FingerprintRegistry;
   readonly replayGuard: ReplayGuard;
   readonly worker: MCodeAdapter;
-  readonly projectionDatabase?: StateDatabase;
+  readonly projectionDatabase: StateDatabase;
 } {
-  const workspaceRegistry = new WorkspaceRegistry();
-  for (const workspace of config.workspaces) {
-    workspaceRegistry.register(workspace.workspace_id, workspace.path);
-  }
-  const profileRegistry = new ProfileRegistry();
-  for (const profile of config.verification_profiles) {
-    profileRegistry.register({
-      id: profile.id,
-      ...(profile.workspace_id !== undefined
-        ? { workspaceId: profile.workspace_id }
-        : {}),
-      description: profile.description,
-      program: profile.program,
-      args: profile.args,
-      timeoutMs: profile.timeout_ms,
-      ...(profile.env !== undefined ? { env: profile.env } : {}),
-      registeredAt: 0,
-    });
-  }
   const stateRoot = stateRootForConfig(config);
   let projectionDatabase: StateDatabase | undefined;
-  let projection: ExecutionProjection;
+  let eventStore: EventStore | undefined;
+
   try {
     projectionDatabase = new StateDatabase(join(stateRoot, "g2m-state.sqlite"));
     backfillProjection({
@@ -110,47 +96,83 @@ function configureEngine(
       })),
       nowMs: Date.now(),
     });
-    projection = new ExecutionProjector(projectionDatabase);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    projection = {
-      project() {
-        throw new Error(`projection unavailable: ${reason}`);
-      },
+    const projection = new ExecutionProjector(projectionDatabase);
+    eventStore = new EventStore({
+      executionDirectory: join(stateRoot, "executions"),
+      tolerateLoadErrors: true,
+    });
+    const evidenceStore = new EvidenceStore({ directory: join(stateRoot, "evidence") });
+    const fingerprintRegistry = new FingerprintRegistry({
+      statePath: join(stateRoot, "fingerprints.json"),
+    });
+    const recoveryReport = scanRecovery({
+      stateRoot,
+      artifactRoot: config.artifact_root,
+      worktreeRoot: config.worktree_root,
+      eventStore,
+      database: projectionDatabase,
+    });
+    runStartupRecovery({
+      report: recoveryReport,
+      eventStore,
+      database: projectionDatabase,
+      projector: projection,
+      evidenceStore,
+      fingerprintRegistry,
+      ...(options.excludeExecutionIds !== undefined
+        ? { excludeExecutionIds: options.excludeExecutionIds }
+        : {}),
+    });
+
+    const workspaceRegistry = new WorkspaceRegistry();
+    for (const workspace of config.workspaces) {
+      workspaceRegistry.register(workspace.workspace_id, workspace.path);
+    }
+    const profileRegistry = new ProfileRegistry();
+    for (const profile of config.verification_profiles) {
+      profileRegistry.register({
+        id: profile.id,
+        ...(profile.workspace_id !== undefined
+          ? { workspaceId: profile.workspace_id }
+          : {}),
+        description: profile.description,
+        program: profile.program,
+        args: profile.args,
+        timeoutMs: profile.timeout_ms,
+        ...(profile.env !== undefined ? { env: profile.env } : {}),
+        registeredAt: 0,
+      });
+    }
+    const replayGuard = new ReplayGuard({ statePath: join(stateRoot, "replay-guard.json") });
+    const engine = new G2MExecutionEngine({
+      workspaceRegistry,
+      workspaceLock: new WorkspaceLock(),
+      profileRegistry,
+      evidenceStore,
+      eventStore,
+      projection,
+      fingerprintRegistry,
+      replayGuard,
+      worker,
+      workerRuntime: { runtime: "mcode", version: workerVersion, model: "configured" },
+      adapterContractVersion: "g2m-worker-v1",
+      worktreeRoot: config.worktree_root,
+      artifactRoot: config.artifact_root,
+    });
+    return {
+      engine,
+      eventStore,
+      evidenceStore,
+      fingerprintRegistry,
+      replayGuard,
+      worker,
+      projectionDatabase,
     };
+  } catch (error) {
+    eventStore?.close();
+    projectionDatabase?.close();
+    throw error;
   }
-  const eventStore = new EventStore({
-    executionDirectory: join(stateRoot, "executions"),
-  });
-  const evidenceStore = new EvidenceStore({ directory: join(stateRoot, "evidence") });
-  const fingerprintRegistry = new FingerprintRegistry({
-    statePath: join(stateRoot, "fingerprints.json"),
-  });
-  const replayGuard = new ReplayGuard({ statePath: join(stateRoot, "replay-guard.json") });
-  const engine = new G2MExecutionEngine({
-    workspaceRegistry,
-    workspaceLock: new WorkspaceLock(),
-    profileRegistry,
-    evidenceStore,
-    eventStore,
-    projection,
-    fingerprintRegistry,
-    replayGuard,
-    worker,
-    workerRuntime: { runtime: "mcode", version: workerVersion, model: "configured" },
-    adapterContractVersion: "g2m-worker-v1",
-    worktreeRoot: config.worktree_root,
-    artifactRoot: config.artifact_root,
-  });
-  return {
-    engine,
-    eventStore,
-    evidenceStore,
-    fingerprintRegistry,
-    replayGuard,
-    worker,
-    ...(projectionDatabase !== undefined ? { projectionDatabase } : {}),
-  };
 }
 
 function stateRootForConfig(config: G2MLocalConfig): string {
@@ -274,12 +296,16 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
   const config = await loadConfig(resolve(required(options, "config")));
   const executionId = required(options, "execution-id");
   const processStatus = parseProcessStatus(required(options, "process-status"));
-  const worker = new MCodeAdapter();
-  const { eventStore, evidenceStore, fingerprintRegistry, replayGuard } = configureEngine(
-    config,
-    worker,
-    "recovery",
-  );
+  let eventStoreToClose: EventStore | undefined;
+  let projectionDatabaseToClose: StateDatabase | undefined;
+  try {
+    const worker = new MCodeAdapter();
+    const configured = configureEngine(config, worker, "recovery", {
+      excludeExecutionIds: [executionId],
+    });
+    const { eventStore, evidenceStore, fingerprintRegistry, replayGuard, projectionDatabase } = configured;
+    eventStoreToClose = eventStore;
+    projectionDatabaseToClose = projectionDatabase;
   const events = eventStore.getByAttemptId(executionId);
   if (events.length === 0) throw new Error("no persisted execution found: " + executionId);
   const taskEvent = events.find((event) => event.type === "task.created");
@@ -462,6 +488,10 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
     task_id: taskId,
     ...resolution,
   });
+  } finally {
+    eventStoreToClose?.close();
+    projectionDatabaseToClose?.close();
+  }
 }
 
 async function probeCommand(options: ReadonlyMap<string, string>): Promise<void> {

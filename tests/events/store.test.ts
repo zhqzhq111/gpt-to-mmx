@@ -2,11 +2,15 @@
  * EventStore + hash chain — plan §52
  */
 
-import { describe, it, expect } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, it, expect } from "vitest";
 
 import {
   computeEventHash,
   EventStore,
+  EventStoreError,
   verifyChain,
 } from "../../src/events/store.js";
 import type { TaskEvent } from "../../src/events/events.js";
@@ -26,6 +30,18 @@ function makeFP(overrides: Partial<TaskFingerprint> = {}): TaskFingerprint {
     runtimeCapabilitySnapshotHash: "rt-cap-1",
     ...overrides,
   };
+}
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function executionRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "g2m-event-store-"));
+  roots.push(root);
+  return join(root, "executions");
 }
 
 describe("EventStore.append", () => {
@@ -269,5 +285,99 @@ describe("verifyChain (user requirement 1: chain integrity, no reordering)", () 
     const result = verifyChain([e]);
     expect(result.valid).toBe(false);
     expect(result.reason).toBe("PREV_HASH_MISMATCH");
+  });
+});
+
+describe("EventStore tolerant execution-directory loading", () => {
+  it("keeps strict loading as the default and throws for a malformed journal", async () => {
+    const root = await executionRoot();
+    const journal = join(root, "bad-execution", "state-events.ndjson");
+    await mkdir(join(root, "bad-execution"), { recursive: true });
+    await writeFile(journal, "{malformed\n", "utf8");
+
+    expect(() => new EventStore({ executionDirectory: root })).toThrow();
+  });
+
+  it("quarantines one bad execution and continues loading lexical neighbors", async () => {
+    const root = await executionRoot();
+    const healthy = new EventStore({ executionDirectory: root });
+    const expected = healthy.append({
+      taskId: "healthy-task",
+      attemptId: "z-healthy",
+      type: "task.created",
+      payload: {},
+      timestampMs: 10,
+    });
+    healthy.close();
+    await mkdir(join(root, "a-bad"), { recursive: true });
+    await writeFile(join(root, "a-bad", "state-events.ndjson"), "{malformed\n", "utf8");
+
+    const tolerant = new EventStore({ executionDirectory: root, tolerateLoadErrors: true });
+
+    expect(tolerant.getByAttemptId("z-healthy")).toEqual([expected]);
+    expect(tolerant.recoveryIssues()).toEqual([{
+      executionId: "a-bad",
+      path: join(root, "a-bad", "state-events.ndjson"),
+      kind: "LOAD_ERROR",
+      reason: expect.stringContaining("invalid journal JSON"),
+    }]);
+
+    const newEvent = tolerant.append({
+      taskId: "new-task",
+      attemptId: "brand-new",
+      type: "task.created",
+      payload: {},
+      timestampMs: 20,
+    });
+    const healthyNext = tolerant.append({
+      taskId: "healthy-task",
+      attemptId: "z-healthy",
+      type: "task.validation.started",
+      payload: {},
+      timestampMs: 30,
+    });
+    expect(newEvent.seq).toBe(1);
+    expect(healthyNext.prevHash).toBe(expected.hash);
+    tolerant.close();
+  });
+
+  it("records a truncated tail and refuses append to both quarantined kinds", async () => {
+    const root = await executionRoot();
+    const seeded = new EventStore({ executionDirectory: root });
+    seeded.append({
+      taskId: "truncated-task",
+      attemptId: "b-truncated",
+      type: "task.created",
+      payload: {},
+      timestampMs: 10,
+    });
+    seeded.append({
+      taskId: "truncated-task",
+      attemptId: "b-truncated",
+      type: "task.validation.started",
+      payload: {},
+      timestampMs: 20,
+    });
+    seeded.close();
+    const completeJournal = await readFile(join(root, "b-truncated", "state-events.ndjson"), "utf8");
+    await writeFile(join(root, "b-truncated", "state-events.ndjson"), completeJournal.trimEnd(), "utf8");
+    await mkdir(join(root, "a-load-error"), { recursive: true });
+    await writeFile(join(root, "a-load-error", "state-events.ndjson"), "{bad\n", "utf8");
+
+    const tolerant = new EventStore({ executionDirectory: root, tolerateLoadErrors: true });
+    expect(tolerant.recoveryIssues().map((issue) => issue.kind)).toEqual(["LOAD_ERROR", "TRUNCATED_TAIL"]);
+    expect(() => tolerant.append({
+      taskId: "load-error-task",
+      attemptId: "a-load-error",
+      type: "task.created",
+      payload: {},
+    })).toThrow(EventStoreError);
+    expect(() => tolerant.append({
+      taskId: "truncated-task",
+      attemptId: "b-truncated",
+      type: "task.validation.started",
+      payload: {},
+    })).toThrow(EventStoreError);
+    tolerant.close();
   });
 });

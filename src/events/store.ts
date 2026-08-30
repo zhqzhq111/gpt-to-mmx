@@ -144,12 +144,14 @@ export interface EventStoreOptions {
   readonly executionDirectory?: string;
   /** @deprecated flat journal layout for internal transition only. */
   readonly logDirectory?: string;
+  readonly tolerateLoadErrors?: boolean;
 }
 
 export interface JournalRecoveryIssue {
   readonly executionId: string;
   readonly path: string;
-  readonly kind: "TRUNCATED_TAIL";
+  readonly kind: "TRUNCATED_TAIL" | "LOAD_ERROR";
+  readonly reason: string;
 }
 
 export type SingleExecutionLoadResult =
@@ -201,6 +203,7 @@ export class EventStore {
   private readonly issues: JournalRecoveryIssue[] = [];
   private readonly executionDirectory: string | undefined;
   private readonly logDirectory: string | undefined;
+  private readonly tolerateLoadErrors: boolean;
 
   constructor(options: EventStoreOptions = {}) {
     if (options.executionDirectory !== undefined && options.logDirectory !== undefined) {
@@ -208,6 +211,7 @@ export class EventStore {
     }
     this.executionDirectory = options.executionDirectory;
     this.logDirectory = options.logDirectory;
+    this.tolerateLoadErrors = options.tolerateLoadErrors ?? false;
     if (this.executionDirectory !== undefined) this.loadExecutionJournals();
     if (this.logDirectory !== undefined) this.loadLegacyJournals();
   }
@@ -216,8 +220,22 @@ export class EventStore {
     const root = this.executionDirectory;
     if (root === undefined) return;
     mkdirSync(root, { recursive: true });
-    for (const entry of readdirSync(root, { withFileTypes: true }).filter((item) => item.isDirectory())) {
-      this.loadJournal(entry.name, join(root, entry.name, "state-events.ndjson"));
+    const entries = readdirSync(root, { withFileTypes: true })
+      .filter((item) => item.isDirectory())
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const path = join(root, entry.name, "state-events.ndjson");
+      try {
+        this.loadJournal(entry.name, path);
+      } catch (error) {
+        if (!this.tolerateLoadErrors) throw error;
+        this.issues.push({
+          executionId: entry.name,
+          path,
+          kind: "LOAD_ERROR",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 
@@ -248,15 +266,21 @@ export class EventStore {
     }
     this.events.push(...events);
     if (loaded.tailStatus === "TRUNCATED_TAIL") {
-      this.issues.push({ executionId, path, kind: "TRUNCATED_TAIL" });
+      this.issues.push({
+        executionId,
+        path,
+        kind: "TRUNCATED_TAIL",
+        reason: "journal ends with an unterminated record",
+      });
     }
   }
 
   append(input: TaskEventInput): TaskEvent {
-    if (this.issues.some((issue) => issue.executionId === input.attemptId)) {
+    const issue = this.issues.find((candidate) => candidate.executionId === input.attemptId);
+    if (issue !== undefined) {
       throw new EventStoreError(
         "PERSISTENCE_FAILED",
-        `cannot append to execution ${input.attemptId}: journal has TRUNCATED_TAIL`,
+        `cannot append to execution ${input.attemptId}: journal has ${issue.kind}`,
       );
     }
     const attemptEvents = this.events.filter((event) => event.attemptId === input.attemptId);

@@ -433,11 +433,13 @@ reducer error, and invalidated without aborting the directory scan.
 `configureEngine` resolves `stateRoot`, opens `g2m-state.sqlite`, runs
 `backfillProjection` with the configured workspace seeds and `Date.now()`, and
 only then constructs the live `ExecutionProjector`, `EventStore`, and engine.
-Both `run` and `recover` pass through this startup path. A database-open or
-backfill failure preserves the existing projection-unavailable fallback.
-The `run` path still closes its EventStore and projection database. `probe`
-and standalone `review` do not call `configureEngine`, so they do not create or
-open a startup state database and their public output contracts are unchanged.
+Both `run` and `recover` pass through this startup path. Phase 5 adds a
+fail-closed recovery classification after this backfill; a database-open,
+backfill, scan, or coordinator failure no longer starts an engine without a
+recovery decision. The `run` and `recover` paths close their EventStore and
+projection database. `probe` and standalone `review` do not call
+`configureEngine`, so they do not create or open a startup state database and
+their public output contracts are unchanged.
 Startup Backfill never appends Journal events, invokes `RecoveryResolver`,
 inspects processes, reclaims leases, or reconciles ACCEPT transactions.
 
@@ -457,7 +459,65 @@ SQLite repair from the old Journal, byte-for-byte Journal preservation, no
 recovery/projection-repair event, completed backfill metadata, and probe /
 standalone-review exclusion.
 
+## Phase 5 — Startup Recovery
+
+Status: complete after the Phase 5 startup recovery implementation.
+
+### Recovery Scanner
+
+`EventStore` now has an opt-in tolerant execution-directory load mode. Strict
+loading remains the default. In tolerant mode, one malformed, missing,
+schema-incompatible, execution-mismatched, or hash-broken Journal becomes a
+per-execution `LOAD_ERROR`; other Journals remain readable and new healthy
+executions can still start. A truncated tail remains a separate
+`TRUNCATED_TAIL` issue and neither kind can be appended to.
+
+`scanRecovery` is read-only and derives deterministic issues from the
+authoritative Journal, the Phase 4 projection, event-bound artifact bytes and
+hashes, outcome files, direct worktree candidates, and lock-file candidates.
+It reports active/non-terminal executions, unknown workers, projection drift,
+missing or mismatched frozen patch/review/apply artifacts, missing terminal
+outcomes, partial ACCEPT sequences, retained worktrees, and locks that require
+lease validation. It never edits Journals or SQLite, deletes worktrees or lock
+files, runs Git, kills processes, or calls the resolver.
+
+### Safe-hold integration
+
+`resolveRecovery` now treats `processStatus = "unknown"` as insufficient proof
+that a worker exited. This check precedes terminal, result, and clean-workspace
+heuristics, so startup cannot guess a successful or unsuccessful outcome.
+`runStartupRecovery` groups SAFE_HOLD issues by execution, skips corrupt,
+truncated, terminal, and report-only cases, and appends at most one CRITICAL
+`recovery.required` event for each valid active execution. The order is
+Journal append/flush, reducer transition to `RECOVERY_REQUIRED`, then SQLite
+projection. A projection failure records `projection.stale` after retaining
+the durable recovery event.
+
+Startup recovery is idempotent: a later scan sees the terminal
+`RECOVERY_REQUIRED` state and appends no duplicate. Explicit
+`g2m recover --execution-id X` excludes X from automatic startup safe-hold so
+its user-supplied `--process-status` remains meaningful; other unsafe
+executions are still classified. Startup closes EventStore and SQLite on
+failure. A quarantined unrelated Journal does not block a healthy new run.
+
+Terminal missing-outcome cases, malformed or truncated Journals, and lock or
+worktree candidates are report-only in this phase. They remain untouched for
+operator handling and later phases. Phase 5 does not retry, resume, apply or
+complete ACCEPT, reclaim leases, delete worktrees/locks, run ProcessSupervisor,
+or perform Storage Manager/GC operations. Those remain Phase 6, Phase 7,
+Phase 8, Phase 9, and Phase 10 work respectively.
+
+### Verification
+
+The fresh final suite reports **415 passed, 5 skipped, 0 failed** across
+**37 test files passed and 3 skipped**. `npm run typecheck`, `npm run build`,
+and `git diff --check` also pass. The suite retains the five explicit
+real-mcode skips: one real modify E2E, one adapter smoke test, and three
+permission-behavior probes. The Phase 5 CLI E2E covers an active Journal being
+safe-held exactly once, healthy runs continuing, and repeated startup avoiding
+duplicate recovery events.
+
 ## Remaining phases
 
-Recovery, crash-safe ACCEPT, cross-process lease, Process Supervisor, Storage
-Manager, GC, operational CLI, runtime hardening, and CI matrices.
+Crash-safe ACCEPT, cross-process lease, Process Supervisor, Storage Manager,
+GC, operational CLI, runtime hardening, and CI matrices.

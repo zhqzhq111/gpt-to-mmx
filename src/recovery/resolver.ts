@@ -165,6 +165,15 @@ export function resolveRecovery(input: RecoveryInput): RecoveryResolution {
     );
   }
 
+  // An unknown supervisor observation is not proof that the worker exited.
+  // It must therefore remain conservative even when other evidence looks
+  // sufficient to reconcile the execution.
+  if (input.processStatus === "unknown") {
+    return makeUnknown(
+      "process status is unknown; recovery must not assume the worker has exited",
+    );
+  }
+
   // Step 4:currentState 已经是 terminal → RECOVERED
   if (input.currentState !== null && isTerminal(input.currentState)) {
     return makeReconciled(
