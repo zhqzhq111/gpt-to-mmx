@@ -498,7 +498,7 @@ export class G2MExecutionEngine {
 
       let workerStorageAbort: import("../storage/monitor.js").StorageCheckResult | undefined;
       workerMonitor = this.options.storageMonitor?.start(
-        { worktreePath: worktree.worktreePath, artifactPath: this.options.artifactRoot },
+        { worktreePath: worktree.worktreePath, artifactPath: resolve(this.options.artifactRoot, executionId) },
         async (result) => {
           workerStorageAbort = result;
           await this.options.worker.cancel(executionId);
@@ -509,7 +509,11 @@ export class G2MExecutionEngine {
       try {
         workerResult = await this.options.worker.collectResult(executionId);
       } catch (error) {
-        if (workerStorageAbort !== undefined && error instanceof AdapterError) {
+        if (
+          workerStorageAbort !== undefined &&
+          error instanceof AdapterError &&
+          error.code !== "UNKNOWN"
+        ) {
           const code = workerStorageAbort.status === "limit_exceeded"
             ? "STORAGE_LIMIT_EXCEEDED"
             : "STORAGE_ADMISSION_DENIED";
@@ -635,7 +639,10 @@ export class G2MExecutionEngine {
             ? { processSupervisor: this.options.processSupervisor }
             : {}),
           ...(this.options.storageMonitor !== undefined
-            ? { storageMonitor: this.options.storageMonitor, storageArtifactPath: this.options.artifactRoot }
+            ? {
+                storageMonitor: this.options.storageMonitor,
+                storageArtifactPath: resolve(this.options.artifactRoot, executionId),
+              }
             : {}),
         },
       );

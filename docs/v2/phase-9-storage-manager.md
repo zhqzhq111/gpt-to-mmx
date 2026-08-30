@@ -123,9 +123,14 @@ from the prior manifest. A successful manifest is evidence for the
 `storage_usage` UPSERT; SQLite is never the only source.
 
 Usage checkpoints are lifecycle-controlled (worktree creation, worker or
-verification completion, frozen patch, review pending, terminal result, and
-startup reconciliation). The free-space probe is read-only; Phase 9 does not
-write a manifest or Journal entry on every monitor tick.
+verification completion, an in-memory pre-freeze check, frozen patch, review
+pending, terminal result, and startup reconciliation). Runtime monitors scan
+only `<artifact_root>/<execution_id>` alongside the active worktree, so
+historical artifacts do not consume a current execution's artifact limit. A
+monitor-triggered `UNKNOWN` worker outcome remains `RECOVERY_REQUIRED`; only
+a confirmed `CANCELLED` outcome may carry a storage-limit cancellation code.
+The free-space probe is read-only; Phase 9 does not write a manifest or
+Journal entry on every monitor tick.
 
 ## Startup and retention semantics
 
@@ -150,9 +155,7 @@ is not authority and Phase 9 never performs GC.
 
 ## Explicit phase boundary
 
-This checkpoint implements only the storage foundation: policy, volume
-identity, usage/manifest, reservation primitive, storage events/projection,
-and startup/rebuild reconciliation. It intentionally does not implement
-Engine admission ordering, Runtime Storage Guard, terminal/recovery lifecycle
-integration, real two-process reservation E2E, or Phase 10 GC/release
-documentation.
+This checkpoint implements policy, volume identity, usage/manifest,
+reservation durability and reconciliation, Engine admission ordering, runtime
+Storage Guard integration, terminal/recovery lifecycle behavior, and real
+two-process reservation E2E. It does not perform Phase 10 GC or deletion.

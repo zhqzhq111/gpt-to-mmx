@@ -15,6 +15,7 @@ import { EvidenceStore } from "../../src/evidence/store.js";
 import { FingerprintRegistry } from "../../src/execution/fingerprint.js";
 import { ProfileRegistry } from "../../src/policy/verification.js";
 import type { ExecutionProjection } from "../../src/projection/execution-projector.js";
+import { StateDatabase } from "../../src/projection/database.js";
 import { buildReview } from "../../src/review/ingress.js";
 import { ReplayGuard } from "../../src/review/replay-guard.js";
 import { ProcessSupervisor } from "../../src/process/supervisor.js";
@@ -33,7 +34,8 @@ import { AdapterError } from "../../src/workers/coding-worker.js";
 import { FakeMCodeAdapter } from "../../src/workers/mcode/fake.js";
 import { WorkspaceLock } from "../../src/workspace/lock.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
-import { StorageAdmissionError, type StorageManager } from "../../src/storage/reservation.js";
+import { DEFAULT_STORAGE_POLICY } from "../../src/storage/policy.js";
+import { StorageAdmissionError, StorageManager } from "../../src/storage/reservation.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -103,6 +105,32 @@ class EditingWorker implements CodingWorkerAdapter {
     _verifiedSessionId: string,
     _prompt: WorkerPrompt,
   ): Promise<void> {
+    return Promise.reject(new Error("not implemented"));
+  }
+}
+
+class UnknownAfterStorageCancelWorker implements CodingWorkerAdapter {
+  private invocation: WorkerInvocation | undefined;
+
+  probe(): Promise<RuntimeCapabilitySnapshot> {
+    return new EditingWorker().probe();
+  }
+
+  async start(invocation: WorkerInvocation): Promise<void> {
+    this.invocation = invocation;
+    await writeFile(join(invocation.workspacePath, "source.txt"), "fixed\n", "utf8");
+  }
+
+  collectResult(executionId: ExecutionId): Promise<WorkerResult> {
+    if (this.invocation?.executionId !== executionId) return Promise.reject(new Error("not started"));
+    return Promise.reject(new AdapterError("UNKNOWN", "storage cancellation outcome is unconfirmed"));
+  }
+
+  cancel(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  resume(): Promise<void> {
     return Promise.reject(new Error("not implemented"));
   }
 }
@@ -288,11 +316,67 @@ describe("G2MExecutionEngine", () => {
         void callback({ status: "limit_exceeded", code: "STORAGE_LIMIT_EXCEEDED", freeBytes: 1, usage: { artifactBytes: 10, worktreeBytes: 10, totalBytes: 20 } });
         return { stop: () => undefined };
       },
-    } as StorageMonitor;
+    } as unknown as StorageMonitor;
     await expect(engine(new EditingWorker(), undefined, undefined, undefined, storageMonitor).execute(task))
       .rejects.toMatchObject({ code: "STORAGE_LIMIT_EXCEEDED" });
     expect(eventStore.list().some((event) => event.type === "patch.frozen")).toBe(false);
     expect(eventStore.list().at(-1)?.type).toBe("agent.cancelled");
+  });
+
+  it("preserves UNKNOWN worker cancellation as RECOVERY_REQUIRED after a storage trigger", async () => {
+    const storageStateRoot = join(tempRoot, "storage-state");
+    await mkdir(storageStateRoot, { recursive: true });
+    const storageDatabase = new StateDatabase(join(storageStateRoot, "state.sqlite"));
+    const storageManager = new StorageManager({
+      database: storageDatabase,
+      eventStore,
+      stateRoot: storageStateRoot,
+      policy: { ...DEFAULT_STORAGE_POLICY, min_free_bytes: 0, safety_margin_bytes: 0, default_execution_reservation_bytes: 1 },
+      freeSpaceProvider: { freeBytes: async () => 1_000_000 },
+      volumeResolver: (path) => ({ volumeId: "test-volume", rootPath: path, freeBytes: 1_000_000 }),
+    });
+    const storageMonitor = {
+      start: (_paths: unknown, callback: (result: unknown) => void | Promise<void>) => {
+        void callback({ status: "limit_exceeded", code: "STORAGE_LIMIT_EXCEEDED", freeBytes: 1, usage: { artifactBytes: 10, worktreeBytes: 10, totalBytes: 20 } });
+        return { stop: () => undefined };
+      },
+    } as StorageMonitor;
+
+    let caught: unknown;
+    try {
+      await engine(new UnknownAfterStorageCancelWorker(), undefined, undefined, storageManager, storageMonitor).execute(task);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const recovery = (caught as G2MExecutionEngineError).recovery;
+    await expect(stat(recovery?.worktree.worktreePath ?? "")).resolves.toBeTruthy();
+    expect(workspaceLock.isHeld("demo")).toBe(true);
+    expect(storageDatabase.prepare("SELECT state FROM storage_reservations").all()).toEqual([{ state: "ACTIVE" }]);
+    expect(eventStore.list().some((event) => event.type === "recovery.required")).toBe(true);
+    expect(eventStore.list().some((event) => event.type === "patch.frozen")).toBe(false);
+    storageDatabase.close();
+  });
+
+  it("does not charge historical artifact bytes to the current runtime monitor", async () => {
+    const seenArtifactPaths: string[] = [];
+    const storageMonitor = {
+      start: (paths: { artifactPath: string }, callback: (result: unknown) => void | Promise<void>) => {
+        seenArtifactPaths.push(paths.artifactPath);
+        if (paths.artifactPath === artifactRoot) {
+          void callback({ status: "limit_exceeded", code: "STORAGE_LIMIT_EXCEEDED", freeBytes: 1, usage: { artifactBytes: 1_000, worktreeBytes: 1, totalBytes: 1_001 } });
+        }
+        return { stop: () => undefined };
+      },
+    } as unknown as StorageMonitor;
+
+    const pending = await engine(new EditingWorker(), undefined, undefined, undefined, storageMonitor).execute(task);
+
+    expect(pending.state).toBe("REVIEW_PENDING");
+    expect(seenArtifactPaths).toHaveLength(2);
+    expect(seenArtifactPaths.every((path) => path === join(artifactRoot, pending.executionId))).toBe(true);
+    workspaceLock.release(pending.lease);
   });
 
   it("holds REVIEW_PENDING lease and blocks a second manager", async () => {

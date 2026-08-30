@@ -816,7 +816,7 @@ Final verification on the Phase 9 branch:
 
 - `npm run typecheck` → pass;
 - `npm run build` → pass;
-- `npm test` → **510 passed, 6 skipped, 0 failed**;
+- `npm test` → **512 passed, 6 skipped, 0 failed**;
 - `npm run test:lease-process` → **3/3**;
 - `npm run test:process-supervisor` → **3/3**;
 - `npm run test:storage-process` → **3/3**;
