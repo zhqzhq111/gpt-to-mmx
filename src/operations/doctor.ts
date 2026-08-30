@@ -1,7 +1,8 @@
 import type { OperationalOptions, OperationalSnapshot } from "./snapshot.js";
 import { buildOperationalSnapshot } from "./snapshot.js";
+import { isTerminal } from "../execution/state-machine.js";
 
-export type DoctorCategory = "state_root" | "journal" | "projection" | "lease" | "reservation" | "storage" | "recovery" | "gc" | "cross_source";
+export type DoctorCategory = "state_root" | "journal" | "projection" | "lease" | "reservation" | "storage" | "recovery" | "gc" | "runtime" | "repair" | "cross_source";
 export type DoctorCheckStatus = "PASS" | "WARN" | "FAIL";
 
 export interface DoctorCheck {
@@ -121,6 +122,52 @@ export function buildDoctorReport(snapshot: DoctorSnapshotInput): DoctorReport {
     snapshot.gc.invalidTombstoneCount > 0 ? "FAIL" : snapshot.gc.interruptedCount + snapshot.gc.cleanupPendingCount > 0 ? "WARN" : "PASS",
     snapshot.gc.invalidTombstoneCount > 0 ? `${snapshot.gc.invalidTombstoneCount} invalid tombstone(s) detected` : snapshot.gc.interruptedCount + snapshot.gc.cleanupPendingCount > 0 ? "GC has interrupted or pending cleanup work" : "GC state is consistent",
     ["gc:tombstones"],
+  ));
+  const phase12Executions = snapshot.executions.filter((execution) => execution.phase12.legacyClassification === "NONE");
+  const artifactState = (name: "runtimeIdentityArtifact" | "protectedPolicyArtifact" | "fingerprintArtifact"): DoctorCheckStatus => {
+    const invalid = phase12Executions.filter((execution) => execution.phase12[name].state !== "VALID");
+    if (invalid.length === 0) return "PASS";
+    return invalid.some((execution) => execution.recoveryStatus === "REQUIRED" || execution.state === "RECOVERY_REQUIRED" || (execution.state !== null && !isTerminal(execution.state))) ? "FAIL" : "WARN";
+  };
+  for (const [id, field, label] of [
+    ["runtime.identity-artifact", "runtimeIdentityArtifact", "runtime identity"],
+    ["runtime.protected-policy-artifact", "protectedPolicyArtifact", "protected policy"],
+    ["runtime.fingerprint-artifact", "fingerprintArtifact", "fingerprint"],
+  ] as const) {
+    const invalid = phase12Executions.filter((execution) => execution.phase12[field].state !== "VALID");
+    checks.push(check(id, "runtime", artifactState(field), invalid.length === 0 ? `${label} artifacts are valid` : `${invalid.length} execution(s) have invalid ${label} artifacts`, invalid.map((execution) => `artifact:${execution.executionId}/${field}`)));
+  }
+  const bindingConflicts = phase12Executions.filter((execution) => execution.phase12.bindings === "CONFLICT");
+  const bindingStatus = bindingConflicts.some((execution) => execution.recoveryStatus === "REQUIRED" || execution.state === "RECOVERY_REQUIRED" || (execution.state !== null && !isTerminal(execution.state))) ? "FAIL" : bindingConflicts.length === 0 ? "PASS" : "WARN";
+  checks.push(check(
+    "runtime.binding-consistency", "runtime", bindingStatus,
+    bindingConflicts.length === 0 ? "Phase 12 artifact bindings are consistent or unavailable" : `${bindingConflicts.length} execution(s) have conflicting Phase 12 artifact bindings`,
+    bindingConflicts.map((execution) => `artifact-binding:${execution.executionId}`),
+  ));
+  const unpinned = phase12Executions.filter((execution) => !execution.phase12.model.pinned);
+  checks.push(check(
+    "runtime.model-pinning", "runtime", unpinned.length === 0 ? "PASS" : "WARN",
+    unpinned.length === 0 ? "all Phase 12 runtime models are pinned" : `${unpinned.length} Phase 12 execution(s) use an unpinned model`,
+    unpinned.map((execution) => `model:${execution.executionId}`),
+  ));
+  const drifted = phase12Executions.filter((execution) => execution.phase12.configDrift.length > 0);
+  checks.push(check(
+    "runtime.current-config-drift", "runtime", drifted.length === 0 ? "PASS" : "WARN",
+    drifted.length === 0 ? "current configuration matches available protected policy bindings" : `${drifted.length} execution(s) have current-config drift: ${[...new Set(drifted.flatMap((execution) => execution.phase12.configDrift))].sort().join(", ")}`,
+    drifted.map((execution) => `config:${execution.executionId}`),
+  ));
+  const legacy = snapshot.executions.filter((execution) => execution.phase12.legacyClassification !== "NONE");
+  const legacyCritical = legacy.filter((execution) => execution.phase12.legacyClassification === "ACTIVE" || execution.phase12.legacyClassification === "RECOVERY_CRITICAL");
+  checks.push(check(
+    "runtime.legacy", "runtime", legacyCritical.length === 0 ? "PASS" : "WARN",
+    legacy.length === 0 ? "all executions have Phase 12 evidence" : legacyCritical.length === 0 ? `${legacy.length} terminal legacy execution(s) are informational; no Phase 12 evidence was fabricated` : `${legacyCritical.length} active/recovery-critical legacy execution(s): Phase 12 evidence unavailable`,
+    legacy.map((execution) => `legacy:${execution.executionId}`),
+  ));
+  const guard = snapshot.reclaimGuard ?? { state: "MISSING" as const, path: "", guardId: null, operationId: null, pid: null, hostname: null, heartbeatAgeMs: null, stale: null };
+  checks.push(check(
+    "repair.reclaim-guard", "repair", guard.state === "MISSING" ? "PASS" : "WARN",
+    guard.state === "MISSING" ? "repair reclaim guard is absent" : `repair reclaim guard observation is ${guard.state.toLowerCase()}; no mutation was attempted`,
+    guard.state === "MISSING" ? [] : ["repair:reclaim-guard"],
   ));
   for (const execution of snapshot.executions.filter((item) => item.recoveryStatus === "REQUIRED")) {
     checks.push(check(`execution.${execution.executionId}.recovery-required`, "cross_source", "FAIL", `execution ${execution.executionId} is RECOVERY_REQUIRED`, [`execution:${execution.executionId}`]));

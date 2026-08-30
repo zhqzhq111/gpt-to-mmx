@@ -14,6 +14,7 @@ import { readStorageManifestSync, type StorageManifest } from "../storage/usage.
 import { nodeFreeSpaceProvider } from "../storage/free-space.js";
 import { readTombstoneSync } from "../storage/tombstone.js";
 import { volumeIdForPath } from "../storage/volume.js";
+import { buildPhase12Observation, observeReclaimGuard, type Phase12ExecutionObservation, type ReclaimGuardObservation } from "./phase12-observation.js";
 import {
   classifyLeasePolicy,
   scanLeaseOwnersSync,
@@ -71,6 +72,7 @@ export interface ExecutionStatus {
   readonly reservationStatus: ReservationStatus;
   readonly recoveryStatus: ExecutionRecoveryStatus;
   readonly gcStatus: GcStatus;
+  readonly phase12: Phase12ExecutionObservation;
 }
 
 export interface ProjectionStatus {
@@ -132,6 +134,7 @@ export interface OperationalSnapshot {
   readonly storage: StorageStatus;
   readonly recovery: RecoveryStatus;
   readonly gc: GcStatusSummary;
+  readonly reclaimGuard?: ReclaimGuardObservation;
 }
 
 export interface OperationalOptions {
@@ -402,14 +405,16 @@ export async function buildOperationalSnapshot(options: OperationalOptions): Pro
       const candidate = candidates.find((item) => item.executionId === executionId);
       const manifest = manifests.get(executionId);
       const recoveryStatus: ExecutionRecoveryStatus = replayed.state === "RECOVERY_REQUIRED" || issues.some((item) => item.severity === "SAFE_HOLD") ? "REQUIRED" : issues.length > 0 ? "REPORT_ONLY" : "NONE";
+      const observedState = replayed.state ?? (typeof row?.state === "string" ? row.state as TaskState : null);
       return {
         executionId, taskId: details.taskId ?? row?.task_id ?? null, workspaceId: details.workspaceId ?? row?.workspace_id ?? null,
-        state: replayed.state ?? (typeof row?.state === "string" ? row.state as TaskState : null), createdAt: events[0]?.timestampMs ?? row?.created_at ?? null,
+        state: observedState, createdAt: events[0]?.timestampMs ?? row?.created_at ?? null,
         updatedAt: events.at(-1)?.timestampMs ?? row?.updated_at ?? null, journalStatus, lastEventType: events.at(-1)?.type ?? null, lastEventSeq: events.at(-1)?.seq ?? null,
         retentionClass: manifest?.retentionClass ?? row?.retention_class ?? null, gcEligibleAt: manifest?.gcEligibleAt ?? row?.gc_eligible_at ?? null,
         artifactBytes: manifest?.artifactBytes ?? 0, worktreeBytes: manifest?.worktreeBytes ?? 0,
         leaseStatus: lease?.status ?? "NONE", reservationStatus: reservation.status, recoveryStatus,
         gcStatus: tombstone ? "GCED" : issues.some((item) => item.kind === "GC_INTERRUPTED") ? "INTERRUPTED" : issues.some((item) => item.kind === "GC_CLEANUP_PENDING") ? "CLEANUP_PENDING" : candidate?.decision === "ELIGIBLE" ? "ELIGIBLE" : candidate === undefined ? "NONE" : "BLOCKED",
+        phase12: buildPhase12Observation({ artifactRoot: config.artifact_root, executionId, config, events, state: observedState, recoveryRequired: recoveryStatus === "REQUIRED" }),
       };
     }).filter((execution) => options.executionId === undefined || execution.executionId === options.executionId);
     const activeReservedByVolume = activeReservationsByVolume(stateRoot, eventStore);
@@ -423,6 +428,7 @@ export async function buildOperationalSnapshot(options: OperationalOptions): Pro
       projection, storage: { managedArtifactBytes, managedWorktreeBytes, managedTotalBytes: managedArtifactBytes + managedWorktreeBytes, activeReservedBytes, maxTotalBytes: config.storage.max_total_bytes, maxArtifactBytes: config.storage.max_artifact_bytes, maxWorktreeBytes: config.storage.max_worktree_bytes, volumes: await storageVolumes(config, stateRoot, activeReservedByVolume) },
       recovery: { openRecoveryCases: recovery.issues.filter((issue) => issue.severity === "SAFE_HOLD").length, executionsRequiringRecovery: executions.filter((execution) => execution.recoveryStatus === "REQUIRED").map((execution) => execution.executionId), issuesByKind, safeHoldCount: recovery.issues.filter((issue) => issue.severity === "SAFE_HOLD").length, reportOnlyCount: recovery.issues.filter((issue) => issue.severity === "REPORT_ONLY").length },
       gc: { eligibleCount: candidates.filter((candidate) => candidate.decision === "ELIGIBLE").length, estimatedReclaimBytes: candidates.filter((candidate) => candidate.decision === "ELIGIBLE").reduce((sum, candidate) => sum + candidate.artifactBytes + candidate.worktreeBytes, 0), interruptedCount: recovery.issues.filter((issue) => issue.kind === "GC_INTERRUPTED").length, cleanupPendingCount: recovery.issues.filter((issue) => issue.kind === "GC_CLEANUP_PENDING").length, tombstoneCount: tombstones.ids.size, invalidTombstoneCount: tombstones.invalid },
+      reclaimGuard: observeReclaimGuard(stateRoot, generatedAt, config.runtime_hardening.repair_reclaim_guard_stale_ms),
     };
   } finally {
     eventStore.close();

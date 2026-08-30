@@ -52,6 +52,20 @@ export function renderText(value: unknown): string {
       }
     }
     for (const state of [...states.keys()].sort()) lines.push(`  ${state}: ${states.get(state)}`);
+    for (const execution of executions) {
+      if (execution !== null && typeof execution === "object") {
+        const item = execution as JsonObject;
+        const phase12 = item.phase12;
+        if (phase12 !== null && typeof phase12 === "object") {
+          const observation = phase12 as JsonObject;
+          const id = typeof item.executionId === "string" ? item.executionId : "unknown";
+          const version = observation.fingerprintVersion ?? "unknown";
+          const model = observation.model;
+          const modelText = model !== null && typeof model === "object" && (model as JsonObject).pinned === true ? "pinned" : "unpinned";
+          lines.push(`  Phase12 ${id}: fingerprint ${scalarText(version)} model ${modelText} legacy ${scalarText(observation.legacyClassification)}`);
+        }
+      }
+    }
   }
   if (Array.isArray(object.workspaces)) lines.push(`Workspaces: ${object.workspaces.length}`);
   if (object.projection !== null && typeof object.projection === "object") {
@@ -65,6 +79,10 @@ export function renderText(value: unknown): string {
   if (object.gc !== null && typeof object.gc === "object") {
     const gc = object.gc as JsonObject;
     if (typeof gc.eligibleCount === "number") lines.push(`GC: eligible ${gc.eligibleCount} interrupted ${typeof gc.interruptedCount === "number" ? gc.interruptedCount : 0}`);
+  }
+  if (object.reclaimGuard !== null && typeof object.reclaimGuard === "object") {
+    const guard = object.reclaimGuard as JsonObject;
+    if (typeof guard.state === "string") lines.push(`Reclaim guard: ${guard.state}`);
   }
   for (const key of Object.keys(object).sort()) {
     if (key === "schemaVersion" || key === "status" || key === "checks") continue;

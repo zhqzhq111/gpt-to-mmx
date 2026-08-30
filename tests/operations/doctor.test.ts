@@ -25,6 +25,7 @@ const snapshot = (overrides: Partial<DoctorSnapshotInput> = {}): DoctorSnapshotI
   },
   recovery: { openRecoveryCases: 0, executionsRequiringRecovery: [], issuesByKind: {}, safeHoldCount: 0, reportOnlyCount: 0 },
   gc: { eligibleCount: 0, estimatedReclaimBytes: 0, interruptedCount: 0, cleanupPendingCount: 0, tombstoneCount: 0, invalidTombstoneCount: 0 },
+  reclaimGuard: { state: "MISSING", path: "state/repair/repair.lock.reclaim", guardId: null, operationId: null, pid: null, hostname: null, heartbeatAgeMs: null, stale: null },
   ...overrides,
 });
 
@@ -69,5 +70,58 @@ describe("operational doctor", () => {
       },
     }));
     expect(report.checks.find((check) => check.id === "storage.accounting")?.status).toBe("FAIL");
+  });
+
+  it("warns for an unpinned model without failing the execution", () => {
+    const report = buildDoctorReport(snapshot({
+      executions: [{
+        executionId: "e1", taskId: "t1", workspaceId: null, state: "COMPLETED", createdAt: 1, updatedAt: 2,
+        journalStatus: "OK", lastEventType: "agent.completed", lastEventSeq: 2, retentionClass: null, gcEligibleAt: null,
+        artifactBytes: 0, worktreeBytes: 0, leaseStatus: "NONE", reservationStatus: "NONE", recoveryStatus: "NONE", gcStatus: "NONE",
+        phase12: {
+          fingerprintVersion: 2, runtimeIdentityArtifact: { state: "VALID" }, protectedPolicyArtifact: { state: "VALID" }, fingerprintArtifact: { state: "VALID" },
+          model: { value: null, pinned: false }, effectiveOutputLimits: {}, outputLimitsSource: "protected-policy", configDrift: [], bindings: "CONSISTENT", legacyClassification: "NONE",
+        },
+      } as never],
+    }));
+    expect(report.status).toBe("WARN");
+    expect(report.checks.find((check) => check.id === "runtime.model-pinning")?.status).toBe("WARN");
+  });
+
+  it("fails on conflicting immutable Phase 12 evidence for an active execution", () => {
+    const report = buildDoctorReport(snapshot({
+      executions: [{
+        executionId: "e1", taskId: "t1", workspaceId: null, state: "RUNNING", createdAt: 1, updatedAt: 2,
+        journalStatus: "OK", lastEventType: "agent.spawn.started", lastEventSeq: 1, retentionClass: null, gcEligibleAt: null,
+        artifactBytes: 0, worktreeBytes: 0, leaseStatus: "NONE", reservationStatus: "NONE", recoveryStatus: "REQUIRED", gcStatus: "NONE",
+        phase12: {
+          fingerprintVersion: 2, runtimeIdentityArtifact: { state: "HASH_MISMATCH" }, protectedPolicyArtifact: { state: "VALID" }, fingerprintArtifact: { state: "VALID" },
+          model: { value: "MiniMax-M3", pinned: true }, effectiveOutputLimits: {}, outputLimitsSource: "protected-policy", configDrift: [], bindings: "CONFLICT", legacyClassification: "NONE",
+        },
+      } as never],
+    }));
+    expect(report.status).toBe("FAIL");
+    expect(report.checks.find((check) => check.id === "runtime.binding-consistency")?.status).toBe("FAIL");
+  });
+
+  it("reports terminal legacy evidence as informational and active legacy evidence as a warning", () => {
+    const terminal = buildDoctorReport(snapshot({
+      executions: [{ state: "COMPLETED", recoveryStatus: "NONE", phase12: { fingerprintVersion: 1, legacyClassification: "TERMINAL", model: { value: null, pinned: false }, runtimeIdentityArtifact: { state: "MISSING" }, protectedPolicyArtifact: { state: "MISSING" }, fingerprintArtifact: { state: "MISSING" }, effectiveOutputLimits: {}, outputLimitsSource: "unavailable", configDrift: [], bindings: "UNAVAILABLE" } } as never],
+    }));
+    expect(terminal.checks.find((check) => check.id === "runtime.legacy")?.status).toBe("PASS");
+    expect(terminal.checks.find((check) => check.id === "runtime.legacy")?.severity).toBe("INFO");
+
+    const active = buildDoctorReport(snapshot({
+      executions: [{ state: "RECOVERY_REQUIRED", recoveryStatus: "REQUIRED", phase12: { fingerprintVersion: 1, legacyClassification: "RECOVERY_CRITICAL", model: { value: null, pinned: false }, runtimeIdentityArtifact: { state: "MISSING" }, protectedPolicyArtifact: { state: "MISSING" }, fingerprintArtifact: { state: "MISSING" }, effectiveOutputLimits: {}, outputLimitsSource: "unavailable", configDrift: [], bindings: "UNAVAILABLE" } } as never],
+    }));
+    expect(active.checks.find((check) => check.id === "runtime.legacy")?.status).toBe("WARN");
+    expect(active.checks.find((check) => check.id === "runtime.legacy")?.message).toMatch(/evidence unavailable/i);
+  });
+
+  it("observes reclaim guard states without turning a dead or foreign guard into a mutation", () => {
+    for (const state of ["LIVE", "DEAD", "FOREIGN", "MALFORMED"] as const) {
+      const report = buildDoctorReport(snapshot({ reclaimGuard: { state, path: "state/repair/repair.lock.reclaim", pid: null, hostname: null, operationId: null, guardId: null, heartbeatAgeMs: null } } as never));
+      expect(report.checks.find((check) => check.id === "repair.reclaim-guard")?.evidence).toContain("repair:reclaim-guard");
+    }
   });
 });
