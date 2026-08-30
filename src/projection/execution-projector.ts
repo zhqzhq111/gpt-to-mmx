@@ -171,6 +171,13 @@ export class ExecutionProjector implements ExecutionProjection {
     ).run(workspaceId, leaseId);
   }
 
+  replaceWorkspaceLeases(owners: readonly ValidLeaseOwner[]): void {
+    this.database.transaction(() => {
+      this.database.exec("DELETE FROM workspace_locks");
+      for (const owner of owners) this.upsertWorkspaceLease(owner);
+    });
+  }
+
   /**
    * Seed the `workspaces` table from trusted CLI configuration. The Journal
    * does not capture workspace identity because workspace bindings come from

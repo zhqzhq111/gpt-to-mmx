@@ -2,7 +2,7 @@
 
 ## Phase 0 — Specification Freeze
 
-Status: complete at Amendment 1 (`746a942`).
+Status: complete at Amendment 2.
 
 ## Phase 1 — Frozen Patch Authority
 
@@ -721,7 +721,7 @@ string returned to the caller.
 
 ## Phase 7A — Durable Lease Foundation
 
-Status: **PROVISIONAL** on branch `codex/phase-7-durable-lease`.
+Status: **COMPLETE / SEALED** on branch `codex/phase-7-durable-lease`.
 
 Phase 7A implements the bottom lease layer and Engine lifecycle integration:
 
@@ -734,14 +734,21 @@ Phase 7A implements the bottom lease layer and Engine lifecycle integration:
 - Engine holds the same lease through `REVIEW_PENDING`, reuses it in
   `applyReview()`, releases only after terminal Journal durability, and retains
   it for `RECOVERY_REQUIRED`.
+- Startup reconciliation reclaims only stale terminal leases with dead PIDs;
+  explicit recovery uses guarded takeover with a new lease ID for the same
+  execution; the recovery scanner remains read-only and classifies malformed,
+  incomplete, foreign-host, stale, heartbeat-mismatch, recovery-blocked, and
+  orphan-heartbeat cases.
+- Real child-process E2E covers concurrent acquire, release/retry, and
+  concurrent stale-terminal reclaim with exactly one winner.
 
-Verification on the provisional branch: `npm run typecheck`, `npm run build`,
-and `npm test` pass; the Engine lease cases pass in
-`tests/execution/engine.test.ts`. Real two-process race coverage remains a
-later Phase 7 Task 10 gate, and this section must not be changed to
-`complete` until that gate and the remaining Phase 7 recovery work pass.
+Final verification: `npm run typecheck`, `npm run build`, and `npm test` pass
+with **463 passed, 5 skipped, 0 failed**; `npm run test:lease-process` passes
+all 3 real process tests; and `git diff --check` passes. The five skips are
+the existing real-mcode tests. Phase 7 is now sealed; later work is limited to
+the explicitly separate Phase 8+ operational and runtime phases.
 
 ## Remaining phases
 
-Cross-process lease, Process Supervisor, Storage Manager,
-GC, operational CLI, runtime hardening, and CI matrices.
+Process Supervisor, Storage Manager, GC, operational CLI, runtime hardening,
+and CI matrices.

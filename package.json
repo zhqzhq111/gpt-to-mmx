@@ -15,7 +15,8 @@
     "g2m": "npm run build --silent && node dist/cli/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:lease-process": "npm run build --silent && node --test tests/process/workspace-lease.process.e2e.mjs"
   },
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",

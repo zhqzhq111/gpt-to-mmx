@@ -5,6 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -119,7 +120,28 @@ export interface LeasePolicyInput {
 
 export interface ReclaimStaleLeaseOptions {
   readonly workspaceKey: string;
-  readonly journalState: "ACTIVE" | "TERMINAL" | "RECOVERY_REQUIRED";
+  readonly journalState: LeaseJournalState;
+  readonly authorization?: "STARTUP_AUTO" | "EXPLICIT_RECOVERY";
+  readonly expectedExecutionId?: string;
+}
+
+export type RecoveryLeaseProcessStatus =
+  | "alive"
+  | "unknown"
+  | "exited_clean"
+  | "exited_error"
+  | "crashed";
+
+export interface RecoveryLeaseTakeoverOptions {
+  readonly workspaceId: string;
+  readonly canonicalPath: string;
+  readonly executionId: string;
+  readonly processStatus: RecoveryLeaseProcessStatus;
+}
+
+export interface StartupLeaseReconciliationReport {
+  readonly reclaimedExecutionIds: readonly string[];
+  readonly heldExecutionIds: readonly string[];
 }
 
 export type WorkspaceLockErrorCode =
@@ -216,6 +238,18 @@ export async function workspaceKeyForPath(rawPath: string): Promise<string> {
   return createHash("sha256").update(`g2m-workspace-v1\0${normalized}`, "utf8").digest("hex");
 }
 
+export function workspaceKeyForPathSync(rawPath: string): string {
+  if (typeof rawPath !== "string" || rawPath.trim().length === 0 || !isAbsolute(rawPath)) {
+    throw new WorkspaceLockError("INVALID_INPUT", "canonicalPath must be an absolute path");
+  }
+  try {
+    const normalized = normalizePhysicalWorkspacePath(realpathSync(rawPath));
+    return createHash("sha256").update(`g2m-workspace-v1\0${normalized}`, "utf8").digest("hex");
+  } catch (error) {
+    throw new WorkspaceLockError("LEASE_IO_FAILED", `cannot resolve workspace path: ${rawPath}`, error);
+  }
+}
+
 export async function readLeaseOwner(path: string): Promise<LeaseOwnerInspection> {
   const file = await readRegularFile(path);
   if (file.kind === "missing") return "MISSING";
@@ -235,6 +269,30 @@ export async function scanLeaseOwners(stateRoot: string): Promise<readonly Valid
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".lock")) continue;
     const value = await readLeaseOwner(join(locksRoot, entry.name));
+    if (typeof value === "object") owners.push(value);
+  }
+  return owners;
+}
+
+export function readLeaseOwnerSync(path: string): LeaseOwnerInspection {
+  const file = readRegularFileSync(path);
+  if (file.kind === "missing") return "MISSING";
+  if (file.kind === "malformed") return "MALFORMED";
+  return parseOwner(file.text);
+}
+
+export function scanLeaseOwnersSync(stateRoot: string): readonly ValidLeaseOwner[] {
+  const locksRoot = join(stateRoot, "locks");
+  let entries;
+  try { entries = readdirSync(locksRoot); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new WorkspaceLockError("LEASE_IO_FAILED", `cannot scan lease directory: ${locksRoot}`, error);
+  }
+  const owners: ValidLeaseOwner[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".lock")) continue;
+    const value = readLeaseOwnerSync(join(locksRoot, name));
     if (typeof value === "object") owners.push(value);
   }
   return owners;
@@ -591,11 +649,41 @@ export class WorkspaceLock {
     };
   }
 
+  inspectWorkspaceLeaseSync(options: { readonly workspaceKey: string }): LeaseInspection {
+    const workspaceKey = options.workspaceKey;
+    if (workspaceKey.trim().length === 0) throw new WorkspaceLockError("INVALID_INPUT", "workspaceKey is required");
+    const ownerPath = this.ownerPath(workspaceKey);
+    const owner = this.readOwnerSync(ownerPath);
+    const heartbeat = typeof owner === "object"
+      ? this.readHeartbeatForOwnerSync(workspaceKey, owner.lease_id) : "MISSING";
+    const now = this.dependencies.now();
+    const ownerFile = readRegularFileSync(ownerPath);
+    const heartbeatFile = typeof heartbeat === "object"
+      ? readRegularFileSync(this.heartbeatPath(workspaceKey, heartbeat.lease_id)) : { kind: "missing" as const };
+    return {
+      workspaceKey, owner, heartbeat,
+      ...(typeof owner === "object" ? {
+        pidStatus: this.dependencies.pidProbe(owner.pid),
+        ageMs: Math.max(0, now - owner.created_at),
+      } : {}),
+      ...(typeof heartbeat === "object" ? { heartbeatAgeMs: Math.max(0, now - heartbeat.heartbeat_at) } : {}),
+      ...(ownerFile.kind === "ok" ? { ownerFileSha256: sha256Text(ownerFile.text) } : {}),
+      ...(heartbeatFile.kind === "ok" ? { heartbeatFileSha256: sha256Text(heartbeatFile.text) } : {}),
+    };
+  }
+
   async reclaimStaleLease(options: ReclaimStaleLeaseOptions): Promise<ValidLeaseOwner> {
-    if (options.journalState !== "TERMINAL") {
+    if (
+      options.journalState !== "TERMINAL" &&
+      !(options.authorization === "EXPLICIT_RECOVERY" && options.journalState === "RECOVERY_REQUIRED")
+    ) {
       throw new WorkspaceLockError("RECLAIM_NOT_ALLOWED", `journal state ${options.journalState} is not reclaimable`);
     }
     const initial = await this.inspectWorkspaceLease({ workspaceKey: options.workspaceKey });
+    if (options.expectedExecutionId !== undefined &&
+        (typeof initial.owner !== "object" || initial.owner.execution_id !== options.expectedExecutionId)) {
+      throw new WorkspaceLockError("WORKSPACE_BUSY", `lease does not belong to execution ${options.expectedExecutionId}`);
+    }
     this.assertReclaimable(initial, options.workspaceKey);
     const guardPath = this.reclaimPath(options.workspaceKey);
     const guardFd = this.acquireReclaimGuardSync(guardPath, options.workspaceKey);
@@ -616,6 +704,57 @@ export class WorkspaceLock {
     } finally {
       try { closeSync(guardFd); } finally { safeUnlinkSync(guardPath); }
     }
+  }
+
+  async reconcileStartupLeases(
+    journalStates: ReadonlyMap<string, LeaseJournalState>,
+  ): Promise<StartupLeaseReconciliationReport> {
+    const reclaimedExecutionIds: string[] = [];
+    const heldExecutionIds: string[] = [];
+    for (const owner of await scanLeaseOwners(this.stateRoot)) {
+      const journalState = journalStates.get(owner.execution_id) ?? "MISSING";
+      if (journalState === "TERMINAL") {
+        try {
+          await this.reclaimStaleLease({ workspaceKey: owner.workspace_key, journalState: "TERMINAL" });
+          reclaimedExecutionIds.push(owner.execution_id);
+          continue;
+        } catch {
+          // Fresh, active, unknown, foreign, or otherwise unsafe evidence is
+          // deliberately held for later operator/recovery handling.
+        }
+      }
+      heldExecutionIds.push(owner.execution_id);
+    }
+    return {
+      reclaimedExecutionIds: reclaimedExecutionIds.sort((left, right) => left.localeCompare(right)),
+      heldExecutionIds: heldExecutionIds.sort((left, right) => left.localeCompare(right)),
+    };
+  }
+
+  async takeoverRecoveryLease(options: RecoveryLeaseTakeoverOptions): Promise<LockHandle> {
+    if (options.processStatus === "alive" || options.processStatus === "unknown") {
+      throw new WorkspaceLockError("RECLAIM_NOT_ALLOWED", `process status ${options.processStatus} does not prove the owner is gone`);
+    }
+    const workspaceKey = await workspaceKeyForPath(options.canonicalPath);
+    const inspection = await this.inspectWorkspaceLease({ workspaceKey });
+    if (inspection.owner === "MISSING") throw new WorkspaceLockError("LEASE_NOT_OWNED", `no recovery lease exists for ${options.workspaceId}`);
+    if (typeof inspection.owner !== "object") {
+      throw new WorkspaceLockError("RECLAIM_NOT_ALLOWED", `recovery owner is ${inspection.owner.toLowerCase()}`);
+    }
+    if (inspection.owner.execution_id !== options.executionId) {
+      throw new WorkspaceLockError("WORKSPACE_BUSY", `workspace is owned by execution ${inspection.owner.execution_id}`);
+    }
+    await this.reclaimStaleLease({
+      workspaceKey,
+      journalState: "RECOVERY_REQUIRED",
+      authorization: "EXPLICIT_RECOVERY",
+      expectedExecutionId: options.executionId,
+    });
+    return this.acquire({
+      workspaceId: options.workspaceId,
+      canonicalPath: options.canonicalPath,
+      executionId: options.executionId,
+    });
   }
 
   heldWorkspaceIds(): readonly string[] { return Array.from(this.localHandles.values()).map((handle) => handle.workspaceId); }
@@ -672,6 +811,16 @@ export class WorkspaceLock {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return "MISSING";
       throw new WorkspaceLockError("LEASE_IO_FAILED", `cannot read heartbeat for ${workspaceKey}`, error);
     }
+  }
+
+  private readHeartbeatForOwnerSync(workspaceKey: string, leaseId: string): LeaseHeartbeatInspection {
+    const file = readRegularFileSync(this.heartbeatPath(workspaceKey, leaseId));
+    if (file.kind === "missing") return "MISSING";
+    if (file.kind === "malformed") return "MALFORMED";
+    const heartbeat = parseHeartbeat(file.text);
+    if (heartbeat === "MALFORMED") return heartbeat;
+    if (heartbeat.workspace_key !== workspaceKey || heartbeat.lease_id !== leaseId) return "LEASE_ID_MISMATCH";
+    return heartbeat;
   }
 
   private async writeHeartbeat(handle: LockHandle): Promise<void> {

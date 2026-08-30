@@ -117,9 +117,9 @@ v2 的十项持久化、恢复、证据一致性、跨进程协调和存储契�
 
 v2 实施进度见 [Implementation Status](docs/v2/implementation-status.md)。
 
-当前工作分支已完成 Phase 7A Durable Lease Foundation 的暂定验证：底层
-filesystem lease 与 Engine 的 `REVIEW_PENDING` 保租约生命周期已接入；真正
-双 Node 进程竞争测试及后续恢复接管仍待完成，尚未宣称 Phase 7 完成。
+当前分支已完成并封存 Phase 7 Cross-process Workspace Lease：底层
+filesystem lease、Engine 的 `REVIEW_PENDING` 保租约、启动协调、显式恢复
+接管、Scanner 分类和真实双 Node 进程竞争 E2E 均已通过最终 Gate。
 
 ## 目录
 

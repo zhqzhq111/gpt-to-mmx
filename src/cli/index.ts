@@ -21,7 +21,7 @@ import type { TaskEvent } from "../events/events.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
 import { MCodeAdapter } from "../workers/mcode/adapter.js";
-import { WorkspaceLock } from "../workspace/lock.js";
+import { scanLeaseOwners, WorkspaceLock, type LeaseJournalState, type LockHandle } from "../workspace/lock.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { captureBaseline } from "../workspace/baseline.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
@@ -70,12 +70,12 @@ interface ConfigureEngineOptions {
   readonly excludeExecutionIds?: readonly string[];
 }
 
-function configureEngine(
+async function configureEngine(
   config: G2MLocalConfig,
   worker: MCodeAdapter,
   workerVersion: string,
   options: ConfigureEngineOptions = {},
-): {
+): Promise<{
   readonly engine: G2MExecutionEngine;
   readonly eventStore: EventStore;
   readonly evidenceStore: EvidenceStore;
@@ -83,7 +83,8 @@ function configureEngine(
   readonly replayGuard: ReplayGuard;
   readonly worker: MCodeAdapter;
   readonly projectionDatabase: StateDatabase;
-} {
+  readonly workspaceLock: WorkspaceLock;
+}> {
   const stateRoot = stateRootForConfig(config);
   let projectionDatabase: StateDatabase | undefined;
   let eventStore: EventStore | undefined;
@@ -108,12 +109,20 @@ function configureEngine(
     const fingerprintRegistry = new FingerprintRegistry({
       statePath: join(stateRoot, "fingerprints.json"),
     });
+    const workspaceRegistry = new WorkspaceRegistry();
+    for (const workspace of config.workspaces) {
+      workspaceRegistry.register(workspace.workspace_id, workspace.path);
+    }
     const recoveryReport = scanRecovery({
       stateRoot,
       artifactRoot: config.artifact_root,
       worktreeRoot: config.worktree_root,
       eventStore,
       database: projectionDatabase,
+      workspaces: config.workspaces.map((entry) => ({
+        workspaceId: entry.workspace_id,
+        canonicalPath: entry.path,
+      })),
     });
     runStartupRecovery({
       report: recoveryReport,
@@ -126,11 +135,34 @@ function configureEngine(
         ? { excludeExecutionIds: options.excludeExecutionIds }
         : {}),
     });
-
-    const workspaceRegistry = new WorkspaceRegistry();
-    for (const workspace of config.workspaces) {
-      workspaceRegistry.register(workspace.workspace_id, workspace.path);
+    const workspaceLock = new WorkspaceLock({
+      stateRoot,
+      workspacePathResolver: (workspaceId) => workspaceRegistry.get(workspaceId).canonicalPath,
+      ...(config.workspace_lease?.heartbeat_interval_ms !== undefined
+        ? { heartbeatIntervalMs: config.workspace_lease.heartbeat_interval_ms } : {}),
+      ...(config.workspace_lease?.stale_after_ms !== undefined
+        ? { staleAfterMs: config.workspace_lease.stale_after_ms } : {}),
+      ...(config.workspace_lease?.incomplete_lease_grace_ms !== undefined
+        ? { incompleteLeaseGraceMs: config.workspace_lease.incomplete_lease_grace_ms } : {}),
+      ...(config.workspace_lease?.reclaim_guard_stale_ms !== undefined
+        ? { reclaimGuardStaleMs: config.workspace_lease.reclaim_guard_stale_ms } : {}),
+      leaseProjection: {
+        upsert: (owner) => projection.upsertWorkspaceLease(owner),
+        removeIfLeaseMatches: (workspaceId, leaseId) => projection.deleteWorkspaceLease(workspaceId, leaseId),
+      },
+    });
+    const leaseStates = new Map<string, LeaseJournalState>();
+    for (const summary of recoveryReport.executions) {
+      const state = replayAcceptState(eventStore.getByAttemptId(summary.executionId), new FingerprintRegistry());
+      if (state === "RECOVERY_REQUIRED") leaseStates.set(summary.executionId, "RECOVERY_REQUIRED");
+      else if (state !== null && ["ACCEPTED", "BLOCKED", "FAILED", "TIMED_OUT", "CANCELLED", "REVISION_REQUESTED"].includes(state)) {
+        leaseStates.set(summary.executionId, "TERMINAL");
+      } else if (state !== null) {
+        leaseStates.set(summary.executionId, "ACTIVE");
+      }
     }
+    await workspaceLock.reconcileStartupLeases(leaseStates);
+    projection.replaceWorkspaceLeases(await scanLeaseOwners(stateRoot));
     const profileRegistry = new ProfileRegistry();
     for (const profile of config.verification_profiles) {
       profileRegistry.register({
@@ -149,22 +181,7 @@ function configureEngine(
     const replayGuard = new ReplayGuard({ statePath: join(stateRoot, "replay-guard.json") });
     const engine = new G2MExecutionEngine({
       workspaceRegistry,
-      workspaceLock: new WorkspaceLock({
-        stateRoot,
-        workspacePathResolver: (workspaceId) => workspaceRegistry.get(workspaceId).canonicalPath,
-        ...(config.workspace_lease?.heartbeat_interval_ms !== undefined
-          ? { heartbeatIntervalMs: config.workspace_lease.heartbeat_interval_ms } : {}),
-        ...(config.workspace_lease?.stale_after_ms !== undefined
-          ? { staleAfterMs: config.workspace_lease.stale_after_ms } : {}),
-        ...(config.workspace_lease?.incomplete_lease_grace_ms !== undefined
-          ? { incompleteLeaseGraceMs: config.workspace_lease.incomplete_lease_grace_ms } : {}),
-        ...(config.workspace_lease?.reclaim_guard_stale_ms !== undefined
-          ? { reclaimGuardStaleMs: config.workspace_lease.reclaim_guard_stale_ms } : {}),
-        leaseProjection: {
-          upsert: (owner) => projection.upsertWorkspaceLease(owner),
-          removeIfLeaseMatches: (workspaceId, leaseId) => projection.deleteWorkspaceLease(workspaceId, leaseId),
-        },
-      }),
+      workspaceLock,
       profileRegistry,
       evidenceStore,
       eventStore,
@@ -185,6 +202,7 @@ function configureEngine(
       replayGuard,
       worker,
       projectionDatabase,
+      workspaceLock,
     };
   } catch (error) {
     eventStore?.close();
@@ -226,7 +244,7 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
   try {
     const worker = new MCodeAdapter();
     const runtime = await worker.probe();
-    const { engine, eventStore, evidenceStore, projectionDatabase } = configureEngine(
+    const { engine, eventStore, evidenceStore, projectionDatabase } = await configureEngine(
       config,
       worker,
       runtime.version ?? "unknown",
@@ -333,10 +351,10 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
   let projectionDatabaseToClose: StateDatabase | undefined;
   try {
     const worker = new MCodeAdapter();
-    const configured = configureEngine(config, worker, "recovery", {
+    const configured = await configureEngine(config, worker, "recovery", {
       excludeExecutionIds: [executionId],
     });
-    const { eventStore, evidenceStore, fingerprintRegistry, replayGuard, projectionDatabase } = configured;
+    const { eventStore, evidenceStore, fingerprintRegistry, replayGuard, projectionDatabase, workspaceLock } = configured;
     eventStoreToClose = eventStore;
     projectionDatabaseToClose = projectionDatabase;
   const events = eventStore.getByAttemptId(executionId);
@@ -396,18 +414,34 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
       // Falls through to the generic recovery resolver below.
     } else {
       const projector = new ExecutionProjector(projectionDatabase);
-      const result = await runAcceptRecovery({
-        executionId,
-        processStatus: processStatus as AcceptProcessStatus,
-        events,
-        repositoryPath: workspace.path,
-        artifactRoot: config.artifact_root,
-        temporaryRoot: resolve(config.artifact_root, executionId),
-        eventStore,
-        projector,
-        replayGuard,
-        fingerprintRegistry,
-      });
+      let recoveryLease: LockHandle | undefined;
+      if (processStatus !== "alive" && processStatus !== "unknown") {
+        recoveryLease = await workspaceLock.takeoverRecoveryLease({
+          workspaceId,
+          canonicalPath: workspace.path,
+          executionId,
+          processStatus,
+        });
+      }
+      let result: Awaited<ReturnType<typeof runAcceptRecovery>> | undefined;
+      try {
+        result = await runAcceptRecovery({
+          executionId,
+          processStatus: processStatus as AcceptProcessStatus,
+          events,
+          repositoryPath: workspace.path,
+          artifactRoot: config.artifact_root,
+          temporaryRoot: resolve(config.artifact_root, executionId),
+          eventStore,
+          projector,
+          replayGuard,
+          fingerprintRegistry,
+        });
+      } finally {
+        if (recoveryLease !== undefined && result?.finalState !== "RECOVERY_REQUIRED") {
+          try { workspaceLock.release(recoveryLease); } catch { /* terminal Journal remains authoritative */ }
+        }
+      }
       emit({
         type: "g2m.recovery.resolved",
         execution_id: executionId,
