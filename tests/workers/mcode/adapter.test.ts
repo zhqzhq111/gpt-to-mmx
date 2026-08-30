@@ -89,6 +89,14 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
         "exit /b 1",
         ":exec",
         "if defined RUNTIME_DRIFT_MARKER echo spawned>\"%RUNTIME_DRIFT_MARKER%\"",
+        "if \"%MOCK_BEHAVIOR%\"==\"malformed\" (",
+        "  echo definitely-not-json",
+        "  exit /b 0",
+        ")",
+        "if \"%MOCK_BEHAVIOR%\"==\"overflow\" (",
+        "  echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "  exit /b 0",
+        ")",
         "if \"%MOCK_BEHAVIOR%\"==\"fail\" (",
         "  echo something bad 1>&2",
         "  exit /b 7",
@@ -380,5 +388,27 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
       if (previousMarker === undefined) delete process.env["RUNTIME_DRIFT_MARKER"];
       else process.env["RUNTIME_DRIFT_MARKER"] = previousMarker;
     }
+  }, 15_000);
+
+  it("turns malformed worker protocol into an UNKNOWN outcome", async () => {
+    process.env["MOCK_BEHAVIOR"] = "malformed";
+    const adapter = new MCodeAdapter();
+    const invocation = makeInvocation();
+    await adapter.start(invocation);
+    await expect(adapter.collectResult(invocation.executionId)).rejects.toMatchObject({
+      code: "UNKNOWN",
+      message: expect.stringMatching(/protocol/i),
+    });
+  }, 15_000);
+
+  it("bounds worker control stdout and enters UNKNOWN", async () => {
+    process.env["MOCK_BEHAVIOR"] = "overflow";
+    const adapter = new MCodeAdapter({ maxWorkerStdoutBytes: 32 });
+    const invocation = makeInvocation();
+    await adapter.start(invocation);
+    await expect(adapter.collectResult(invocation.executionId)).rejects.toMatchObject({
+      code: "UNKNOWN",
+      message: expect.stringMatching(/exceeded|protocol/i),
+    });
   }, 15_000);
 });

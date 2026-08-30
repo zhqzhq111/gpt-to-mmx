@@ -413,6 +413,9 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
     const worker = new MCodeAdapter({
       ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
       maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
+      maxWorkerStdoutBytes: config.runtime_hardening.max_worker_stdout_bytes,
+      maxStreamJsonLineBytes: config.runtime_hardening.max_stream_json_line_bytes,
+      maxWorkerEvents: config.runtime_hardening.max_worker_events,
     });
     const runtime = await worker.probe();
     const { engine, eventStore, evidenceStore, projectionDatabase } = await configureEngine(
@@ -524,6 +527,9 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
     const worker = new MCodeAdapter({
       ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
       maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
+      maxWorkerStdoutBytes: config.runtime_hardening.max_worker_stdout_bytes,
+      maxStreamJsonLineBytes: config.runtime_hardening.max_stream_json_line_bytes,
+      maxWorkerEvents: config.runtime_hardening.max_worker_events,
     });
     const configured = await configureEngine(config, worker, "recovery", {
       excludeExecutionIds: [executionId],
@@ -672,6 +678,9 @@ async function probeCommand(options: ReadonlyMap<string, string>): Promise<void>
     const worker = new MCodeAdapter({
       ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
       maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
+      maxWorkerStdoutBytes: config.runtime_hardening.max_worker_stdout_bytes,
+      maxStreamJsonLineBytes: config.runtime_hardening.max_stream_json_line_bytes,
+      maxWorkerEvents: config.runtime_hardening.max_worker_events,
     });
     emit({ type: "g2m.runtime.probe", runtime: await worker.probe() });
   } finally {

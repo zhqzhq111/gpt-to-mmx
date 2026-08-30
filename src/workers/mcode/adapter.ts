@@ -30,9 +30,11 @@ import {
 import { buildMCodeInvocation } from "./invocation.js";
 import { LocalPermissionPolicy } from "./permission-mapper.js";
 import {
-  parseStreamJsonLine,
   type StreamJsonEvent,
 } from "./stream-json-parser.js";
+import {
+  StreamJsonDecoder,
+} from "./stream-json-decoder.js";
 import { sha256 } from "../../protocol/hash.js";
 import {
   buildRuntimeIdentity,
@@ -44,6 +46,10 @@ import {
 } from "../../runtime/worker-summary.js";
 
 interface MCodeExecutionState {
+  readonly executionId: ExecutionId;
+  readonly maxWorkerStdoutBytes: number;
+  readonly maxStreamJsonLineBytes: number;
+  readonly maxWorkerEvents: number;
   readonly process: ManagedProcess;
   readonly events: StreamJsonEvent[];
   readonly completionPromise: Promise<void>;
@@ -53,8 +59,10 @@ interface MCodeExecutionState {
   terminalError?: AdapterError;
 }
 
-const BUFFER_FLUSH_INTERVAL_MS = 5_000;
 const WATCHDOG_GRACE_MS = 1_000;
+const DEFAULT_WORKER_STDOUT_BYTES = 33_554_432;
+const DEFAULT_STREAM_JSON_LINE_BYTES = 4_194_304;
+const DEFAULT_WORKER_EVENTS = 100_000;
 
 export class MCodeAdapter implements CodingWorkerAdapter {
   private readonly policy: LocalPermissionPolicy;
@@ -67,15 +75,24 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     readonly processSupervisor?: ProcessSupervisor;
     readonly model?: string;
     readonly maxProbeOutputBytes?: number;
+    readonly maxWorkerStdoutBytes?: number;
+    readonly maxStreamJsonLineBytes?: number;
+    readonly maxWorkerEvents?: number;
   } = {}) {
     this.policy = options.policy ?? new LocalPermissionPolicy();
     this.processSupervisor = options.processSupervisor ?? new ProcessSupervisor();
     this.model = options.model;
     this.maxProbeOutputBytes = options.maxProbeOutputBytes;
+    this.maxWorkerStdoutBytes = options.maxWorkerStdoutBytes;
+    this.maxStreamJsonLineBytes = options.maxStreamJsonLineBytes;
+    this.maxWorkerEvents = options.maxWorkerEvents;
   }
 
   private readonly model: string | undefined;
   private readonly maxProbeOutputBytes: number | undefined;
+  private readonly maxWorkerStdoutBytes: number | undefined;
+  private readonly maxStreamJsonLineBytes: number | undefined;
+  private readonly maxWorkerEvents: number | undefined;
 
   async probe(): Promise<RuntimeCapabilitySnapshot> {
     const d = await this.getDescriptor();
@@ -192,6 +209,10 @@ export class MCodeAdapter implements CodingWorkerAdapter {
       resolveCompletion = resolve;
     });
     const state: MCodeExecutionState = {
+      executionId: id,
+      maxWorkerStdoutBytes: this.maxWorkerStdoutBytes ?? DEFAULT_WORKER_STDOUT_BYTES,
+      maxStreamJsonLineBytes: this.maxStreamJsonLineBytes ?? DEFAULT_STREAM_JSON_LINE_BYTES,
+      maxWorkerEvents: this.maxWorkerEvents ?? DEFAULT_WORKER_EVENTS,
       process: managed,
       events: [],
       completionPromise,
@@ -324,45 +345,44 @@ export class MCodeAdapter implements CodingWorkerAdapter {
 }
 
 function attachOutput(state: MCodeExecutionState): void {
-  let buffer = "";
-  const flush = (): void => {
-    if (buffer.length === 0) return;
-    for (const line of buffer.split(/\r?\n/)) {
-      const event = safeParseLine(line);
-      if (event !== undefined) recordEvent(state, event);
+  const decoder = new StreamJsonDecoder({
+    maxLineBytes: state.maxStreamJsonLineBytes,
+    maxTotalBytes: state.maxWorkerStdoutBytes,
+    maxEvents: state.maxWorkerEvents,
+  });
+  const protocolFailure = (error: unknown): void => {
+    if (state.terminalError === undefined) {
+      const detail = error instanceof Error ? error.message : String(error);
+      state.terminalError = new AdapterError(
+        "UNKNOWN",
+        `worker stream-json protocol failed: ${detail}`,
+        { executionId: state.executionId, cause: error },
+      );
+      state.resolveCompletion();
     }
-    buffer = "";
+    void state.process.terminate("cleanup");
   };
-  const flushTimer = setInterval(flush, BUFFER_FLUSH_INTERVAL_MS);
-
   state.process.stdout?.on("data", (chunk: Buffer | string) => {
-    buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const event = safeParseLine(line);
-      if (event !== undefined) recordEvent(state, event);
+    try {
+      for (const event of decoder.push(chunk)) recordEvent(state, event);
+    } catch (error) {
+      protocolFailure(error);
     }
   });
   state.process.stderr?.on("data", () => undefined);
   void state.processOutcomePromise.then(() => {
-    clearInterval(flushTimer);
-    flush();
+    if (state.terminalError !== undefined) return;
+    try {
+      for (const event of decoder.finish()) recordEvent(state, event);
+    } catch (error) {
+      protocolFailure(error);
+    }
   });
 }
 
 function recordEvent(state: MCodeExecutionState, event: StreamJsonEvent): void {
   state.events.push(event);
   if (event.type === "exec.completed") state.resolveCompletion();
-}
-
-function safeParseLine(line: string): StreamJsonEvent | undefined {
-  if (line.trim().length === 0) return undefined;
-  try {
-    return parseStreamJsonLine(line);
-  } catch {
-    return undefined;
-  }
 }
 
 function throwForProcessOutcome(outcome: ProcessOutcome, executionId: ExecutionId): void {

@@ -57,7 +57,7 @@ export interface RawEvent {
 }
 
 export class StreamJsonParseError extends Error {
-  readonly code: "INVALID_JSON" | "EMPTY_LINE";
+  readonly code: "INVALID_JSON" | "EMPTY_LINE" | "INVALID_EVENT";
   override readonly cause?: unknown;
   constructor(code: StreamJsonParseError["code"], message: string, cause?: unknown) {
     super(message);
@@ -65,6 +65,24 @@ export class StreamJsonParseError extends Error {
     this.code = code;
     this.cause = cause;
   }
+}
+
+function invalidEvent(message: string): never {
+  throw new StreamJsonParseError("INVALID_EVENT", message);
+}
+
+function requiredString(obj: Record<string, unknown>, field: string): string {
+  const value = obj[field];
+  if (typeof value !== "string") invalidEvent(`known event requires string \`${field}\``);
+  return value;
+}
+
+function requiredStringArray(obj: Record<string, unknown>, field: string): string[] {
+  const value = obj[field];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    invalidEvent(`known event requires string array \`${field}\``);
+  }
+  return value;
 }
 
 /**
@@ -102,40 +120,59 @@ export function parseStreamJsonLine(line: string): StreamJsonEvent {
   }
   switch (type) {
     case "system":
+      if (obj["event"] !== "init" && obj["event"] !== "complete" && obj["event"] !== "error") {
+        invalidEvent("system event has invalid `event` enum");
+      }
       return {
         type: "system",
-        event: typeof obj["event"] === "string" ? (obj["event"] as SystemEvent["event"]) : "init",
-        session_id: typeof obj["session_id"] === "string" ? obj["session_id"] : undefined,
-        message: typeof obj["message"] === "string" ? obj["message"] : undefined,
+        event: obj["event"],
+        ...(obj["session_id"] !== undefined ? { session_id: requiredString(obj, "session_id") } : {}),
+        ...(obj["message"] !== undefined ? { message: requiredString(obj, "message") } : {}),
       };
     case "assistant":
       return {
         type: "assistant",
-        text: typeof obj["text"] === "string" ? obj["text"] : "",
+        text: requiredString(obj, "text"),
       };
     case "tool":
       return {
         type: "tool",
-        name: typeof obj["name"] === "string" ? obj["name"] : "unknown",
+        name: requiredString(obj, "name"),
         args: obj["args"],
         result: obj["result"],
       };
     case "result":
+      if (obj["status"] !== "success" && obj["status"] !== "failure" && obj["status"] !== "blocked") {
+        invalidEvent("result event has invalid `status` enum");
+      }
+      if (obj["tests"] !== undefined && !Array.isArray(obj["tests"])) {
+        invalidEvent("result event requires an array `tests` field");
+      }
+      if (obj["tests"] === undefined) invalidEvent("result event requires `tests`");
+      for (const test of obj["tests"]) {
+        if (test === null || typeof test !== "object" || Array.isArray(test)) invalidEvent("result test must be an object");
+        const testObject = test as Record<string, unknown>;
+        requiredString(testObject, "name");
+        if (testObject["status"] !== "passed" && testObject["status"] !== "failed" && testObject["status"] !== "skipped") {
+          invalidEvent("result test has invalid `status` enum");
+        }
+        if (testObject["message"] !== undefined) requiredString(testObject, "message");
+      }
       return {
         type: "result",
-        status: typeof obj["status"] === "string" ? (obj["status"] as ResultEvent["status"]) : "success",
-        summary: typeof obj["summary"] === "string" ? obj["summary"] : "",
-        files_changed: Array.isArray(obj["files_changed"]) ? obj["files_changed"].filter((s): s is string => typeof s === "string") : [],
-        tests: Array.isArray(obj["tests"]) ? obj["tests"].map((t) => {
-          const tt = t as Record<string, unknown>;
+        status: obj["status"],
+        summary: requiredString(obj, "summary"),
+        files_changed: requiredStringArray(obj, "files_changed"),
+        tests: obj["tests"].map((test) => {
+          const tt = test as Record<string, unknown>;
           return {
-            name: typeof tt["name"] === "string" ? tt["name"] : "",
-            status: typeof tt["status"] === "string" ? (tt["status"] as "passed" | "failed" | "skipped") : "passed",
-            ...(typeof tt["message"] === "string" ? { message: tt["message"] } : {}),
+            name: tt["name"] as string,
+            status: tt["status"] as "passed" | "failed" | "skipped",
+            ...(tt["message"] !== undefined ? { message: tt["message"] as string } : {}),
           };
-        }) : [],
-        remaining_risks: Array.isArray(obj["remaining_risks"]) ? obj["remaining_risks"].filter((s): s is string => typeof s === "string") : [],
-        ...(typeof obj["blocked_reason"] === "string" ? { blocked_reason: obj["blocked_reason"] } : {}),
+        }),
+        remaining_risks: requiredStringArray(obj, "remaining_risks"),
+        ...(obj["blocked_reason"] !== undefined ? { blocked_reason: requiredString(obj, "blocked_reason") } : {}),
       };
     default:
       return { type, ...obj };
