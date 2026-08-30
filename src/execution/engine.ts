@@ -464,6 +464,9 @@ export class G2MExecutionEngine {
       const runtimeIdentity = this.options.worker.getRuntimeIdentity === undefined
         ? undefined
         : await this.options.worker.getRuntimeIdentity(runtimeCapabilitySnapshotHash);
+      const resolvedVerificationProgram = profile === undefined
+        ? undefined
+        : await resolveProgramIdentity(profile.program);
       const verificationIdentity = profile === undefined
         ? {
             id: "none",
@@ -475,10 +478,12 @@ export class G2MExecutionEngine {
           }
         : {
             id: profile.id,
+            resolved_program: resolvedVerificationProgram!.resolved_program,
+            program_identity_hash: resolvedVerificationProgram!.program_identity_hash,
+            program_bytes: resolvedVerificationProgram!.program_bytes,
             args: profile.args,
             timeout_ms: profile.timeoutMs,
             ...(profile.env !== undefined ? { env: profile.env } : {}),
-            ...(await resolveProgramIdentity(profile.program)),
           };
       const protectedPolicy = runtimeIdentity === undefined
         ? undefined
@@ -737,6 +742,15 @@ export class G2MExecutionEngine {
                 storageMonitor: this.options.storageMonitor,
                 storageArtifactPath: resolve(this.options.artifactRoot, executionId),
               }
+            : {}),
+          ...(this.options.runtimeHardening?.max_verification_stdout_bytes !== undefined
+            ? { maxStdoutBytes: this.options.runtimeHardening.max_verification_stdout_bytes }
+            : {}),
+          ...(this.options.runtimeHardening?.max_verification_stderr_bytes !== undefined
+            ? { maxStderrBytes: this.options.runtimeHardening.max_verification_stderr_bytes }
+            : {}),
+          ...(resolvedVerificationProgram !== undefined
+            ? { expectedProgramIdentity: resolvedVerificationProgram }
             : {}),
         },
       );

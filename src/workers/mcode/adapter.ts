@@ -287,7 +287,19 @@ export class MCodeAdapter implements CodingWorkerAdapter {
     }
 
     const { normalizeWorkerEvents } = await import("./result-normalizer.js");
-    const outcome = normalizeWorkerEvents(state.events);
+    let outcome;
+    try {
+      outcome = normalizeWorkerEvents(state.events, { strictSummary: true });
+    } catch (error) {
+      if (error instanceof Error && error.name === "WorkerSummaryValidationError") {
+        throw new AdapterError(
+          "UNKNOWN",
+          `worker summary protocol failed: ${error.message}`,
+          { executionId, cause: error },
+        );
+      }
+      throw error;
+    }
     if (outcome.workerStatus !== undefined && outcome.workerStatus !== "succeeded") {
       const code = /timeout|limit/i.test(outcome.workerStatus) ? "TIMED_OUT" : "FAILED";
       throw new AdapterError(

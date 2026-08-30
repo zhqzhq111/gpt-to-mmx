@@ -74,4 +74,40 @@ describe("real mcode stream-json contract", () => {
       remainingRisks: [],
     });
   });
+
+  it("strictly validates an exact worker summary JSON string", () => {
+    const event = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: JSON.stringify({
+          summary: "done",
+          files_changed: [],
+          tests: [{ name: "unit", status: "passed" }],
+          remaining_risks: [],
+        }),
+      },
+    }));
+    expect(normalizeWorkerEvents([event], { strictSummary: true }).result?.summary).toBe("done");
+  });
+
+  it("strict mode rejects heuristic Markdown wrapping and invalid fields", () => {
+    const fenced = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: "```json\n{\"summary\":\"done\",\"files_changed\":[],\"tests\":[],\"remaining_risks\":[]}\n```",
+      },
+    }));
+    expect(() => normalizeWorkerEvents([fenced], { strictSummary: true })).toThrow(/summary|JSON|strict/i);
+
+    const invalid = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: JSON.stringify({ summary: "done", files_changed: [1], tests: [], remaining_risks: [] }),
+      },
+    }));
+    expect(() => normalizeWorkerEvents([invalid], { strictSummary: true })).toThrow(/files_changed|array|string/i);
+  });
 });

@@ -27,6 +27,14 @@ export interface NormalizeOutcome {
   readonly workerStatus?: string;
 }
 
+export class WorkerSummaryValidationError extends Error {
+  readonly code = "WORKER_SUMMARY_INVALID" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerSummaryValidationError";
+  }
+}
+
 type JsonObject = Record<string, unknown>;
 
 function isObject(value: unknown): value is JsonObject {
@@ -43,11 +51,19 @@ function stringArray(value: unknown): string[] {
     : [];
 }
 
-function parseSummaryPayload(output: unknown): JsonObject | undefined {
+function parseSummaryPayload(output: unknown, strict: boolean): JsonObject | undefined {
   if (isObject(output)) return output;
   if (typeof output !== "string") return undefined;
 
   const text = output.trim();
+  if (strict) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      return isObject(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
   const candidates = [text];
   const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   if (fenced?.[1] !== undefined) candidates.unshift(fenced[1].trim());
@@ -69,12 +85,51 @@ function parseSummaryPayload(output: unknown): JsonObject | undefined {
   return undefined;
 }
 
+function strictStringArray(value: unknown, field: string): readonly string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new WorkerSummaryValidationError(`${field} must be an array of strings`);
+  }
+  return value;
+}
+
+function validateStrictSummary(payload: JsonObject): void {
+  const allowed = new Set(["summary", "files_changed", "tests", "remaining_risks", "blocked_reason"]);
+  const extra = Object.keys(payload).find((key) => !allowed.has(key));
+  if (extra !== undefined) throw new WorkerSummaryValidationError(`unknown worker summary field: ${extra}`);
+  if (typeof payload["summary"] !== "string") throw new WorkerSummaryValidationError("summary must be a string");
+  strictStringArray(payload["files_changed"], "files_changed");
+  strictStringArray(payload["remaining_risks"], "remaining_risks");
+  if (!Array.isArray(payload["tests"])) throw new WorkerSummaryValidationError("tests must be an array");
+  for (const test of payload["tests"]) {
+    if (!isObject(test) || typeof test["name"] !== "string") {
+      throw new WorkerSummaryValidationError("each test requires a string name");
+    }
+    if (test["status"] !== "passed" && test["status"] !== "failed" && test["status"] !== "skipped") {
+      throw new WorkerSummaryValidationError("each test has an invalid status");
+    }
+    if (Object.keys(test).some((key) => !["name", "status", "message"].includes(key))) {
+      throw new WorkerSummaryValidationError("each test contains an unknown field");
+    }
+    if (test["message"] !== undefined && typeof test["message"] !== "string") {
+      throw new WorkerSummaryValidationError("test message must be a string");
+    }
+  }
+  if (payload["blocked_reason"] !== undefined && typeof payload["blocked_reason"] !== "string") {
+    throw new WorkerSummaryValidationError("blocked_reason must be a string");
+  }
+}
+
 function normalizeExecResult(
   rawResult: JsonObject,
   sessionId: string | undefined,
+  strictSummary: boolean,
 ): NormalizeOutcome {
   const output = rawResult["output"];
-  const payload = parseSummaryPayload(output);
+  const payload = parseSummaryPayload(output, strictSummary);
+  if (strictSummary && payload === undefined) {
+    throw new WorkerSummaryValidationError("output must be an exact JSON worker summary object");
+  }
+  if (strictSummary && payload !== undefined) validateStrictSummary(payload);
   const summary = stringValue(payload?.["summary"])
     ?? (typeof output === "string" ? output.trim() : "");
   const reportedTests = isObject(payload) ? payload["tests"] : undefined;
@@ -125,7 +180,9 @@ function normalizeExecResult(
 
 export function normalizeWorkerEvents(
   events: readonly StreamJsonEvent[],
+  options: { readonly strictSummary?: boolean } = {},
 ): NormalizeOutcome {
+  const strictSummary = options.strictSummary ?? false;
   let lastResult: ResultEvent | undefined;
   let lastExecResult: JsonObject | undefined;
   let sessionId: string | undefined;
@@ -154,7 +211,7 @@ export function normalizeWorkerEvents(
   }
 
   if (lastExecResult !== undefined) {
-    return normalizeExecResult(lastExecResult, sessionId);
+    return normalizeExecResult(lastExecResult, sessionId, strictSummary);
   }
 
   if (!lastResult) {

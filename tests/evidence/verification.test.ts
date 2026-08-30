@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +24,7 @@ import {
 import { sha256 } from "../../src/protocol/hash.js";
 import type { VerificationProfile } from "../../src/policy/verification.js";
 import type { StorageMonitor } from "../../src/storage/monitor.js";
+import { resolveProgramIdentity } from "../../src/runtime/program-identity.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -266,6 +267,10 @@ describe("runVerification", () => {
       signal: r.signal,
       stdout: r.stdout,
       stderr: r.stderr,
+      stdoutBytes: r.stdoutBytes,
+      stderrBytes: r.stderrBytes,
+      stdoutTruncated: r.stdoutTruncated,
+      stderrTruncated: r.stderrTruncated,
       errorMessage: r.errorMessage,
     });
     expect(r.resultHash).toBe(expected);
@@ -330,5 +335,41 @@ describe("runVerification", () => {
       tempDir,
     );
     expect(r.status).toBe("passed");
+  });
+
+  it("bounds verification stdout/stderr while preserving exit-code authority", async () => {
+    const r = await runVerification(
+      makeProfile({
+        id: "bounded",
+        args: ["-e", "process.stdout.write('x'.repeat(1000)); process.stderr.write('y'.repeat(1000)); process.exit(0)"],
+      }),
+      "ws-bounded",
+      tempDir,
+      { maxStdoutBytes: 32, maxStderrBytes: 32 },
+    );
+    expect(r.status).toBe("passed");
+    expect(r.stdoutBytes).toBe(1000);
+    expect(r.stderrBytes).toBe(1000);
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderrTruncated).toBe(true);
+    expect(r.stdout.length).toBe(32);
+    expect(r.stderr.length).toBe(32);
+  });
+
+  it("refuses a changed verification launcher before it runs", async () => {
+    const launcher = join(tempDir, "verification-launcher.cmd");
+    const marker = join(tempDir, "verification-ran.txt");
+    const original = ["@echo off", `echo ran>\"${marker}\"`, "exit /b 0", ""].join("\r\n");
+    await writeFile(launcher, original, "utf8");
+    const identity = await resolveProgramIdentity(launcher);
+    await writeFile(launcher, `${original}\r\n`, "utf8");
+    const r = await runVerification(
+      makeProfile({ id: "drift", program: launcher, args: [] }),
+      "ws-drift",
+      tempDir,
+      { expectedProgramIdentity: identity },
+    );
+    expect(r.status).toBe("runtime_drift");
+    await expect(readFile(marker)).rejects.toThrow();
   });
 });
