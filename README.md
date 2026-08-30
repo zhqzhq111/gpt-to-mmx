@@ -19,13 +19,15 @@ G2M v1.0.0 Coding Orchestrator 已完成：
 - Event Hash Chain、State Machine、task fingerprint；
 - Review Bundle、六字段绑定、anti-stale / anti-replay；
 - ACCEPT / REVISE / BLOCK；
+- Phase 10 proof-first GC：只读默认的 `g2m gc`、跨进程 GC lock、Crash-safe
+  `gc.marked` / Tombstone / `gc.completed` 顺序、可重建历史投影；
 - UNKNOWN Resolver 与 RECOVERY_REQUIRED；
 - Unified ProcessSupervisor：Windows process-tree、POSIX process-group、超时/取消终止确认；
 - `read_only` 任务的真实 diff 强制审计；
 - 可交互 `g2m run` / `g2m review` 命令；
 - 已安装的 `$gpt-to-mmx` Codex Skill。
 
-完整状态见 [_skill/docs/implementation-status.md](/F:/gpt-mmx/_skill/docs/implementation-status.md)，架构基线见 [_skill/docs/GPT-to-MMX-v1-实施计划书.md](/F:/gpt-mmx/_skill/docs/GPT-to-MMX-v1-实施计划书.md)。
+完整状态见 [_skill/docs/implementation-status.md](_skill/docs/implementation-status.md)，架构基线见 [_skill/docs/GPT-to-MMX-v1-实施计划书.md](_skill/docs/GPT-to-MMX-v1-实施计划书.md)。
 
 ## 已验证
 
@@ -54,7 +56,7 @@ npm run build
 npm run g2m -- probe --config <g2m.config.json>
 ```
 
-本地配置可从 [examples/g2m.config.example.json](/F:/gpt-mmx/examples/g2m.config.example.json) 开始。任务、review 和 findings 文件应放在目标仓库外，例如 `.tmp/handoffs/<task-id>/`。
+本地配置可从 [examples/g2m.config.example.json](examples/g2m.config.example.json) 开始。任务、review 和 findings 文件应放在目标仓库外，例如 `.tmp/handoffs/<task-id>/`。
 
 可选的 `state_root` 用于保存跨进程恢复所需的事件、证据、指纹和 Review 防重放状态；未配置时默认使用 `<artifact_root>/state`。
 
@@ -83,9 +85,40 @@ npm run g2m -- review --bundle <review-bundle.json> --decision ACCEPT --output <
 npm run g2m -- recover --config <config.json> --execution-id <execution-id> --process-status crashed
 ```
 
+历史执行清理默认只做只读候选审查；只有显式 `--apply` 才会删除，并且
+不会提供绕过恢复、Lease 或路径校验的 `--force` 选项：
+
+```powershell
+npm run g2m -- gc --config <config.json>
+npm run g2m -- gc --config <config.json> --apply
+```
+
+运维命令提供统一的状态、诊断和受限修复接口。`status` 与 `doctor` 都是
+严格只读的，不会触发 Engine startup recovery、Projection backfill、Lease
+reconciliation、Storage reconciliation 或 GC resume：
+
+```powershell
+npm run g2m -- status --config <config.json>
+npm run g2m -- status --config <config.json> --format json
+npm run g2m -- doctor --config <config.json> --format json
+```
+
+`repair` 默认只生成计划；只有显式 `--apply` 才会执行一个白名单动作：
+`projection-rebuild`、`gc-resume` 或 `storage-reconcile`。不支持
+`--all`、`--force` 或任何绕过 Journal、Recovery、Lease、SQLite 校验的选项。
+apply 会在 Repair Lock 内重新生成并校验 plan；如果锁前后的持久状态发生
+变化，会返回 `REPAIR_PLAN_STALE`，不会执行旧 plan。Repair Lock 带有
+heartbeat、同主机 dead-PID stale reclaim 和 operation ownership 校验；live、
+unknown 或 foreign owner 都会被拒绝。修复后应再次运行 `doctor`：
+
+```powershell
+npm run g2m -- repair --config <config.json> --action projection-rebuild
+npm run g2m -- repair --config <config.json> --action projection-rebuild --apply --format json
+```
+
 ## Codex Skill
 
-Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](/F:/gpt-mmx/_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
+Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
 
 ```text
 C:\Users\zhq\.codex\skills\gpt-to-mmx
@@ -131,6 +164,21 @@ Phase 8 最终 Gate：`npm run typecheck`、`npm run build`、`git diff --check`
 通过；`npm test` 为 `479 passed / 5 skipped / 0 failed`；Lease process E2E
 为 `3/3`，Process Supervisor parent→grandchild E2E 为 `3/3`。
 
+Phase 9 Storage Manager 已完成：策略配置保持旧配置兼容；Storage Manager
+按卷执行逻辑容量预留，使用 `BEGIN IMMEDIATE` 防止并发 G2M 进程重复预留；
+usage scanner 使用 symlink-safe traversal，manifest 原子更新且可重建；
+storage reservation Journal/projection 支持启动恢复；Worker 和 Verification
+均受运行时磁盘监控保护。详细契约见
+[docs/v2/phase-9-storage-manager.md](docs/v2/phase-9-storage-manager.md)。
+
+Phase 10 Garbage Collection 已完成：GC 候选必须通过 Journal、Manifest、
+Lease、Reservation、Recovery 与文件系统的交叉证明；`gc.marked` 在所有
+破坏性操作前持久化，Tombstone 自校验且永久保留，`gc.completed` 后才关闭
+Journal writer 并删除 execution state。中断操作可在下次启动或显式 `g2m gc
+--apply` 时幂等续做；`RECOVERY_REQUIRED`、未知孤儿目录和不确定的
+worktree 绑定永不自动删除。详细契约见
+[docs/v2/phase-10-garbage-collection.md](docs/v2/phase-10-garbage-collection.md)。
+
 ## 目录
 
 ```text
@@ -145,6 +193,7 @@ src/
 ├── execution/                 State Machine、Fingerprint、Execution Engine
 ├── review/                    Bundle、Ingress、Replay Guard
 ├── recovery/                  UNKNOWN / RECOVERY_REQUIRED Resolver
+├── operations/                status / doctor / allowlisted repair
 └── workers/mcode/             Resolver、Adapter、Parser、Normalizer
 
 _skill/
@@ -154,7 +203,7 @@ _skill/
 
 ## v1 范围结论
 
-ACP 已复评为当前闭环不需要；Agent Team 暂无稳定 External Interface，因此 v1 不接入。详见 [_skill/docs/phase12-13-evaluation.md](/F:/gpt-mmx/_skill/docs/phase12-13-evaluation.md)。
+ACP 已复评为当前闭环不需要；Agent Team 暂无稳定 External Interface，因此 v1 不接入。详见 [_skill/docs/phase12-13-evaluation.md](_skill/docs/phase12-13-evaluation.md)。
 
 ```text
 Plans cross the boundary as data.

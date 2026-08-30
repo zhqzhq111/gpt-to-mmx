@@ -20,6 +20,8 @@ import {
   type RecoveryIssue,
   type RecoveryScanOptions,
 } from "../../src/recovery/scanner.js";
+import { executeGc, GcFaultError, type GcExecutorOptions } from "../../src/storage/gc.js";
+import { writeStorageManifestAtomic } from "../../src/storage/usage.js";
 
 const roots: string[] = [];
 
@@ -439,6 +441,50 @@ describe("scanRecovery", () => {
     expect(report.issues).toContainEqual(expect.objectContaining({ kind: "LEASE_RECOVERY_BLOCKED", executionId: "recovery-lease" }));
     expect(report.issues).toContainEqual(expect.objectContaining({ kind: "LEASE_MALFORMED" }));
     expect(await readFile(malformedPath)).toEqual(before);
+    events.close();
+    f.database.close();
+  });
+
+  it("reports interrupted GC and suppresses ordinary missing-artifact/outcome errors", async () => {
+    const f = await fixture();
+    const seed = new EventStore({ executionDirectory: f.executionRoot });
+    appendToRunning(seed, "gc-interrupted");
+    append(seed, "gc-interrupted", "gc-interrupted-task", "agent.failed");
+    seed.close();
+    const events = new EventStore({ executionDirectory: f.executionRoot, tolerateLoadErrors: true });
+    replayAndProject(f.database, events.getByAttemptId("gc-interrupted"));
+    const artifactPath = join(f.artifactRoot, "gc-interrupted");
+    await mkdir(artifactPath, { recursive: true });
+    await writeFile(join(artifactPath, "outcome.json"), "outcome", "utf8");
+    const terminalAt = events.getByAttemptId("gc-interrupted").at(-1)?.timestampMs ?? 0;
+    await writeStorageManifestAtomic(join(f.stateRoot, "executions", "gc-interrupted", "storage-manifest.json"), {
+      executionId: "gc-interrupted",
+      artifactBytes: 7,
+      worktreeBytes: 0,
+      artifactPath,
+      worktreePath: join(f.worktreeRoot, "missing"),
+      retentionClass: "NORMAL",
+      gcEligibleAt: terminalAt + 30 * 24 * 60 * 60 * 1000,
+      updatedAt: terminalAt,
+    });
+    const gcOptions: GcExecutorOptions = {
+      stateRoot: f.stateRoot,
+      artifactRoot: f.artifactRoot,
+      worktreeRoot: f.worktreeRoot,
+      eventStore: events,
+      database: f.database,
+      nowMs: terminalAt + 30 * 24 * 60 * 60 * 1000 + 1,
+      completedRetentionDays: 30,
+      fault: async (point) => { if (point === "after_gc_marked") throw new GcFaultError(point); },
+    };
+    await executeGc(gcOptions);
+    await rm(artifactPath, { recursive: true, force: true });
+
+    const report = scanRecovery(scannerOptions(f, events));
+
+    expect(issueKinds(report, "gc-interrupted")).toContain("GC_INTERRUPTED");
+    expect(issueKinds(report, "gc-interrupted")).not.toContain("MISSING_OUTCOME");
+    expect(issueKinds(report, "gc-interrupted")).not.toContain("MISSING_COMMITTED_ARTIFACT");
     events.close();
     f.database.close();
   });

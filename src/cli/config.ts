@@ -1,6 +1,8 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
+import { DEFAULT_STORAGE_POLICY } from "../storage/policy.js";
+
 const absolutePath = z.string().min(1).refine(isAbsolute, "path must be absolute");
 
 const WorkspaceConfigSchema = z
@@ -31,6 +33,18 @@ const WorkspaceLeaseConfigSchema = z
   })
   .strict();
 
+const StoragePolicySchema = z.object({
+  min_free_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.min_free_bytes),
+  safety_margin_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.safety_margin_bytes),
+  default_execution_reservation_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.default_execution_reservation_bytes),
+  max_total_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.max_total_bytes),
+  max_artifact_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.max_artifact_bytes),
+  max_worktree_bytes: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.max_worktree_bytes),
+  completed_retention_days: z.number().int().nonnegative().default(DEFAULT_STORAGE_POLICY.completed_retention_days),
+  reservation_ttl_ms: z.number().int().positive().default(DEFAULT_STORAGE_POLICY.reservation_ttl_ms),
+  monitor_interval_ms: z.number().int().positive().default(DEFAULT_STORAGE_POLICY.monitor_interval_ms),
+}).strict();
+
 const LocalConfigSchema = z
   .object({
     protocol_version: z.literal("g2m.local-config.v1"),
@@ -40,6 +54,7 @@ const LocalConfigSchema = z
     artifact_root: absolutePath,
     state_root: absolutePath.optional(),
     workspace_lease: WorkspaceLeaseConfigSchema.optional(),
+    storage: StoragePolicySchema.default(DEFAULT_STORAGE_POLICY),
     mcode_path: absolutePath.optional(),
     review_timeout_ms: z.number().int().positive().default(1_800_000),
   })

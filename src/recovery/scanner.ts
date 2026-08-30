@@ -16,6 +16,7 @@ import {
   WorkspaceLock,
   type LeaseJournalState,
 } from "../workspace/lock.js";
+import { readTombstoneSync } from "../storage/tombstone.js";
 
 export type RecoveryIssueKind =
   | "JOURNAL_LOAD_ERROR"
@@ -37,7 +38,11 @@ export type RecoveryIssueKind =
   | "LEASE_STALE"
   | "LEASE_RECOVERY_BLOCKED"
   | "ORPHAN_HEARTBEAT"
-  | "LOCK_REQUIRES_VALIDATION";
+  | "LOCK_REQUIRES_VALIDATION"
+  | "GC_INTERRUPTED"
+  | "GC_CLEANUP_PENDING"
+  | "GC_TOMBSTONE_INVALID"
+  | "GC_STATE_CHANGED_AFTER_MARK";
 
 export type RecoveryIssueSeverity = "SAFE_HOLD" | "REPORT_ONLY";
 
@@ -93,6 +98,10 @@ const ISSUE_PRIORITY: Readonly<Record<RecoveryIssueKind, number>> = {
   LEASE_STALE: 115,
   ORPHAN_HEARTBEAT: 116,
   LOCK_REQUIRES_VALIDATION: 120,
+  GC_INTERRUPTED: 130,
+  GC_CLEANUP_PENDING: 131,
+  GC_TOMBSTONE_INVALID: 132,
+  GC_STATE_CHANGED_AFTER_MARK: 133,
 };
 
 function payloadString(event: TaskEvent, ...keys: string[]): string | undefined {
@@ -505,12 +514,59 @@ export function scanRecovery(options: RecoveryScanOptions): RecoveryScanReport {
       });
     }
     addProjectionIssues(issues, database, executionId, events);
-    for (const event of events) {
+    const markedIndex = events.findIndex((event) => event.type === "gc.marked");
+    const marked = markedIndex >= 0;
+    const gcCompleted = events.some((event) => event.type === "gc.completed");
+    if (marked && !gcCompleted) {
+      addIssue(issues, {
+        kind: "GC_INTERRUPTED",
+        severity: "REPORT_ONLY",
+        executionId,
+        reason: "gc.marked is durable but gc.completed is absent",
+        evidence: [eventEvidence(executionId, events[markedIndex]!)],
+      });
+    }
+    if (gcCompleted) {
+      try {
+        const tombstone = readTombstoneSync(join(options.stateRoot, "tombstones", `${executionId}.json`));
+        const completedEvent = events.find((event) => event.type === "gc.completed");
+        if (tombstone === undefined || completedEvent?.payload["tombstone_hash"] !== tombstone.selfHash) throw new Error("gc.completed tombstone binding");
+        addIssue(issues, {
+          kind: "GC_CLEANUP_PENDING",
+          severity: "REPORT_ONLY",
+          executionId,
+          reason: "gc.completed is durable while the execution state directory remains",
+          evidence: [eventEvidence(executionId, completedEvent!)],
+        });
+      } catch {
+        addIssue(issues, {
+          kind: "GC_TOMBSTONE_INVALID",
+          severity: "REPORT_ONLY",
+          executionId,
+          reason: "gc.completed is not bound to a valid tombstone",
+          evidence: [`tombstone:${executionId}`],
+        });
+      }
+    }
+    if (marked) {
+      for (const event of events.slice(markedIndex + 1)) {
+        if (event.type !== "gc.completed" && (event.domain === "lifecycle" || event.domain === "recovery")) {
+          addIssue(issues, {
+            kind: "GC_STATE_CHANGED_AFTER_MARK",
+            severity: "REPORT_ONLY",
+            executionId,
+            reason: "lifecycle or recovery event was appended after gc.marked",
+            evidence: [eventEvidence(executionId, event)],
+          });
+        }
+      }
+    }
+    if (!marked) for (const event of events) {
       if (event.type === "patch.frozen") validateFrozenPatch(issues, event, options.artifactRoot, state);
       if (event.type === "review.requested") validateReviewBundle(issues, event, options.artifactRoot, state);
       if (event.type === "patch.applied") validateApplyEvidence(issues, event, options.artifactRoot, state);
     }
-    if (isTerminal(state) && !existsSync(resolve(options.artifactRoot, executionId, "outcome.json"))) {
+    if (!marked && !gcCompleted && isTerminal(state) && !existsSync(resolve(options.artifactRoot, executionId, "outcome.json"))) {
       addIssue(issues, {
         kind: "MISSING_OUTCOME",
         severity: "REPORT_ONLY",

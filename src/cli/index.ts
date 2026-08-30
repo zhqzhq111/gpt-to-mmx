@@ -17,6 +17,11 @@ import { runAcceptRecovery, isPartialAccept, type AcceptProcessStatus } from "..
 import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
 import { scanRecovery } from "../recovery/scanner.js";
 import { runStartupRecovery } from "../recovery/startup.js";
+import { StorageManager, reconcileStorageReservations } from "../storage/reservation.js";
+import { rebuildStorageUsageFromManifests } from "../storage/usage.js";
+import { StorageMonitor } from "../storage/monitor.js";
+import { cleanupSafeOrphans, executeGc, resumeInterrupted } from "../storage/gc.js";
+import { planGcCandidates } from "../storage/gc-candidate.js";
 import type { TaskEvent } from "../events/events.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
@@ -26,6 +31,10 @@ import { WorkspaceRegistry } from "../workspace/registry.js";
 import { captureBaseline } from "../workspace/baseline.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
 import { createReviewForBundle, writeJsonAtomic } from "./review-file.js";
+import { buildOperationalSnapshot } from "../operations/snapshot.js";
+import { runDoctor } from "../operations/doctor.js";
+import { executeRepair, planRepair } from "../operations/repair.js";
+import { renderJson, renderText } from "../operations/format.js";
 
 interface ParsedArguments {
   readonly command: string;
@@ -39,15 +48,72 @@ function emit(value: unknown): void {
 function parseArguments(argv: readonly string[]): ParsedArguments {
   const command = argv[0] ?? "help";
   const options = new Map<string, string>();
-  for (let index = 1; index < argv.length; index += 2) {
+  for (let index = 1; index < argv.length;) {
     const key = argv[index];
     const value = argv[index + 1];
-    if (key === undefined || !key.startsWith("--") || value === undefined) {
+    if (key === undefined || !key.startsWith("--")) {
       throw new Error(`invalid argument near "${key ?? "end of input"}"`);
     }
+    if (key === "--apply") {
+      options.set("apply", "true");
+      index += 1;
+      continue;
+    }
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`invalid argument near "${key}"`);
+    }
     options.set(key.slice(2), value);
+    index += 2;
   }
   return { command, options };
+}
+
+async function gcCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  for (const forbidden of ["force", "ignore-recovery", "ignore-lease", "delete-anyway"]) {
+    if (options.has(forbidden)) throw new Error("GC does not support --" + forbidden);
+  }
+  const config = await loadConfig(resolve(required(options, "config")));
+  const apply = options.get("apply") === "true";
+  const stateRoot = stateRootForConfig(config);
+  const database = new StateDatabase(join(stateRoot, "g2m-state.sqlite"), { readOnly: !apply });
+  const eventStore = new EventStore({
+    executionDirectory: join(stateRoot, "executions"),
+    tolerateLoadErrors: true,
+    readOnly: !apply,
+  });
+  try {
+    const plannerOptions = {
+      stateRoot,
+      artifactRoot: config.artifact_root,
+      worktreeRoot: config.worktree_root,
+      eventStore,
+      database,
+      nowMs: Date.now(),
+      completedRetentionDays: config.storage.completed_retention_days,
+      workspaces: config.workspaces.map((workspace) => ({ workspaceId: workspace.workspace_id, canonicalPath: workspace.path })),
+    } as const;
+    if (!apply) {
+      const all = await planGcCandidates(plannerOptions);
+      const filtered = options.get("execution-id") === undefined ? all : all.filter((candidate) => candidate.executionId === options.get("execution-id"));
+      emit({
+        type: "g2m.gc",
+        mode: "dry-run",
+        eligible: filtered.filter((candidate) => candidate.decision === "ELIGIBLE"),
+        blocked: filtered.filter((candidate) => candidate.decision === "BLOCKED"),
+        estimated_reclaim_bytes: filtered.filter((candidate) => candidate.decision === "ELIGIBLE").reduce((sum, candidate) => sum + candidate.artifactBytes + candidate.worktreeBytes, 0),
+        message: "No files were deleted. Use --apply to perform GC.",
+      });
+      return;
+    }
+    const resumed = await resumeInterrupted(plannerOptions);
+    const executionId = options.get("execution-id");
+    const result = await executeGc({ ...plannerOptions, ...(executionId !== undefined ? { executionId } : {}) });
+    const orphans = await cleanupSafeOrphans({ ...plannerOptions, ...(executionId !== undefined ? { executionId } : {}) });
+    emit({ type: "g2m.gc", mode: "apply", resumed, result, orphans });
+  } finally {
+    eventStore.close();
+    database.close();
+  }
 }
 
 function required(options: ReadonlyMap<string, string>, name: string): string {
@@ -84,6 +150,7 @@ async function configureEngine(
   readonly worker: MCodeAdapter;
   readonly projectionDatabase: StateDatabase;
   readonly workspaceLock: WorkspaceLock;
+  readonly storageManager: StorageManager;
 }> {
   const stateRoot = stateRootForConfig(config);
   let projectionDatabase: StateDatabase | undefined;
@@ -99,8 +166,11 @@ async function configureEngine(
         canonicalPath: entry.path,
       })),
       nowMs: Date.now(),
+      completedRetentionDays: config.storage.completed_retention_days,
     });
-    const projection = new ExecutionProjector(projectionDatabase);
+    const projection = new ExecutionProjector(projectionDatabase, {
+      completedRetentionDays: config.storage.completed_retention_days,
+    });
     eventStore = new EventStore({
       executionDirectory: join(stateRoot, "executions"),
       tolerateLoadErrors: true,
@@ -163,6 +233,40 @@ async function configureEngine(
     }
     await workspaceLock.reconcileStartupLeases(leaseStates);
     projection.replaceWorkspaceLeases(await scanLeaseOwners(stateRoot));
+    const storageManager = new StorageManager({
+      database: projectionDatabase,
+      eventStore,
+      stateRoot,
+      policy: config.storage,
+    });
+    await reconcileStorageReservations({
+      stateRoot,
+      database: projectionDatabase,
+      eventStore,
+      nowMs: Date.now(),
+    });
+    rebuildStorageUsageFromManifests({
+      stateRoot,
+      database: projectionDatabase,
+      nowMs: Date.now(),
+    });
+    await resumeInterrupted({
+      stateRoot,
+      artifactRoot: config.artifact_root,
+      worktreeRoot: config.worktree_root,
+      eventStore,
+      database: projectionDatabase,
+      nowMs: Date.now(),
+      completedRetentionDays: config.storage.completed_retention_days,
+      workspaces: config.workspaces.map((entry) => ({ workspaceId: entry.workspace_id, canonicalPath: entry.path })),
+      workspaceLock,
+    });
+    const liveDatabase = projectionDatabase;
+    if (liveDatabase === undefined) throw new Error("projection database was not initialized");
+    const storageMonitor = new StorageMonitor({
+      policy: config.storage,
+      managedUsageBytes: () => Number((liveDatabase.prepare("SELECT COALESCE(SUM(artifact_bytes + worktree_bytes), 0) AS total FROM storage_usage").get() as { total: number | bigint }).total),
+    });
     const profileRegistry = new ProfileRegistry();
     for (const profile of config.verification_profiles) {
       profileRegistry.register({
@@ -193,6 +297,8 @@ async function configureEngine(
       adapterContractVersion: "g2m-worker-v1",
       worktreeRoot: config.worktree_root,
       artifactRoot: config.artifact_root,
+      storageManager,
+      storageMonitor,
     });
     return {
       engine,
@@ -203,6 +309,7 @@ async function configureEngine(
       worker,
       projectionDatabase,
       workspaceLock,
+      storageManager,
     };
   } catch (error) {
     eventStore?.close();
@@ -213,6 +320,56 @@ async function configureEngine(
 
 function stateRootForConfig(config: G2MLocalConfig): string {
   return config.state_root ?? resolve(config.artifact_root, "state");
+}
+
+type OutputFormat = "text" | "json";
+
+function outputFormat(options: ReadonlyMap<string, string>): OutputFormat {
+  const format = options.get("format") ?? "text";
+  if (format !== "text" && format !== "json") throw new Error("--format must be text or json");
+  return format;
+}
+
+function emitOperational(value: unknown, format: OutputFormat): void {
+  process.stdout.write(format === "json" ? renderJson(value) : renderText(value));
+}
+
+async function statusCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  const config = await loadConfig(resolve(required(options, "config")));
+  const executionId = options.get("execution-id");
+  emitOperational(await buildOperationalSnapshot({
+    config,
+    ...(executionId !== undefined ? { executionId } : {}),
+  }), outputFormat(options));
+}
+
+async function doctorCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  const config = await loadConfig(resolve(required(options, "config")));
+  const executionId = options.get("execution-id");
+  emitOperational(await runDoctor({
+    config,
+    ...(executionId !== undefined ? { executionId } : {}),
+  }), outputFormat(options));
+}
+
+async function repairCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  for (const forbidden of ["all", "force", "delete-anyway", "ignore-journal", "ignore-recovery", "ignore-lease", "trust-sqlite", "rewrite-journal"]) {
+    if (options.has(forbidden)) throw new Error(`repair does not support --${forbidden}`);
+  }
+  const config = await loadConfig(resolve(required(options, "config")));
+  const action = required(options, "action");
+  const executionId = options.get("execution-id");
+  const common = {
+    config,
+    action,
+    ...(executionId !== undefined ? { executionId } : {}),
+  } as const;
+  const format = outputFormat(options);
+  if (options.get("apply") === "true") {
+    emitOperational(await executeRepair({ ...common, apply: true }), format);
+  } else {
+    emitOperational(await planRepair({ ...common, apply: false }), format);
+  }
 }
 
 async function waitForReview(path: string, timeoutMs: number): Promise<Review> {
@@ -511,6 +668,10 @@ function printHelp(): void {
       "  g2m probe  --config <g2m.config.json>",
       "  g2m run    --config <config> --task <task.json> --review <review.json>",
       "  g2m recover --config <config> --execution-id <id> --process-status <status>",
+      "  g2m gc      --config <config> [--apply] [--execution-id <id>]",
+      "  g2m status  --config <config> [--execution-id <id>] [--format text|json]",
+      "  g2m doctor  --config <config> [--execution-id <id>] [--format text|json]",
+      "  g2m repair  --config <config> --action <action> [--apply] [--format text|json]",
       "  g2m review --bundle <review-bundle.json> --decision <ACCEPT|REVISE|BLOCK>",
       "             --output <review.json> [--findings-file <path>] [--new-task-id <id>]",
       "",
@@ -532,6 +693,18 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       return;
     case "probe":
       await probeCommand(parsed.options);
+      return;
+    case "gc":
+      await gcCommand(parsed.options);
+      return;
+    case "status":
+      await statusCommand(parsed.options);
+      return;
+    case "doctor":
+      await doctorCommand(parsed.options);
+      return;
+    case "repair":
+      await repairCommand(parsed.options);
       return;
     case "help":
     case "--help":

@@ -2,6 +2,7 @@ import type { TaskEvent } from "../events/events.js";
 import { fingerprintHash } from "../execution/fingerprint.js";
 import type { TaskState } from "../execution/state-machine.js";
 import type { ValidLeaseOwner } from "../workspace/lock.js";
+import type { Tombstone } from "../storage/tombstone.js";
 import { StateDatabase } from "./database.js";
 
 export interface WorkspaceSeed {
@@ -85,8 +86,32 @@ function retentionClass(state: TaskState): string | null {
   return null;
 }
 
+function retentionProjection(
+  state: TaskState,
+  terminalTimestamp: number,
+  completedRetentionDays: number,
+): { retentionClass: string | null; gcEligibleAt: number | null } {
+  const retention = retentionClass(state);
+  if (retention !== "NORMAL") return { retentionClass: retention, gcEligibleAt: null };
+  return {
+    retentionClass: "NORMAL",
+    gcEligibleAt: terminalTimestamp + completedRetentionDays * 24 * 60 * 60 * 1000,
+  };
+}
+
+export interface ExecutionProjectorOptions {
+  readonly completedRetentionDays?: number;
+}
+
 export class ExecutionProjector implements ExecutionProjection {
-  constructor(private readonly database: StateDatabase) {}
+  private readonly completedRetentionDays: number;
+
+  constructor(
+    private readonly database: StateDatabase,
+    options: ExecutionProjectorOptions = {},
+  ) {
+    this.completedRetentionDays = options.completedRetentionDays ?? 30;
+  }
 
   project(event: TaskEvent, state: TaskState, metadata: ProjectionMetadata = {}): void {
     this.database.transaction(() => this.projectWithinTransaction(event, state, metadata));
@@ -136,6 +161,40 @@ export class ExecutionProjector implements ExecutionProjection {
     return this.database.prepare(
       "SELECT * FROM recovery_cases WHERE execution_id = ?",
     ).get(executionId) as RecoveryCaseRow | undefined;
+  }
+
+  projectTombstone(tombstone: Tombstone): void {
+    this.database.transaction(() => {
+      for (const table of ["artifacts", "reviews", "recovery_cases", "storage_usage", "storage_reservations"]) {
+        this.database.prepare("DELETE FROM " + table + " WHERE execution_id = ?").run(tombstone.executionId);
+      }
+      this.database.prepare(`
+        INSERT INTO executions(
+          execution_id, task_id, workspace_id, state, created_at, updated_at,
+          base_revision, runtime, runtime_version, model, fingerprint_hash,
+          artifact_path, worktree_path, review_bundle_id, retention_class, gc_eligible_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL)
+        ON CONFLICT(execution_id) DO UPDATE SET
+          task_id = excluded.task_id,
+          workspace_id = excluded.workspace_id,
+          state = excluded.state,
+          created_at = excluded.created_at,
+          updated_at = excluded.updated_at,
+          artifact_path = NULL,
+          worktree_path = NULL,
+          review_bundle_id = NULL,
+          retention_class = excluded.retention_class,
+          gc_eligible_at = NULL
+      `).run(
+        tombstone.executionId,
+        tombstone.taskId,
+        tombstone.workspaceId,
+        tombstone.finalState,
+        tombstone.createdAt,
+        tombstone.gcCompletedAt,
+        tombstone.retentionClass,
+      );
+    });
   }
 
   workspaceLease(workspaceId: string): Record<string, unknown> | undefined {
@@ -206,6 +265,11 @@ export class ExecutionProjector implements ExecutionProjection {
     state: TaskState,
     metadata: ProjectionMetadata,
   ): void {
+    if (event.domain === "storage") {
+      this.projectStorage(event);
+      this.updateCursor(event);
+      return;
+    }
     if (event.domain === "projection") {
       this.updateCursor(event);
       return;
@@ -227,6 +291,42 @@ export class ExecutionProjector implements ExecutionProjection {
     this.projectReview(event);
     this.projectRecovery(event);
     this.updateCursor(event);
+  }
+
+  private projectStorage(event: TaskEvent): void {
+    const rawReservations = event.payload["reservations"];
+    const reservations = Array.isArray(rawReservations) ? rawReservations : [];
+    if (event.type === "storage.reservation.created") {
+      const setId = typeof event.payload["reservation_set_id"] === "string" ? event.payload["reservation_set_id"] : null;
+      const recordPath = typeof event.payload["record_path"] === "string" ? event.payload["record_path"] : null;
+      const recordHash = typeof event.payload["record_hash"] === "string" ? event.payload["record_hash"] : null;
+      for (const raw of reservations) {
+        if (raw === null || typeof raw !== "object") continue;
+        const value = raw as Record<string, unknown>;
+        if (typeof value["reservation_id"] !== "string" || typeof value["volume_id"] !== "string" || typeof value["reserved_bytes"] !== "number") continue;
+        const roles = Array.isArray(value["roles"]) ? value["roles"].filter((role): role is string => typeof role === "string") : [];
+        this.database.prepare(`
+          INSERT INTO storage_reservations(
+            reservation_id, reservation_set_id, execution_id, volume_id,
+            reserved_bytes, created_at, expires_at, state, roles_json,
+            record_path, record_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+          ON CONFLICT(reservation_id) DO UPDATE SET
+            state = CASE WHEN storage_reservations.state = 'ACTIVE' THEN 'ACTIVE' ELSE storage_reservations.state END
+        `).run(
+          value["reservation_id"], setId, event.attemptId, value["volume_id"], value["reserved_bytes"],
+          event.timestampMs, typeof event.payload["expires_at"] === "number" ? event.payload["expires_at"] : event.timestampMs,
+          JSON.stringify(roles), recordPath, recordHash,
+        );
+      }
+      return;
+    }
+    const ids = reservations.length > 0
+      ? reservations.map((raw) => raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>)["reservation_id"] : undefined).filter((id): id is string => typeof id === "string")
+      : (Array.isArray(event.payload["reservation_ids"]) ? event.payload["reservation_ids"].filter((id): id is string => typeof id === "string") : []);
+    const state = event.type === "storage.reservation.expired" ? "EXPIRED" : event.type === "storage.reservation.abandoned" ? "ABANDONED" : "RELEASED";
+    const statement = this.database.prepare("UPDATE storage_reservations SET state = ? WHERE reservation_id = ? AND state = 'ACTIVE'");
+    for (const id of ids) statement.run(state, id);
   }
 
   private updateCursor(event: TaskEvent): void {
@@ -258,6 +358,7 @@ export class ExecutionProjector implements ExecutionProjection {
     metadata: ProjectionMetadata,
   ): void {
     const binding = taskBinding(event);
+    const retention = retentionProjection(state, event.timestampMs, this.completedRetentionDays);
     this.database.prepare(`
       INSERT INTO executions(
         execution_id, task_id, workspace_id, state, created_at, updated_at,
@@ -285,7 +386,7 @@ export class ExecutionProjector implements ExecutionProjection {
       event.fingerprint !== undefined ? fingerprintHash(event.fingerprint) : null,
       metadata.artifactPath ?? null,
       metadata.worktreePath ?? null,
-      retentionClass(state),
+      retention.retentionClass,
     );
   }
 
@@ -295,6 +396,7 @@ export class ExecutionProjector implements ExecutionProjection {
     metadata: ProjectionMetadata,
   ): void {
     const reviewBundleId = textPayload(event, "review_bundle_id", "reviewBundleId");
+    const retention = retentionProjection(state, event.timestampMs, this.completedRetentionDays);
     this.database.prepare(`
       UPDATE executions SET
         state = ?,
@@ -306,7 +408,8 @@ export class ExecutionProjector implements ExecutionProjection {
         artifact_path = COALESCE(?, artifact_path),
         worktree_path = COALESCE(?, worktree_path),
         review_bundle_id = COALESCE(?, review_bundle_id),
-        retention_class = COALESCE(?, retention_class)
+        retention_class = ?,
+        gc_eligible_at = ?
       WHERE execution_id = ?
     `).run(
       state,
@@ -318,7 +421,8 @@ export class ExecutionProjector implements ExecutionProjection {
       metadata.artifactPath ?? null,
       metadata.worktreePath ?? null,
       reviewBundleId ?? null,
-      retentionClass(state),
+      retention.retentionClass,
+      retention.gcEligibleAt,
       event.attemptId,
     );
   }

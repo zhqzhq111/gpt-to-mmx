@@ -117,6 +117,10 @@ const CRITICAL_TYPES = new Set<TaskEventType>([
   "review.decision.block",
   "recovery.required",
   "recovery.reconciled",
+  "storage.reservation.created",
+  "storage.reservation.released",
+  "storage.reservation.expired",
+  "storage.reservation.abandoned",
   "gc.marked",
   "gc.completed",
   "projection.stale",
@@ -124,6 +128,7 @@ const CRITICAL_TYPES = new Set<TaskEventType>([
 ]);
 
 function defaultDomain(type: TaskEventType): EventDomain {
+  if (type.startsWith("storage.")) return "storage";
   if (type.startsWith("gc.")) return "storage";
   if (type.startsWith("projection.")) return "projection";
   if (type === "recovery.reconciled") return "recovery";
@@ -146,6 +151,7 @@ export interface EventStoreOptions {
   /** @deprecated flat journal layout for internal transition only. */
   readonly logDirectory?: string;
   readonly tolerateLoadErrors?: boolean;
+  readonly readOnly?: boolean;
 }
 
 export interface JournalRecoveryIssue {
@@ -205,6 +211,7 @@ export class EventStore {
   private readonly executionDirectory: string | undefined;
   private readonly logDirectory: string | undefined;
   private readonly tolerateLoadErrors: boolean;
+  private readonly readOnly: boolean;
 
   constructor(options: EventStoreOptions = {}) {
     if (options.executionDirectory !== undefined && options.logDirectory !== undefined) {
@@ -213,6 +220,7 @@ export class EventStore {
     this.executionDirectory = options.executionDirectory;
     this.logDirectory = options.logDirectory;
     this.tolerateLoadErrors = options.tolerateLoadErrors ?? false;
+    this.readOnly = options.readOnly ?? false;
     if (this.executionDirectory !== undefined) this.loadExecutionJournals();
     if (this.logDirectory !== undefined) this.loadLegacyJournals();
   }
@@ -220,8 +228,15 @@ export class EventStore {
   private loadExecutionJournals(): void {
     const root = this.executionDirectory;
     if (root === undefined) return;
-    mkdirSync(root, { recursive: true });
-    const entries = readdirSync(root, { withFileTypes: true })
+    if (!this.readOnly) mkdirSync(root, { recursive: true });
+    let entries;
+    try {
+      entries = readdirSync(root, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    entries = entries
       .filter((item) => item.isDirectory())
       .sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
@@ -320,6 +335,13 @@ export class EventStore {
   }
 
   flush(): void { for (const writer of this.writers.values()) writer.flush(); }
+
+  closeExecution(executionId: string): void {
+    const writer = this.writers.get(executionId);
+    if (writer === undefined) return;
+    writer.close();
+    this.writers.delete(executionId);
+  }
 
   close(): void {
     for (const writer of this.writers.values()) writer.close();

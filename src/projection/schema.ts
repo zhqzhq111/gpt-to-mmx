@@ -63,12 +63,18 @@ CREATE TABLE IF NOT EXISTS storage_usage(
 
 CREATE TABLE IF NOT EXISTS storage_reservations(
   reservation_id TEXT PRIMARY KEY,
+  reservation_set_id TEXT,
   execution_id TEXT NOT NULL,
   volume_id TEXT NOT NULL,
   reserved_bytes INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
-  state TEXT NOT NULL
+  state TEXT NOT NULL,
+  pid INTEGER,
+  hostname TEXT,
+  roles_json TEXT,
+  record_path TEXT,
+  record_hash TEXT
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS recovery_cases(

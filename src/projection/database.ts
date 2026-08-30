@@ -21,21 +21,29 @@ export class ProjectionDatabaseError extends Error {
   }
 }
 
+export interface StateDatabaseOptions {
+  readonly readOnly?: boolean;
+}
+
 export class StateDatabase {
   private readonly database: DatabaseSync;
   private closed = false;
 
-  constructor(readonly path: string) {
+  constructor(readonly path: string, options: StateDatabaseOptions = {}) {
     let opened: DatabaseSync | undefined;
     try {
-      if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-      opened = new DatabaseSync(path, { timeout: 5_000 });
-      opened.exec("PRAGMA journal_mode = WAL");
-      opened.exec("PRAGMA synchronous = NORMAL");
-      opened.exec("PRAGMA busy_timeout = 5000");
-      opened.exec(FROZEN_SCHEMA_SQL);
+      if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
+      const openPath = options.readOnly && path !== ":memory:" ? `file:${path}?immutable=1` : path;
+      opened = new DatabaseSync(openPath, { timeout: 5_000, readOnly: options.readOnly ?? false });
+      if (!options.readOnly) {
+        opened.exec("PRAGMA journal_mode = WAL");
+        opened.exec("PRAGMA synchronous = NORMAL");
+        opened.exec("PRAGMA busy_timeout = 5000");
+        opened.exec(FROZEN_SCHEMA_SQL);
+        this.ensureStorageReservationColumns(opened);
+      }
       this.database = opened;
-      this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
+      if (!options.readOnly) this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
     } catch (error) {
       // Close the SQLite handle on any failure so the underlying file
       // lock is released (otherwise a follow-up `rm` / `rename` against
@@ -44,6 +52,29 @@ export class StateDatabase {
         try { opened.close(); } catch { /* swallow close error during cleanup */ }
       }
       throw new ProjectionDatabaseError(`cannot open projection database: ${path}`, error);
+    }
+  }
+
+  private ensureStorageReservationColumns(database: DatabaseSync): void {
+    const existing = new Set(
+      (database.prepare("PRAGMA table_info(storage_reservations)").all() as Array<{ name: string }>).map((row) => row.name),
+    );
+    const columns: ReadonlyArray<[string, string]> = [
+      ["reservation_set_id", "TEXT"],
+      ["pid", "INTEGER"],
+      ["hostname", "TEXT"],
+      ["roles_json", "TEXT"],
+      ["record_path", "TEXT"],
+      ["record_hash", "TEXT"],
+    ];
+    for (const [name, type] of columns) {
+      if (!existing.has(name)) {
+        try {
+          database.exec(`ALTER TABLE storage_reservations ADD COLUMN ${name} ${type}`);
+        } catch (error) {
+          if (!(error instanceof Error) || !/duplicate column/i.test(error.message)) throw error;
+        }
+      }
     }
   }
 
