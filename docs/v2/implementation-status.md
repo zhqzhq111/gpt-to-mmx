@@ -771,8 +771,16 @@ Implemented:
 - Real parent→grandchild process E2E covers cancellation, timeout, and
   Verification timeout on Windows.
 
-Final Gate evidence is recorded below after typecheck, build, complete tests,
-lease-process E2E, process-supervisor E2E, and `git diff --check` complete.
+Final Gate evidence:
+
+- `npm run typecheck` → exit 0.
+- `npm run build` → exit 0.
+- `npm test` → **476 passed, 5 skipped, 0 failed** across **43 test files
+  passed and 3 skipped**.
+- `npm run test:lease-process` → **3/3** real lease process tests passed.
+- `npm run test:process-supervisor` → **3/3** real parent→grandchild process
+  tests passed.
+- `git diff --check` → exit 0.
 
 ## Remaining phases
 
