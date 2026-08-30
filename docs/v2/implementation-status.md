@@ -868,6 +868,23 @@ The six existing skips remain the real mcode/permission probes. Phase 10 does
 not add a background GC daemon, generic force deletion, broad orphan cleanup,
 or Phase 11 operational commands.
 
+## Phase 11 — Operational CLI
+
+Status: **IMPLEMENTED** on branch `codex/phase-11-operational-cli`.
+
+The operational layer exposes read-only `g2m status` and `g2m doctor`, plus
+explicit-apply `g2m repair`. Snapshot collection never calls
+`configureEngine()` or its mutating startup sequence. It reads Journal,
+filesystem manifests, lease files, reservation records, projection metadata,
+Recovery Scanner results, and GC candidate results without creating missing
+directories or repairing state merely by observing it.
+
+Repair is serialized and durably audited. The only Phase 11 actions are
+`projection-rebuild`, `gc-resume`, and `storage-reconcile`; there is no generic
+force option, `--all`, Journal rewrite, or lease reclaim action. JSON output uses
+the stable `g2m.status.v1`, `g2m.doctor.v1`, `g2m.repair-plan.v1`, and
+`g2m.repair-result.v1` schemas with snake_case fields.
+
 ## Remaining phases
 
 GC, operational CLI, runtime hardening, and CI matrices.

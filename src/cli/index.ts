@@ -351,6 +351,9 @@ async function doctorCommand(options: ReadonlyMap<string, string>): Promise<void
 }
 
 async function repairCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  for (const forbidden of ["all", "force", "delete-anyway", "ignore-journal", "ignore-recovery", "ignore-lease", "trust-sqlite", "rewrite-journal"]) {
+    if (options.has(forbidden)) throw new Error(`repair does not support --${forbidden}`);
+  }
   const config = await loadConfig(resolve(required(options, "config")));
   const action = required(options, "action");
   const executionId = options.get("execution-id");

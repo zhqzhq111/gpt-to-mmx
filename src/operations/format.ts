@@ -41,6 +41,31 @@ export function renderText(value: unknown): string {
       }
     }
   }
+  const executions = object.executions;
+  if (Array.isArray(executions)) {
+    lines.push(`Executions: ${executions.length}`);
+    const states = new Map<string, number>();
+    for (const execution of executions) {
+      if (execution !== null && typeof execution === "object" && typeof (execution as JsonObject).state === "string") {
+        const state = (execution as JsonObject).state as string;
+        states.set(state, (states.get(state) ?? 0) + 1);
+      }
+    }
+    for (const state of [...states.keys()].sort()) lines.push(`  ${state}: ${states.get(state)}`);
+  }
+  if (Array.isArray(object.workspaces)) lines.push(`Workspaces: ${object.workspaces.length}`);
+  if (object.projection !== null && typeof object.projection === "object") {
+    const projection = object.projection as JsonObject;
+    if (typeof projection.status === "string") lines.push(`Projection: ${projection.status}`);
+  }
+  if (object.recovery !== null && typeof object.recovery === "object") {
+    const recovery = object.recovery as JsonObject;
+    if (typeof recovery.openRecoveryCases === "number") lines.push(`Recovery: open cases ${recovery.openRecoveryCases}`);
+  }
+  if (object.gc !== null && typeof object.gc === "object") {
+    const gc = object.gc as JsonObject;
+    if (typeof gc.eligibleCount === "number") lines.push(`GC: eligible ${gc.eligibleCount} interrupted ${typeof gc.interruptedCount === "number" ? gc.interruptedCount : 0}`);
+  }
   for (const key of Object.keys(object).sort()) {
     if (key === "schemaVersion" || key === "status" || key === "checks") continue;
     const child = object[key];

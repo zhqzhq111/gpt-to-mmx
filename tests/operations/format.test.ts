@@ -30,4 +30,16 @@ describe("operational output formatting", () => {
     expect(output).toContain("WARN");
     expect(output).toContain("PASS projection.readable: ok");
   });
+
+  it("includes operational sections in status text", () => {
+    const output = renderText({
+      schemaVersion: "g2m.status.v1",
+      generatedAt: 10,
+      stateRoot: { stateRootExists: true },
+      executions: [{ executionId: "exec-1", state: "RUNNING" }],
+      recovery: { openRecoveryCases: 2 },
+    });
+    expect(output).toContain("Executions: 1");
+    expect(output).toContain("Recovery: open cases 2");
+  });
 });

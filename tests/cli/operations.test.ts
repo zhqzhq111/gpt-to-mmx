@@ -42,4 +42,10 @@ describe("operational CLI", () => {
     expect(output.schema_version).toBe("g2m.repair-plan.v1");
     await expect(readFile(join(f.root, "state", "repair"))).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("rejects force and all bypass options", async () => {
+    const f = await fixture();
+    await expect(main(["repair", "--config", f.config, "--action", "projection-rebuild", "--force", "true"])).rejects.toThrow(/force|allowlisted/i);
+    await expect(main(["repair", "--config", f.config, "--action", "all"])).rejects.toThrow(/allowlisted/i);
+  });
 });
