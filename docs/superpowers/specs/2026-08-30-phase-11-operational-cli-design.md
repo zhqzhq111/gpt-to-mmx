@@ -1,8 +1,8 @@
 # G2M Phase 11 Operational CLI Design
 
-**Date:** 2026-08-30  
-**Branch:** `codex/phase-11-operational-cli`  
-**Base:** `406906e8e93983bd35f5a73f4b88fd105eff4297`  
+**Date:** 2026-08-30
+**Branch:** `codex/phase-11-operational-cli`
+**Base:** `406906e8e93983bd35f5a73f4b88fd105eff4297`
 **Scope:** Phase 11 only; Phase 12 is explicitly out of scope.
 
 ## Goal
@@ -168,4 +168,3 @@ Tests are added before implementation for:
 The Phase 10 baseline must remain green, and final verification includes
 typecheck, build, the full test suite, relevant process suites, and
 `git diff --check`.
-
