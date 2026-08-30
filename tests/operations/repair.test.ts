@@ -56,4 +56,22 @@ describe("operational repair", () => {
     expect(result.status).toBe("REFUSED");
     expect(result.reasons).toContain("REPAIR_PLAN_STALE");
   });
+
+  it("does not stale a projection plan because volatile volume facts changed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-repair-")); roots.push(root);
+    const snapshots: OperationalSnapshot[] = [];
+    const base = (free: number): OperationalSnapshot => ({
+      schemaVersion: "g2m.status.v1", generatedAt: 10, stateRoot: { stateRootExists: true, executionsDirectoryExists: true, locksDirectoryExists: true, reservationsDirectoryExists: true, tombstonesDirectoryExists: true, projectionDatabaseExists: true },
+      executions: [], workspaces: [], projection: { status: "OK", databaseExists: true, databaseReadable: true, schemaVersion: 1, rebuildStatus: "complete", rebuildAt: 1, staleExecutionCount: 0, projectionStaleEventCount: 0 },
+      storage: { managedArtifactBytes: 0, managedWorktreeBytes: 0, managedTotalBytes: 0, activeReservedBytes: 0, maxTotalBytes: 0, maxArtifactBytes: 0, maxWorktreeBytes: 0, volumes: [{ volumeId: "v1", physicalFreeBytes: free, activeReservedBytes: 0, effectiveAvailableBytes: free, policyAvailableBytes: free, minFreeBytes: 0, safetyMarginBytes: 0 }] },
+      recovery: { openRecoveryCases: 0, executionsRequiringRecovery: [], issuesByKind: {}, safeHoldCount: 0, reportOnlyCount: 0 },
+      gc: { eligibleCount: 0, estimatedReclaimBytes: 0, interruptedCount: 0, cleanupPendingCount: 0, tombstoneCount: 0, invalidTombstoneCount: 0 },
+    });
+    snapshots.push(base(100), base(99));
+    const result = await executeRepair({ config: config(root), action: "projection-rebuild", apply: true, nowMs: 10 }, {
+      buildSnapshot: async () => snapshots.shift()!,
+      dispatch: async () => "dispatched",
+    });
+    expect(result.status).toBe("APPLIED");
+  });
 });

@@ -68,7 +68,26 @@ function preconditionHash(snapshot: OperationalSnapshot): string {
   // Acquiring the repair lock creates the control-plane directory itself. It
   // must not make an otherwise identical data snapshot stale, especially when
   // this is the first repair against a previously absent state root.
-  return sha256({ ...snapshot, generatedAt: 0, stateRoot: { ...snapshot.stateRoot, stateRootExists: true } });
+  const stableWorkspaces = snapshot.workspaces.map((workspace) => ({
+    workspaceId: workspace.workspaceId,
+    canonicalPath: workspace.canonicalPath,
+    canonicalPathExists: workspace.canonicalPathExists,
+    lease: {
+      status: workspace.lease.status,
+      executionId: workspace.lease.executionId,
+      leaseId: workspace.lease.leaseId,
+      hostname: workspace.lease.hostname,
+      pid: workspace.lease.pid,
+    },
+  }));
+  // Physical free-space readings and heartbeat ages are intentionally
+  // volatile. The action-specific persistent records below remain in the
+  // execution/recovery/GC portions of the snapshot and are revalidated after
+  // the lock is held.
+  const { storage: _volatileStorage, workspaces: _volatileWorkspaces, ...stable } = snapshot;
+  void _volatileStorage;
+  void _volatileWorkspaces;
+  return sha256({ ...stable, generatedAt: 0, stateRoot: { ...snapshot.stateRoot, stateRootExists: true }, workspaces: stableWorkspaces });
 }
 
 export async function planRepair(options: RepairOptions, dependencies: RepairDependencies = {}): Promise<RepairPlan> {
