@@ -10,12 +10,18 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { runVerification } from "../../src/evidence/verification.js";
+import { ProcessSupervisor } from "../../src/process/supervisor.js";
+import type { PlatformProcessController } from "../../src/process/platform.js";
 import { sha256 } from "../../src/protocol/hash.js";
 import type { VerificationProfile } from "../../src/policy/verification.js";
+
+const execFileAsync = promisify(execFile);
 
 describe("runVerification", () => {
   let tempDir: string;
@@ -108,7 +114,40 @@ describe("runVerification", () => {
     expect(r.status).toBe("timed_out");
     expect(r.exitCode).toBeNull();
     expect(r.errorMessage).toMatch(/500ms/);
+    expect(r.termination).toMatchObject({ confirmedGone: true });
   });
+
+  it("returns 'termination_unconfirmed' when the process tree cannot be proven gone", async () => {
+    const controller: PlatformProcessController = {
+      strategy: "windows_taskkill",
+      isAlive: () => "alive",
+      terminate: async (pid) => {
+        try {
+          await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true });
+        } catch { /* cleanup is best effort */ }
+        return {
+          confirmedGone: false,
+          gracefulAttempted: true,
+          forcedAttempted: true,
+          strategy: "windows_taskkill",
+          error: "test probe refused confirmation",
+        };
+      },
+    };
+    const r = await runVerification(
+      makeProfile({
+        id: "unknown-termination",
+        args: ["-e", "setInterval(() => {}, 10000)"],
+        timeoutMs: 50,
+      }),
+      "ws-unknown-termination",
+      tempDir,
+      { processSupervisor: new ProcessSupervisor({ platformController: controller }) },
+    );
+
+    expect(r.status).toBe("termination_unconfirmed");
+    expect(r.termination).toMatchObject({ confirmedGone: false });
+  }, 10_000);
 
   it("returns 'spawn_error' when program does not exist (ENOENT)", async () => {
     const missing = `g2m-nonexistent-${Date.now()}-${Math.random().toString(36).slice(2)}`;

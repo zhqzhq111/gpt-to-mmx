@@ -20,6 +20,7 @@ import {
   recordWorkspaceEvidence,
 } from "../evidence/store.js";
 import { runVerification } from "../evidence/verification.js";
+import type { ProcessSupervisor } from "../process/supervisor.js";
 import { writeImmutableArtifact } from "../persistence/artifact-writer.js";
 import type { ExecutionProjection } from "../projection/execution-projector.js";
 import { ProfileRegistry, resolveProfile } from "../policy/verification.js";
@@ -72,6 +73,7 @@ export interface G2MExecutionEngineOptions {
   readonly fingerprintRegistry: FingerprintRegistry;
   readonly replayGuard: ReplayGuard;
   readonly worker: CodingWorkerAdapter;
+  readonly processSupervisor?: ProcessSupervisor;
   readonly workerRuntime: WorkerRuntimeInfo;
   readonly adapterContractVersion: string;
   readonly worktreeRoot: string;
@@ -543,6 +545,9 @@ export class G2MExecutionEngine {
         profile,
         task.workspace_scope.workspace_id,
         worktree.worktreePath,
+        ...(this.options.processSupervisor !== undefined
+          ? [{ processSupervisor: this.options.processSupervisor }]
+          : []),
       );
       recordVerificationEvidence(
         this.options.evidenceStore,
@@ -550,6 +555,27 @@ export class G2MExecutionEngine {
         executionId,
         verification,
       );
+
+      if (verification.status === "termination_unconfirmed") {
+        this.appendAndReduce(mutable, {
+          taskId: task.task_id,
+          executionId,
+          type: "recovery.required",
+          payload: {
+            reason: verification.errorMessage ?? "verification termination could not be confirmed",
+            verificationStatus: verification.status,
+            resultHash: verification.resultHash,
+          },
+          fingerprint,
+        });
+        preserveWorktree = true;
+        throw new G2MExecutionEngineError(
+          "RECOVERY_REQUIRED",
+          "verification process termination is unknown; isolated evidence was preserved",
+          undefined,
+          { state: "RECOVERY_REQUIRED", worktree },
+        );
+      }
 
       const executionArtifactRoot = resolve(this.options.artifactRoot, executionId);
       const patch = await collectWorktreePatch(worktree, executionArtifactRoot);

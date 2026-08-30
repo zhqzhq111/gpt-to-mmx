@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { execFile as execFileProcess } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -16,6 +17,8 @@ import { ProfileRegistry } from "../../src/policy/verification.js";
 import type { ExecutionProjection } from "../../src/projection/execution-projector.js";
 import { buildReview } from "../../src/review/ingress.js";
 import { ReplayGuard } from "../../src/review/replay-guard.js";
+import { ProcessSupervisor } from "../../src/process/supervisor.js";
+import type { PlatformProcessController } from "../../src/process/platform.js";
 import type { CodeTaskV1 } from "../../src/protocol/code-task.v1.schema.js";
 import type {
   CodingWorkerAdapter,
@@ -176,6 +179,7 @@ describe("G2MExecutionEngine", () => {
   function engine(
     worker: CodingWorkerAdapter = new EditingWorker(),
     projection?: ExecutionProjection,
+    processSupervisor?: ProcessSupervisor,
   ): G2MExecutionEngine {
     return new G2MExecutionEngine({
       workspaceRegistry,
@@ -187,6 +191,7 @@ describe("G2MExecutionEngine", () => {
       fingerprintRegistry,
       replayGuard,
       worker,
+      ...(processSupervisor !== undefined ? { processSupervisor } : {}),
       workerRuntime: { runtime: "fake", version: "editing-worker-1", model: "fake" },
       adapterContractVersion: "g2m-worker-v1",
       worktreeRoot,
@@ -468,4 +473,58 @@ describe("G2MExecutionEngine", () => {
     expect(workspaceLock.isHeld("demo")).toBe(true);
     expect(eventStore.getByTaskId(task.task_id).at(-1)?.type).toBe("recovery.required");
   });
+
+  it("safe-holds when verification termination is unconfirmed and skips patch collection", async () => {
+    profileRegistry.register({
+      id: "unconfirmed_tests",
+      workspaceId: "demo",
+      description: "verification process cannot be confirmed gone",
+      program: process.execPath,
+      args: ["-e", "setInterval(() => {}, 10000)"],
+      timeoutMs: 50,
+      registeredAt: 0,
+    });
+    const controller: PlatformProcessController = {
+      strategy: "windows_taskkill",
+      isAlive: () => "alive",
+      terminate: async (pid) => {
+        try {
+          await promisify(execFileProcess)("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true });
+        } catch { /* cleanup is best effort */ }
+        return {
+          confirmedGone: false,
+          gracefulAttempted: true,
+          forcedAttempted: true,
+          strategy: "windows_taskkill",
+          error: "test probe refused confirmation",
+        };
+      },
+    };
+    const unsafeVerificationTask = {
+      ...task,
+      task_id: "task-verification-unknown",
+      verification_profile: "unconfirmed_tests",
+    } satisfies CodeTaskV1;
+    const runner = engine(
+      new EditingWorker(),
+      undefined,
+      new ProcessSupervisor({ platformController: controller }),
+    );
+
+    let caught: unknown;
+    try {
+      await runner.execute(unsafeVerificationTask);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const recovery = (caught as G2MExecutionEngineError).recovery;
+    await expect(stat(recovery?.worktree.worktreePath ?? "")).resolves.toBeTruthy();
+    expect(workspaceLock.isHeld("demo")).toBe(true);
+    const events = eventStore.getByTaskId(unsafeVerificationTask.task_id).map((event) => event.type);
+    expect(events).toContain("recovery.required");
+    expect(events).not.toContain("patch.frozen");
+    expect(events).not.toContain("evidence.diff.collected");
+  }, 10_000);
 });
