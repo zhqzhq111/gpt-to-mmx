@@ -894,4 +894,5 @@ managed-storage maximums rather than a clamped derived value.
 
 ## Remaining phases
 
-GC, operational CLI, runtime hardening, and CI matrices.
+- Phase 12 — Runtime Hardening
+- Phase 13 — CI / Regression
