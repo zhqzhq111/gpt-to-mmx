@@ -408,6 +408,12 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
           try {
             const tombstone = readTombstoneSync(join(tombstonesRoot, name));
             if (tombstone === undefined || tombstone.executionId !== executionId) throw new Error("tombstone filename binding");
+            const execution = executions.get(executionId);
+            if (execution !== undefined) {
+              if (execution.kind !== "ok") throw new Error("tombstone execution Journal is invalid");
+              const completed = execution.events.find((event) => event.type === "gc.completed");
+              if (completed?.payload["tombstone_hash"] !== tombstone.selfHash) throw new Error("tombstone has no matching gc.completed");
+            }
             projector.projectTombstone(tombstone);
           } catch (error) {
             invalidTombstones += 1;

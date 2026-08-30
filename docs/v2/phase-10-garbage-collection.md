@@ -1,6 +1,6 @@
 # Phase 10 — Garbage Collection and Crash-safe Retention Cleanup
 
-Status: implementation in progress from the sealed Phase 9 storage baseline.
+Status: **COMPLETE / SEALED** on branch `codex/phase-10-garbage-collection`.
 
 ## Authority
 
@@ -38,8 +38,9 @@ acquire optional WorkspaceLock maintenance lease
 append durable CRITICAL gc.marked
 remove repository-bound worktree and prune Git metadata
 remove the validated execution artifact directory
-write and verify a durable self-hashed tombstone
-append durable CRITICAL gc.completed bound to that tombstone
+prepare the self-hashed tombstone in memory
+append durable CRITICAL gc.completed bound to the prepared tombstone hash
+write and verify that exact prepared tombstone
 close this execution's Journal writer
 remove the execution state directory
 remove only released/expired/abandoned reservation records
@@ -49,9 +50,12 @@ release maintenance and GC locks
 
 The execution Journal remains present until `gc.completed` is durable. A
 failure after `gc.marked` never rolls back the mark; it is resumed later as
-`GC_INTERRUPTED`. A valid tombstone plus `gc.completed` makes state-directory
-cleanup idempotent and is reported as `GC_CLEANUP_PENDING` if cleanup is
-temporarily unavailable.
+`GC_INTERRUPTED`. A final on-disk Tombstone is written only after its matching
+`gc.completed` is durable. If the process crashes after `gc.completed` but
+before the Tombstone write, recovery reconstructs the exact bytes and verifies
+the event hash before writing it. A valid Tombstone plus matching
+`gc.completed` makes state-directory cleanup idempotent and is reported as
+`GC_CLEANUP_PENDING` if cleanup is temporarily unavailable.
 
 ## Tombstones
 
@@ -75,10 +79,13 @@ operation suppresses ordinary missing-artifact corruption reports for the
 targets it authorized, but any lifecycle/recovery event after the mark stops
 automatic continuation.
 
-Projection rebuilds accept valid tombstones as minimal historical GC records;
-they do not fabricate artifact, review, or recovery rows. Invalid tombstones
-are rejected and remain operator-visible. Only tombstone-bound leftovers are
-eligible for `SAFE_ORPHAN` cleanup; unknown orphan directories are report-only.
+Projection rebuilds accept valid tombstones as minimal historical GC records
+only when the execution Journal is absent or contains matching durable
+`gc.completed`. A Tombstone beside a Journal with only `gc.marked` is reported
+as interrupted and cannot clear or fabricate projection facts. Invalid
+tombstones are rejected and remain operator-visible. Only tombstone-bound
+leftovers are eligible for `SAFE_ORPHAN` cleanup; when an execution state
+directory still exists, matching `gc.completed` is additionally required.
 
 ## CLI boundary
 

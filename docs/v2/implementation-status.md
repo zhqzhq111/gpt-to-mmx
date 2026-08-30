@@ -826,7 +826,8 @@ Phase 9 does not perform historical GC; deletion remains a Phase 10 concern.
 
 ## Phase 10 — Garbage Collection and Crash-safe Retention Cleanup
 
-Status: **COMPLETE / IMPLEMENTED** on branch `codex/phase-10-garbage-collection`.
+Status: **COMPLETE / IMPLEMENTED** on branch `codex/phase-10-garbage-collection`;
+Phase 10.1 seal fix included.
 
 Implemented:
 
@@ -840,11 +841,13 @@ Implemented:
 - cross-process `state_root/gc/gc.lock` ownership with metadata, heartbeat,
   same-host dead-PID stale reclaim, and foreign/unknown/live refusal;
 - sequential Crash-safe executor ordering: `gc.marked`, repository-bound
-  worktree removal, artifact removal, Tombstone, `gc.completed`, writer close,
-  state cleanup, and projection cleanup;
-- idempotent interrupted-GC resume for mark-only, half-deleted, pre-completed
-  Tombstone, and completed-with-leftover-state windows, plus deterministic
-  fault injection hooks used only by tests;
+  worktree removal, artifact removal, in-memory Tombstone preparation,
+  `gc.completed` durable hash commit, exact Tombstone write, writer close, state
+  cleanup, and projection cleanup;
+- idempotent interrupted-GC resume for mark-only, half-deleted,
+  completed-before-Tombstone, pre-completed Tombstone, and
+  completed-with-leftover-state windows, plus deterministic fault injection
+  hooks used only by tests;
 - Recovery Scanner classification and missing-artifact suppression for marked
   operations; projection rebuild from valid Tombstones with no fabricated
   artifact/review/recovery rows and invalid-Tombstone rejection;
@@ -857,7 +860,7 @@ Final verification:
 
 - `npm run typecheck` → pass;
 - `npm run build` → pass;
-- `npm test` → **540 passed, 6 skipped, 0 failed** at the Phase 10 mid gate;
+- `npm test` → **544 passed, 6 skipped, 0 failed** at the Phase 10.1 seal gate;
 - `npm run test:gc-process` → **1/1** real process suite passed;
 - `git diff --check` → pass.
 

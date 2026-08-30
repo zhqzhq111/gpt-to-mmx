@@ -72,6 +72,16 @@ export function computeTombstoneHash(input: TombstoneInput): string {
   return createHash("sha256").update(canonicalize(diskInput(input)), "utf8").digest("hex");
 }
 
+export function prepareTombstone(input: TombstoneInput): Tombstone {
+  if (input.executionId.length === 0 || input.executionId.includes("/") || input.executionId.includes("\\")) {
+    throw new TombstoneError("TOMBSTONE_INVALID", "tombstone execution id is not a safe path component");
+  }
+  if (!isTerminal(input.finalState) || !["NORMAL", "RETAINED", "RECOVERY_CRITICAL"].includes(input.retentionClass)) {
+    throw new TombstoneError("TOMBSTONE_INVALID", "tombstone state or retention class is invalid");
+  }
+  return Object.freeze({ ...input, schemaVersion: 1, selfHash: computeTombstoneHash(input) });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -132,10 +142,6 @@ function parseTombstone(raw: unknown): Tombstone {
   return Object.freeze({ ...input, schemaVersion: 1, selfHash: raw.self_hash as string });
 }
 
-function diskTombstone(input: TombstoneInput): JsonObject {
-  return { ...diskInput(input), self_hash: computeTombstoneHash(input) };
-}
-
 export async function readTombstone(path: string): Promise<Tombstone | undefined> {
   try {
     return parseTombstone(JSON.parse(await readFile(path, "utf8")) as unknown);
@@ -157,14 +163,18 @@ export function readTombstoneSync(path: string): Tombstone | undefined {
 }
 
 export async function writeTombstone(path: string, input: TombstoneInput): Promise<Tombstone> {
+  return writePreparedTombstone(path, prepareTombstone(input));
+}
+
+export async function writePreparedTombstone(path: string, prepared: Tombstone): Promise<Tombstone> {
   const existing = await readTombstone(path);
   if (existing !== undefined) {
-    if (existing.selfHash !== computeTombstoneHash(input)) {
+    if (existing.selfHash !== prepared.selfHash) {
       throw new TombstoneError("TOMBSTONE_INVALID", `existing tombstone conflicts with requested content: ${path}`);
     }
     return existing;
   }
-  const bytes = Buffer.from(`${JSON.stringify(diskTombstone(input), null, 2)}\n`, "utf8");
+  const bytes = Buffer.from(`${JSON.stringify({ ...diskInput(prepared), self_hash: prepared.selfHash }, null, 2)}\n`, "utf8");
   try {
     await writeImmutableArtifact(path, bytes);
   } catch (error) {
@@ -176,6 +186,7 @@ export async function writeTombstone(path: string, input: TombstoneInput): Promi
   }
   const written = await readTombstone(path);
   if (written === undefined) throw new TombstoneError("TOMBSTONE_IO", `tombstone disappeared after write: ${path}`);
+  if (written.selfHash !== prepared.selfHash) throw new TombstoneError("TOMBSTONE_INVALID", `tombstone hash changed after write: ${path}`);
   return written;
 }
 

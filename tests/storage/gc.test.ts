@@ -10,7 +10,7 @@ import { StateDatabase } from "../../src/projection/database.js";
 import { ExecutionProjector } from "../../src/projection/execution-projector.js";
 import { writeStorageManifestAtomic } from "../../src/storage/usage.js";
 import { cleanupSafeOrphans, executeGc, GcFaultError, resumeInterrupted, type GcExecutorOptions } from "../../src/storage/gc.js";
-import { readTombstone } from "../../src/storage/tombstone.js";
+import { readTombstone, writeTombstone } from "../../src/storage/tombstone.js";
 
 const roots: string[] = [];
 const stores: EventStore[] = [];
@@ -101,6 +101,16 @@ describe("GC executor", () => {
     expect(existsSync(f.artifactPath)).toBe(true);
   });
 
+  it("does not leave a final Tombstone when crashing after preparation before gc.completed", async () => {
+    const f = await fixture();
+    const report = await executeGc({ ...f.options, fault: async (point) => { if (point === "after_tombstone_prepared") throw new GcFaultError(point); } });
+
+    expect(report.failures[0]?.reason).toContain("after_tombstone_prepared");
+    expect(await readTombstone(join(f.stateRoot, "tombstones", f.executionId + ".json"))).toBeUndefined();
+    expect(f.options.eventStore.getByAttemptId(f.executionId).at(-1)?.type).toBe("gc.marked");
+    expect(existsSync(join(f.stateRoot, "executions", f.executionId))).toBe(true);
+  });
+
   it("resumes a marked operation idempotently after the process is restarted", async () => {
     const f = await fixture();
     await executeGc({ ...f.options, fault: async (point) => { if (point === "after_gc_marked") throw new GcFaultError(point); } });
@@ -117,6 +127,7 @@ describe("GC executor", () => {
     const f = await fixture();
     await executeGc({ ...f.options, fault: async (point) => { if (point === "after_gc_completed") throw new GcFaultError(point); } });
     expect(existsSync(join(f.stateRoot, "executions", f.executionId))).toBe(true);
+    expect(await readTombstone(join(f.stateRoot, "tombstones", f.executionId + ".json"))).toBeUndefined();
 
     const result = await resumeInterrupted(f.options);
 
@@ -127,7 +138,7 @@ describe("GC executor", () => {
 
   it("cleans only leftovers bound by a valid tombstone", async () => {
     const f = await fixture();
-    await executeGc({ ...f.options, fault: async (point) => { if (point === "after_gc_completed") throw new GcFaultError(point); } });
+    await executeGc(f.options);
     await mkdir(f.artifactPath, { recursive: true });
     await writeFile(join(f.artifactPath, "orphan"), "bound", "utf8");
     const unknown = join(f.options.artifactRoot, "unknown-orphan");
@@ -137,5 +148,31 @@ describe("GC executor", () => {
     expect(result.removed).toBeGreaterThanOrEqual(1);
     expect(existsSync(f.artifactPath)).toBe(false);
     expect(existsSync(unknown)).toBe(true);
+  });
+
+  it("does not let an old pre-completed Tombstone delete a live state directory", async () => {
+    const f = await fixture();
+    await executeGc({ ...f.options, fault: async (point) => { if (point === "after_gc_marked") throw new GcFaultError(point); } });
+    const marked = f.options.eventStore.getByAttemptId(f.executionId).at(-1)!;
+    await writeTombstone(join(f.stateRoot, "tombstones", f.executionId + ".json"), {
+      executionId: f.executionId,
+      taskId: marked.taskId,
+      workspaceId: null,
+      finalState: "FAILED",
+      createdAt: 100,
+      terminalAt: 120,
+      retentionClass: "NORMAL",
+      gcMarkedEventId: marked.eventId,
+      gcMarkedEventHash: marked.hash,
+      gcCompletedAt: f.options.nowMs,
+      artifactBytesBeforeGc: 7,
+      worktreeBytesBeforeGc: 0,
+    });
+
+    const result = await cleanupSafeOrphans(f.options);
+
+    expect(result.skipped).toBeGreaterThan(0);
+    expect(existsSync(join(f.stateRoot, "executions", f.executionId))).toBe(true);
+    expect(existsSync(f.artifactPath)).toBe(true);
   });
 });

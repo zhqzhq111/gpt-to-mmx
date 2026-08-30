@@ -12,7 +12,7 @@ import { FingerprintRegistry } from "../execution/fingerprint.js";
 import { isTerminal } from "../execution/state-machine.js";
 import { acquireGcRunLock, type GcRunLockHandle } from "./gc-lock.js";
 import { planGcCandidates, type GcCandidate, type GcPlannerOptions } from "./gc-candidate.js";
-import { assertDirectChild, assertDirectExecutionChild, assertSafeDeletionTarget, readTombstone, writeTombstone } from "./tombstone.js";
+import { assertDirectChild, assertDirectExecutionChild, assertSafeDeletionTarget, prepareTombstone, readTombstone, writePreparedTombstone } from "./tombstone.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,6 +20,7 @@ export type GcFaultPoint =
   | "after_gc_marked"
   | "after_worktree_removed"
   | "after_artifacts_removed"
+  | "after_tombstone_prepared"
   | "after_tombstone_written"
   | "after_gc_completed"
   | "before_execution_dir_removed";
@@ -161,7 +162,7 @@ async function executeOne(options: GcExecutorOptions, candidate: GcCandidate, ru
     }
     await inject(options, "after_artifacts_removed");
     const completedAt = options.nowMs;
-    const tombstone = await writeTombstone(join(options.stateRoot, "tombstones", fresh.executionId + ".json"), {
+    const preparedTombstone = prepareTombstone({
       executionId: fresh.executionId,
       taskId: fresh.taskId,
       workspaceId: fresh.workspaceId,
@@ -175,14 +176,16 @@ async function executeOne(options: GcExecutorOptions, candidate: GcCandidate, ru
       artifactBytesBeforeGc: fresh.artifactBytes,
       worktreeBytesBeforeGc: fresh.worktreeBytes,
     });
-    await inject(options, "after_tombstone_written");
+    await inject(options, "after_tombstone_prepared");
     options.eventStore.append({
       taskId: fresh.taskId,
       attemptId: fresh.executionId,
       type: "gc.completed",
-      payload: { gc_run_id: runLock.runId, tombstone_hash: tombstone.selfHash, gc_completed_at: completedAt },
+      payload: { gc_run_id: runLock.runId, tombstone_hash: preparedTombstone.selfHash, gc_completed_at: completedAt },
     });
     await inject(options, "after_gc_completed");
+    await writePreparedTombstone(join(options.stateRoot, "tombstones", fresh.executionId + ".json"), preparedTombstone);
+    await inject(options, "after_tombstone_written");
     options.eventStore.closeExecution(fresh.executionId);
     await inject(options, "before_execution_dir_removed");
     try {
@@ -296,8 +299,25 @@ async function resumeOne(options: GcExecutorOptions, executionId: string, runLoc
   if (existsSync(candidate.artifactPath)) await assertSafeDeletionTarget(candidate.artifactPath);
   const tombstonePath = join(options.stateRoot, "tombstones", executionId + ".json");
   if (completed !== undefined) {
+    const completedAt = payloadNumber(completed.payload["gc_completed_at"]);
+    const preparedTombstone = prepareTombstone({
+      executionId,
+      taskId: candidate.taskId,
+      workspaceId: candidate.workspaceId,
+      finalState: candidate.finalState,
+      createdAt: events.find((event) => event.type === "task.created")?.timestampMs ?? marked.timestampMs,
+      terminalAt: candidate.terminalAt ?? marked.timestampMs,
+      retentionClass: candidate.retentionClass,
+      gcMarkedEventId: marked.eventId,
+      gcMarkedEventHash: marked.hash,
+      gcCompletedAt: completedAt ?? options.nowMs,
+      artifactBytesBeforeGc: candidate.artifactBytes,
+      worktreeBytesBeforeGc: candidate.worktreeBytes,
+    });
+    if (completed.payload["tombstone_hash"] !== preparedTombstone.selfHash) throw new GcExecutionError("GC_TOMBSTONE_INVALID", "gc.completed tombstone hash does not match deterministic reconstruction");
     const tombstone = await readTombstone(tombstonePath);
-    if (tombstone === undefined || completed.payload["tombstone_hash"] !== tombstone.selfHash) throw new GcExecutionError("GC_TOMBSTONE_INVALID", "gc.completed is not bound to a valid tombstone");
+    if (tombstone === undefined) await writePreparedTombstone(tombstonePath, preparedTombstone);
+    else if (tombstone.selfHash !== preparedTombstone.selfHash) throw new GcExecutionError("GC_TOMBSTONE_INVALID", "existing tombstone does not match gc.completed");
     await finalizeStateDirectory(options, executionId);
     return;
   }
@@ -306,7 +326,13 @@ async function resumeOne(options: GcExecutorOptions, executionId: string, runLoc
     await (options.removeWorktree ?? ((entry) => defaultRemoveWorktree(options, entry)))(candidate);
     await (options.removeArtifact ?? defaultRemoveArtifact)(candidate.artifactPath);
     const existing = await readTombstone(tombstonePath);
-    const tombstone = existing ?? await writeTombstone(tombstonePath, {
+    if (existing !== undefined) {
+      if (existing.gcMarkedEventId !== marked.eventId || existing.gcMarkedEventHash !== marked.hash) throw new GcExecutionError("GC_TOMBSTONE_INVALID", "pre-completed tombstone is not bound to gc.marked");
+      // This is a legacy Phase 10 tombstone written before gc.completed. It
+      // cannot remain as completion authority under the fixed protocol.
+      await rm(tombstonePath, { force: false });
+    }
+    const preparedTombstone = prepareTombstone({
       executionId,
       taskId: candidate.taskId,
       workspaceId: candidate.workspaceId,
@@ -320,7 +346,9 @@ async function resumeOne(options: GcExecutorOptions, executionId: string, runLoc
       artifactBytesBeforeGc: candidate.artifactBytes,
       worktreeBytesBeforeGc: candidate.worktreeBytes,
     });
-    options.eventStore.append({ taskId: candidate.taskId, attemptId: executionId, type: "gc.completed", payload: { gc_run_id: String(marked.payload["gc_run_id"] ?? runLock.runId), tombstone_hash: tombstone.selfHash, gc_completed_at: tombstone.gcCompletedAt } });
+    await inject(options, "after_tombstone_prepared");
+    options.eventStore.append({ taskId: candidate.taskId, attemptId: executionId, type: "gc.completed", payload: { gc_run_id: String(marked.payload["gc_run_id"] ?? runLock.runId), tombstone_hash: preparedTombstone.selfHash, gc_completed_at: preparedTombstone.gcCompletedAt } });
+    await writePreparedTombstone(tombstonePath, preparedTombstone);
     await finalizeStateDirectory(options, executionId);
   } finally {
     await leased.release().catch(() => undefined);
@@ -350,32 +378,38 @@ export async function cleanupSafeOrphans(options: GcExecutorOptions): Promise<Sa
     return { scanned: 0, removed: 0, invalid: 0, skipped: 0 };
   }
   let invalid = 0;
-  const validIds: string[] = [];
+  const validTombstones = new Map<string, NonNullable<Awaited<ReturnType<typeof readTombstone>>>>();
   for (const name of names) {
     try {
       const tombstone = await readTombstone(join(options.stateRoot, "tombstones", name));
       if (tombstone === undefined || name !== tombstone.executionId + ".json") throw new Error("tombstone binding");
       assertDirectExecutionChild(options.artifactRoot, resolve(options.artifactRoot, tombstone.executionId), tombstone.executionId);
-      validIds.push(tombstone.executionId);
+      validTombstones.set(tombstone.executionId, tombstone);
     } catch {
       invalid += 1;
     }
   }
-  if (validIds.length === 0) return { scanned: names.length, removed: 0, invalid, skipped: 0 };
+  if (validTombstones.size === 0) return { scanned: names.length, removed: 0, invalid, skipped: 0 };
   const lock = await acquireGcRunLock({ stateRoot: options.stateRoot });
   let removed = 0;
   let skipped = 0;
   try {
-    for (const executionId of validIds) {
+    for (const [executionId, tombstone] of validTombstones) {
       const artifactPath = resolve(options.artifactRoot, executionId);
       assertDirectExecutionChild(options.artifactRoot, artifactPath, executionId);
+      const statePath = join(options.stateRoot, "executions", executionId);
+      const stateExists = existsSync(statePath);
+      const completed = options.eventStore.getByAttemptId(executionId).find((event) => event.type === "gc.completed" && event.payload["tombstone_hash"] === tombstone.selfHash);
+      if (stateExists && completed === undefined) {
+        skipped += 1;
+        continue;
+      }
       try {
         if ((await assertSafeDeletionTarget(artifactPath)) === "DIRECTORY") {
           await rm(artifactPath, { recursive: true, force: false });
           removed += 1;
         }
       } catch { skipped += 1; }
-      const statePath = join(options.stateRoot, "executions", executionId);
       if (existsSync(statePath)) {
         try {
           options.eventStore.closeExecution(executionId);

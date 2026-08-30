@@ -109,6 +109,44 @@ describe("rebuildProjection", () => {
     rebuilt.close();
   });
 
+  it("does not treat a valid-looking Tombstone as completed when the Journal has no gc.completed", async () => {
+    const root = await stateRoot();
+    const store = new EventStore({ executionDirectory: join(root, "executions") });
+    const created = store.append({ taskId: "pre-completed-task", attemptId: "pre-completed", type: "task.created", timestampMs: 1, payload: {} });
+    store.append({ taskId: "pre-completed-task", attemptId: "pre-completed", type: "task.validation.started", timestampMs: 2, payload: {} });
+    store.append({ taskId: "pre-completed-task", attemptId: "pre-completed", type: "task.validation.failed", timestampMs: 3, payload: {} });
+    const marked = store.append({ taskId: "pre-completed-task", attemptId: "pre-completed", type: "gc.marked", timestampMs: 4, payload: {
+      gc_run_id: "run-1", final_state: "FAILED", retention_class: "NORMAL", gc_eligible_at: 5,
+      manifest_generation: 1, manifest_hash: "h".repeat(64), artifact_bytes: 0, worktree_bytes: 0,
+      artifact_target: "pre-completed", worktree_target: null,
+    } });
+    store.close();
+    await mkdir(join(root, "tombstones"), { recursive: true });
+    await writeTombstone(join(root, "tombstones", "pre-completed.json"), {
+      executionId: "pre-completed",
+      taskId: created.taskId,
+      workspaceId: null,
+      finalState: "FAILED",
+      createdAt: 1,
+      terminalAt: 3,
+      retentionClass: "NORMAL",
+      gcMarkedEventId: marked.eventId,
+      gcMarkedEventHash: marked.hash,
+      gcCompletedAt: 5,
+      artifactBytesBeforeGc: 0,
+      worktreeBytesBeforeGc: 0,
+    });
+
+    const report = await rebuildProjection({ stateRoot: root, workspaces: [], nowMs: 10 });
+    const rebuilt = new StateDatabase(join(root, "g2m-state.sqlite"));
+    const row = rebuilt.prepare("SELECT state, gc_eligible_at FROM executions WHERE execution_id = ?").get("pre-completed") as { state: string; gc_eligible_at: number | null };
+    expect(report.invalidTombstones).toBe(1);
+    expect(row.state).toBe("FAILED");
+    expect(row.gc_eligible_at).not.toBeNull();
+    expect(rebuilt.getMeta("tombstone:pre-completed:stale")).toContain("gc.completed");
+    rebuilt.close();
+  });
+
   it("replaces a disposable SQLite index from Journals and trusted workspace config", async () => {
     const root = await stateRoot();
     const executions = join(root, "executions");
