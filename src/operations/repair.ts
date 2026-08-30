@@ -1,0 +1,145 @@
+import { randomUUID } from "node:crypto";
+import { join, resolve } from "node:path";
+
+import type { G2MLocalConfig } from "../cli/config.js";
+import { EventStore } from "../events/store.js";
+import { rebuildProjection } from "../projection/rebuild.js";
+import { StateDatabase } from "../projection/database.js";
+import { reconcileStorageReservations } from "../storage/reservation.js";
+import { resumeInterrupted } from "../storage/gc.js";
+import { WorkspaceLock } from "../workspace/lock.js";
+import { buildOperationalSnapshot, type OperationalOptions } from "./snapshot.js";
+import { acquireRepairLock } from "./repair-lock.js";
+import { writeRepairAudit } from "./repair-audit.js";
+
+export type RepairAction = "projection-rebuild" | "gc-resume" | "storage-reconcile";
+
+export class RepairActionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RepairActionError";
+  }
+}
+
+export interface RepairOptions extends OperationalOptions {
+  readonly action: string;
+  readonly apply: boolean;
+  readonly operationId?: string;
+}
+
+export interface RepairPlan {
+  readonly schemaVersion: "g2m.repair-plan.v1";
+  readonly operationId: string;
+  readonly generatedAt: number;
+  readonly action: string;
+  readonly executionId: string | null;
+  readonly applyRequired: true;
+  readonly permitted: boolean;
+  readonly reasons: readonly string[];
+  readonly target: string;
+}
+
+export interface RepairResult {
+  readonly schemaVersion: "g2m.repair-result.v1";
+  readonly operationId: string;
+  readonly generatedAt: number;
+  readonly action: string;
+  readonly executionId: string | null;
+  readonly status: "APPLIED" | "REFUSED" | "FAILED";
+  readonly result: unknown;
+  readonly reasons: readonly string[];
+}
+
+const allowlist = new Set<string>(["projection-rebuild", "gc-resume", "storage-reconcile"]);
+const forbidden = new Set<string>(["all", "force", "delete-anyway", "ignore-journal", "ignore-recovery", "ignore-lease", "trust-sqlite", "rewrite-journal"]);
+
+function stateRoot(config: G2MLocalConfig): string {
+  return config.state_root ?? resolve(config.artifact_root, "state");
+}
+
+export async function planRepair(options: RepairOptions): Promise<RepairPlan> {
+  if (forbidden.has(options.action) || !allowlist.has(options.action)) {
+    throw new RepairActionError(`repair action is not allowlisted: ${options.action}`);
+  }
+  const snapshot = await buildOperationalSnapshot(options);
+  const reasons: string[] = [];
+  if (options.action === "gc-resume") {
+    const target = options.executionId === undefined
+      ? snapshot.gc.interruptedCount
+      : snapshot.executions.some((execution) => execution.executionId === options.executionId && execution.gcStatus === "INTERRUPTED") ? 1 : 0;
+    if (target === 0) reasons.push("no interrupted GC operation is eligible for resume");
+  }
+  if (options.action !== "projection-rebuild" && !snapshot.projection.databaseExists) reasons.push("projection database is required by this repair action");
+  if (options.executionId !== undefined && options.action === "projection-rebuild") reasons.push("projection rebuild operates on the complete state root");
+  return {
+    schemaVersion: "g2m.repair-plan.v1",
+    operationId: options.operationId ?? randomUUID(),
+    generatedAt: snapshot.generatedAt,
+    action: options.action,
+    executionId: options.executionId ?? null,
+    applyRequired: true,
+    permitted: reasons.length === 0,
+    reasons: Object.freeze(reasons),
+    target: options.executionId === undefined ? "state-root" : `execution:${options.executionId}`,
+  };
+}
+
+function gcOptions(config: G2MLocalConfig, nowMs: number, executionId: string | undefined) {
+  const root = stateRoot(config);
+  const eventStore = new EventStore({ executionDirectory: join(root, "executions"), tolerateLoadErrors: true });
+  const database = new StateDatabase(join(root, "g2m-state.sqlite"));
+  const workspaceLock = new WorkspaceLock({ stateRoot: root });
+  return {
+    options: {
+      stateRoot: root, artifactRoot: config.artifact_root, worktreeRoot: config.worktree_root, eventStore, database, nowMs,
+      ...(executionId !== undefined ? { executionId } : {}), completedRetentionDays: config.storage.completed_retention_days,
+      workspaces: config.workspaces.map((workspace) => ({ workspaceId: workspace.workspace_id, canonicalPath: workspace.path })), workspaceLock,
+    } as const,
+    close: () => { eventStore.close(); database.close(); },
+  };
+}
+
+async function dispatch(plan: RepairPlan, config: G2MLocalConfig): Promise<unknown> {
+  const nowMs = plan.generatedAt;
+  if (plan.action === "projection-rebuild") {
+    return rebuildProjection({
+      stateRoot: stateRoot(config), nowMs,
+      workspaces: config.workspaces.map((workspace) => ({ workspaceId: workspace.workspace_id, canonicalPath: workspace.path })),
+      completedRetentionDays: config.storage.completed_retention_days,
+    });
+  }
+  const resources = gcOptions(config, nowMs, plan.executionId ?? undefined);
+  try {
+    if (plan.action === "gc-resume") return resumeInterrupted(resources.options);
+    return reconcileStorageReservations({ stateRoot: stateRoot(config), database: resources.options.database, eventStore: resources.options.eventStore, nowMs });
+  } finally { resources.close(); }
+}
+
+export async function executeRepair(options: RepairOptions & { readonly apply: true }): Promise<RepairResult> {
+  const plan = await planRepair(options);
+  const resultBase = {
+    schemaVersion: "g2m.repair-result.v1" as const,
+    operationId: plan.operationId,
+    generatedAt: plan.generatedAt,
+    action: plan.action,
+    executionId: plan.executionId,
+  };
+  if (!plan.permitted) {
+    return { ...resultBase, status: "REFUSED", result: null, reasons: plan.reasons };
+  }
+  const lock = await acquireRepairLock(stateRoot(options.config), { operationId: plan.operationId, nowMs: plan.generatedAt });
+  try {
+    await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "plan", action: plan.action, createdAt: plan.generatedAt, payload: plan });
+    await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "start", action: plan.action, createdAt: Date.now(), payload: { target: plan.target } });
+    try {
+      const value = await dispatch(plan, options.config);
+      const result: RepairResult = { ...resultBase, status: "APPLIED", result: value, reasons: [] };
+      await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "result", action: plan.action, createdAt: Date.now(), payload: result });
+      return result;
+    } catch (error) {
+      const result: RepairResult = { ...resultBase, status: "FAILED", result: null, reasons: [error instanceof Error ? error.message : String(error)] };
+      await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "result", action: plan.action, createdAt: Date.now(), payload: result });
+      return result;
+    }
+  } finally { await lock.release(); }
+}
