@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   G2MExecutionEngine,
@@ -127,7 +127,7 @@ describe("G2MExecutionEngine", () => {
 
     workspaceRegistry = new WorkspaceRegistry();
     workspaceRegistry.register("demo", repositoryPath);
-    workspaceLock = new WorkspaceLock();
+    workspaceLock = new WorkspaceLock({ stateRoot: join(tempRoot, "state") });
     profileRegistry = new ProfileRegistry();
     profileRegistry.register({
       id: "targeted_tests",
@@ -225,7 +225,22 @@ describe("G2MExecutionEngine", () => {
       change_set_hash: pending.bundle.workspaceEvidence.patch.changeSetHash,
       base_revision: pending.worktree.baseRevision,
     });
-    expect(workspaceLock.isHeld("demo")).toBe(false);
+    expect(workspaceLock.isHeld("demo")).toBe(true);
+    workspaceLock.release(pending.lease);
+  });
+
+  it("holds REVIEW_PENDING lease and blocks a second manager", async () => {
+    const pending = await engine().execute(task);
+    expect(pending.lease.leaseId).toBeTruthy();
+    expect(workspaceLock.isHeld("demo")).toBe(true);
+
+    const contender = new WorkspaceLock({ stateRoot: join(tempRoot, "state") });
+    await expect(contender.acquire({
+      workspaceId: "demo-alias",
+      canonicalPath: repositoryPath,
+      executionId: "contender",
+    })).rejects.toMatchObject({ code: "WORKSPACE_BUSY" });
+    workspaceLock.release(pending.lease);
   });
 
   it("keeps the durable lifecycle result when SQLite projection fails", async () => {
@@ -276,6 +291,8 @@ describe("G2MExecutionEngine", () => {
 
   it("applies the reviewed patch only after an ACCEPT decision", async () => {
     const runner = engine();
+    const acquireSpy = vi.spyOn(workspaceLock, "acquire");
+    const assertOwnedSpy = vi.spyOn(workspaceLock, "assertOwned");
     const pending = await runner.execute(task);
     const review = buildReview({
       taskId: pending.bundle.taskId,
@@ -291,6 +308,13 @@ describe("G2MExecutionEngine", () => {
     const completed = await runner.applyReview(pending, review);
 
     expect(completed.state).toBe("ACCEPTED");
+    expect(completed.executionId).toBe(pending.executionId);
+    expect(pending.lease.leaseId).toBeTruthy();
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+    // One initial ownership check creates the first sidecar; applyReview adds
+    // the entry and pre-apply checks without acquiring a second lease.
+    expect(assertOwnedSpy.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(workspaceLock.isHeld("demo")).toBe(false);
     expect(completed.patchStatus).toBe("applied");
     expect(eventStore.getByTaskId(task.task_id).slice(-4).map((event) => event.type)).toEqual([
       "review.accept.prepared",
@@ -345,6 +369,7 @@ describe("G2MExecutionEngine", () => {
 
     expect(completed.state).toBe("BLOCKED");
     expect(completed.patchStatus).toBe("discarded");
+    expect(workspaceLock.isHeld("demo")).toBe(false);
     expect(await readFile(join(repositoryPath, "source.txt"), "utf8")).toMatch(/^broken\r?\n$/);
     await expect(stat(pending.worktree.worktreePath)).rejects.toBeTruthy();
   });
@@ -368,6 +393,7 @@ describe("G2MExecutionEngine", () => {
 
     expect(completed.state).toBe("REVISION_REQUESTED");
     expect(completed.patchStatus).toBe("retained_for_revision");
+    expect(workspaceLock.isHeld("demo")).toBe(false);
     await expect(stat(pending.worktree.worktreePath)).resolves.toBeTruthy();
     expect(await readFile(join(repositoryPath, "source.txt"), "utf8")).toMatch(/^broken\r?\n$/);
   });
@@ -422,6 +448,7 @@ describe("G2MExecutionEngine", () => {
     await expect(runner.execute(task)).rejects.toMatchObject({
       code: "WORKER_TIMED_OUT",
     });
+    expect(workspaceLock.isHeld("demo")).toBe(false);
     expect(eventStore.getByTaskId(task.task_id).at(-1)?.type).toBe("agent.timed_out");
   });
 
@@ -438,6 +465,7 @@ describe("G2MExecutionEngine", () => {
     const recovery = (caught as G2MExecutionEngineError).recovery;
     expect(recovery?.state).toBe("RECOVERY_REQUIRED");
     await expect(stat(recovery?.worktree.worktreePath ?? "")).resolves.toBeTruthy();
+    expect(workspaceLock.isHeld("demo")).toBe(true);
     expect(eventStore.getByTaskId(task.task_id).at(-1)?.type).toBe("recovery.required");
   });
 });

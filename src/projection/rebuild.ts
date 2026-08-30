@@ -66,6 +66,7 @@ import type { TaskEvent } from "../events/events.js";
 import { reduce } from "../events/reducer.js";
 import { FingerprintRegistry } from "../execution/fingerprint.js";
 import type { TaskState } from "../execution/state-machine.js";
+import { scanLeaseOwners } from "../workspace/lock.js";
 import { StateDatabase } from "./database.js";
 import { ExecutionProjector, type WorkspaceSeed } from "./execution-projector.js";
 
@@ -343,6 +344,14 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
       tempDatabase = new StateDatabase(tempPath);
       const projector = new ExecutionProjector(tempDatabase);
       writeWorkspaces(projector, workspaces, nowMs);
+
+      // The filesystem owner files are authoritative. SQLite receives only
+      // strictly valid lease metadata and can therefore be deleted/rebuilt
+      // without changing ownership decisions.
+      const leaseOwners = await scanLeaseOwners(stateRoot);
+      tempDatabase.transaction(() => {
+        for (const owner of leaseOwners) projector.upsertWorkspaceLease(owner);
+      });
 
       for (const [executionId, scan] of executions) {
         if (scan.kind === "load-error") {

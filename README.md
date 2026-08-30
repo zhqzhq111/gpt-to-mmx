@@ -117,6 +117,10 @@ v2 的十项持久化、恢复、证据一致性、跨进程协调和存储契�
 
 v2 实施进度见 [Implementation Status](docs/v2/implementation-status.md)。
 
+当前工作分支已完成 Phase 7A Durable Lease Foundation 的暂定验证：底层
+filesystem lease 与 Engine 的 `REVIEW_PENDING` 保租约生命周期已接入；真正
+双 Node 进程竞争测试及后续恢复接管仍待完成，尚未宣称 Phase 7 完成。
+
 ## 目录
 
 ```text

@@ -149,7 +149,22 @@ function configureEngine(
     const replayGuard = new ReplayGuard({ statePath: join(stateRoot, "replay-guard.json") });
     const engine = new G2MExecutionEngine({
       workspaceRegistry,
-      workspaceLock: new WorkspaceLock(),
+      workspaceLock: new WorkspaceLock({
+        stateRoot,
+        workspacePathResolver: (workspaceId) => workspaceRegistry.get(workspaceId).canonicalPath,
+        ...(config.workspace_lease?.heartbeat_interval_ms !== undefined
+          ? { heartbeatIntervalMs: config.workspace_lease.heartbeat_interval_ms } : {}),
+        ...(config.workspace_lease?.stale_after_ms !== undefined
+          ? { staleAfterMs: config.workspace_lease.stale_after_ms } : {}),
+        ...(config.workspace_lease?.incomplete_lease_grace_ms !== undefined
+          ? { incompleteLeaseGraceMs: config.workspace_lease.incomplete_lease_grace_ms } : {}),
+        ...(config.workspace_lease?.reclaim_guard_stale_ms !== undefined
+          ? { reclaimGuardStaleMs: config.workspace_lease.reclaim_guard_stale_ms } : {}),
+        leaseProjection: {
+          upsert: (owner) => projection.upsertWorkspaceLease(owner),
+          removeIfLeaseMatches: (workspaceId, leaseId) => projection.deleteWorkspaceLease(workspaceId, leaseId),
+        },
+      }),
       profileRegistry,
       evidenceStore,
       eventStore,

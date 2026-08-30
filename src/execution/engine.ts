@@ -87,6 +87,7 @@ export interface PendingReviewExecution {
   readonly worktree: TemporaryWorktreeHandle;
   readonly patch: WorktreePatch;
   readonly fingerprint: TaskFingerprint;
+  readonly lease: LockHandle;
 }
 
 export interface CompletedReviewExecution {
@@ -355,10 +356,11 @@ export class G2MExecutionEngine {
         type: "workspace.lock.requested",
       });
       try {
-        lockHandle = this.options.workspaceLock.acquire(
-          task.workspace_scope.workspace_id,
+        lockHandle = await this.options.workspaceLock.acquire({
+          workspaceId: task.workspace_scope.workspace_id,
+          canonicalPath: workspace.canonicalPath,
           executionId,
-        );
+        });
       } catch (error) {
         this.appendAndReduce(mutable, {
           taskId: task.task_id,
@@ -664,6 +666,7 @@ export class G2MExecutionEngine {
         worktree,
         patch,
         fingerprint,
+        lease: lockHandle,
       });
       this.pending.set(bundle.bundleId, pending);
       return pending;
@@ -682,8 +685,12 @@ export class G2MExecutionEngine {
         error,
       );
     } finally {
-      if (lockHandle !== undefined && this.options.workspaceLock.isHeld(lockHandle.workspaceId)) {
-        this.options.workspaceLock.release(lockHandle);
+      if (
+        lockHandle !== undefined &&
+        mutable.state !== "REVIEW_PENDING" &&
+        mutable.state !== "RECOVERY_REQUIRED"
+      ) {
+        try { this.options.workspaceLock.release(lockHandle); } catch { /* terminal outcome remains durable */ }
       }
     }
   }
@@ -699,12 +706,10 @@ export class G2MExecutionEngine {
       );
     }
 
-    let lockHandle: LockHandle | undefined;
+    const lockHandle = pending.lease;
+    let releaseLease = false;
     try {
-      lockHandle = this.options.workspaceLock.acquire(
-        pending.task.workspace_scope.workspace_id,
-        `review-${pending.executionId}`,
-      );
+      await this.options.workspaceLock.assertOwned(lockHandle);
       const currentDiff = await collectDiff(
         pending.worktree.worktreePath,
         pending.worktree.baseRevision,
@@ -760,6 +765,7 @@ export class G2MExecutionEngine {
           pending.patch,
           pending.worktree.repositoryPath,
         );
+        await this.options.workspaceLock.assertOwned(lockHandle);
         // Phase 6 §6 / §7: `patch.apply.started` is a CRITICAL lifecycle
         // event. Its payload binds the Frozen Patch, expected change set,
         // base revision, and Review triple so the recovery scanner can
@@ -857,6 +863,7 @@ export class G2MExecutionEngine {
           },
           fingerprint: pending.fingerprint,
         });
+        releaseLease = true;
         // Phase 6 §32: ReplayGuard is a derived anti-replay cache. It
         // MUST never lead the Journal — record only after
         // review.accept.completed is durable. P1#3: any failure here is
@@ -898,6 +905,7 @@ export class G2MExecutionEngine {
         const applied = applyBoundReview(review, pending.bundle, reviewContext);
         if (applied.kind === "applied") {
           this.projectDurable(applied.event, applied.newState);
+          releaseLease = true;
         }
       }
       if (review.decision === "ACCEPT") {
@@ -919,8 +927,8 @@ export class G2MExecutionEngine {
         ...(review.newTaskId !== undefined ? { newTaskId: review.newTaskId } : {}),
       });
     } finally {
-      if (lockHandle !== undefined && this.options.workspaceLock.isHeld(lockHandle.workspaceId)) {
-        this.options.workspaceLock.release(lockHandle);
+      if (releaseLease) {
+        try { this.options.workspaceLock.release(lockHandle); } catch { /* terminal outcome remains durable */ }
       }
     }
   }

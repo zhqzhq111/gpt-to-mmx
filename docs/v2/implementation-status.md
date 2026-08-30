@@ -97,7 +97,7 @@ Nine tables, all `STRICT`:
 |-------|---------|
 | `executions` | one row per `execution_id`; state, task binding, base revision, runtime/model/fingerprint, retention class |
 | `workspaces` | one row per `workspace_id`; `canonical_path` and `updated_at` |
-| `workspace_locks` | (reserved; not yet projected — in-memory `WorkspaceLock` is authoritative) |
+| `workspace_locks` | filesystem lease projection; owner files remain authoritative and rows are lease_id-conditional |
 | `reviews` | one row per `review_bundle_id`; decision, `review_id`, `review_hash`, `applied_at` |
 | `artifacts` | one row per `artifact_id`; `kind`, `path`, `sha256`, `bytes`, `immutable` |
 | `storage_usage` | (reserved for Storage Manager) |
@@ -718,6 +718,28 @@ string returned to the caller.
   `tests/workspace/worktree.test.ts` cover P0#3 stdin apply and P0#4
   full change set).
 - The five pre-existing real-mcode skips remain unchanged.
+
+## Phase 7A — Durable Lease Foundation
+
+Status: **PROVISIONAL** on branch `codex/phase-7-durable-lease`.
+
+Phase 7A implements the bottom lease layer and Engine lifecycle integration:
+
+- filesystem owner leases use physical workspace identity and `open("wx")`;
+- heartbeat sidecars use atomic replacement;
+- release and stale reclaim use a shared reclaim guard and second ownership check;
+- lease inspection refuses automatic reclaim for active, unknown, foreign-host,
+  and `RECOVERY_REQUIRED` evidence;
+- `workspace_locks` is a rebuildable SQLite projection;
+- Engine holds the same lease through `REVIEW_PENDING`, reuses it in
+  `applyReview()`, releases only after terminal Journal durability, and retains
+  it for `RECOVERY_REQUIRED`.
+
+Verification on the provisional branch: `npm run typecheck`, `npm run build`,
+and `npm test` pass; the Engine lease cases pass in
+`tests/execution/engine.test.ts`. Real two-process race coverage remains a
+later Phase 7 Task 10 gate, and this section must not be changed to
+`complete` until that gate and the remaining Phase 7 recovery work pass.
 
 ## Remaining phases
 

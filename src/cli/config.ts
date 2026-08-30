@@ -22,6 +22,15 @@ const VerificationProfileConfigSchema = z
   })
   .strict();
 
+const WorkspaceLeaseConfigSchema = z
+  .object({
+    heartbeat_interval_ms: z.number().int().positive().optional(),
+    stale_after_ms: z.number().int().positive().optional(),
+    incomplete_lease_grace_ms: z.number().int().positive().optional(),
+    reclaim_guard_stale_ms: z.number().int().positive().optional(),
+  })
+  .strict();
+
 const LocalConfigSchema = z
   .object({
     protocol_version: z.literal("g2m.local-config.v1"),
@@ -30,6 +39,7 @@ const LocalConfigSchema = z
     worktree_root: absolutePath,
     artifact_root: absolutePath,
     state_root: absolutePath.optional(),
+    workspace_lease: WorkspaceLeaseConfigSchema.optional(),
     mcode_path: absolutePath.optional(),
     review_timeout_ms: z.number().int().positive().default(1_800_000),
   })
