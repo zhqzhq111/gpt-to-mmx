@@ -58,6 +58,11 @@ npm run g2m -- probe --config <g2m.config.json>
 
 可选的 `state_root` 用于保存跨进程恢复所需的事件、证据、指纹和 Review 防重放状态；未配置时默认使用 `<artifact_root>/state`。
 
+本仓库的测试临时目录统一位于工程内的 `.tmp/test-runs/`，不会再使用
+Windows 系统临时目录；该目录已加入 `.gitignore`。实际运行产生的
+state、artifact 和 worktree 仍由配置中的 `state_root`、`artifact_root`
+和 `worktree_root` 决定，建议将它们配置到工程内的 `.tmp/` 目录。
+
 启动执行并等待 Codex 复核：
 
 ```powershell

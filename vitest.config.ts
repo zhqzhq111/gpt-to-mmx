@@ -2,6 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    setupFiles: ["./tests/setup.ts"],
     // Windows Git worktree setup can exceed Vitest's 5 s default when the
     // complete suite runs in parallel. Individual watchdog behavior still has
     // its own tighter assertions and test-level timeouts.
