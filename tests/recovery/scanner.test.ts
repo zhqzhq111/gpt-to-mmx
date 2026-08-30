@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -394,6 +394,51 @@ describe("scanRecovery", () => {
     expect(await readFile(worktreeFile)).toEqual(before.worktree);
     expect(await readFile(lockFile)).toEqual(before.lock);
     expect(f.database.getMeta("execution:bound-execution:last_event_hash")).toBe(before.meta);
+    events.close();
+    f.database.close();
+  });
+
+  it("classifies stale, recovery-blocked, and malformed leases without deleting them", async () => {
+    const f = await fixture();
+    const seed = new EventStore({ executionDirectory: f.executionRoot });
+    appendToReviewPending(seed, "terminal-lease");
+    append(seed, "terminal-lease", "terminal-lease-task", "review.decision.block", {
+      review_bundle_id: "terminal-lease-bundle", review_id: "review-1",
+    });
+    appendToRunningWithFingerprint(seed, "active-lease");
+    appendToRunningWithFingerprint(seed, "recovery-lease");
+    append(seed, "recovery-lease", "recovery-lease-task", "recovery.required", { reason: "unknown" });
+    seed.close();
+    const events = new EventStore({ executionDirectory: f.executionRoot, tolerateLoadErrors: true });
+    replayAndProject(f.database, events.getByAttemptId("terminal-lease"));
+    replayAndProject(f.database, events.getByAttemptId("active-lease"));
+    replayAndProject(f.database, events.getByAttemptId("recovery-lease"));
+    await mkdir(join(f.stateRoot, "locks"), { recursive: true });
+    const leases = [
+      ["a".repeat(64), "terminal-lease", "terminal-lease-task"],
+      ["b".repeat(64), "active-lease", "active-lease-task"],
+      ["c".repeat(64), "recovery-lease", "recovery-lease-task"],
+    ] as const;
+    for (const [key, executionId] of leases) {
+      await writeFile(join(f.stateRoot, "locks", `${key}.lock`), JSON.stringify({
+        lock_version: 1, workspace_key: key, workspace_id: "workspace-1", execution_id: executionId,
+        lease_id: `lease-${executionId}`, pid: 999999, hostname: hostname(), created_at: 0, heartbeat_at: 0,
+      }) + "\n", "utf8");
+      await writeFile(join(f.stateRoot, "locks", `${key}.lease-${executionId}.heartbeat`), JSON.stringify({
+        heartbeat_version: 1, workspace_key: key, lease_id: `lease-${executionId}`, heartbeat_at: 0,
+      }) + "\n", "utf8");
+    }
+    const malformedPath = join(f.stateRoot, "locks", `${"d".repeat(64)}.lock`);
+    await writeFile(malformedPath, "not-json", "utf8");
+    const before = await readFile(malformedPath);
+
+    const report = scanRecovery(scannerOptions(f, events));
+
+    expect(report.issues).toContainEqual(expect.objectContaining({ kind: "LEASE_STALE", executionId: "terminal-lease", severity: "REPORT_ONLY" }));
+    expect(report.issues).toContainEqual(expect.objectContaining({ kind: "LEASE_STALE", executionId: "active-lease", severity: "SAFE_HOLD" }));
+    expect(report.issues).toContainEqual(expect.objectContaining({ kind: "LEASE_RECOVERY_BLOCKED", executionId: "recovery-lease" }));
+    expect(report.issues).toContainEqual(expect.objectContaining({ kind: "LEASE_MALFORMED" }));
+    expect(await readFile(malformedPath)).toEqual(before);
     events.close();
     f.database.close();
   });

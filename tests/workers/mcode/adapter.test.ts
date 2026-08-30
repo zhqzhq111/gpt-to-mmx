@@ -18,6 +18,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { MCodeAdapter } from "../../../src/workers/mcode/adapter.js";
+import { ProcessSupervisor } from "../../../src/process/supervisor.js";
+import type { PlatformProcessController } from "../../../src/process/platform.js";
 import {
   AdapterError,
   type WorkerInvocation,
@@ -252,7 +254,39 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
       await expect(adapter.collectResult(inv.executionId)).rejects.toMatchObject({
         code: "TIMED_OUT",
       });
-      expect(Date.now() - startedAt).toBeLessThan(4_000);
+      expect(Date.now() - startedAt).toBeLessThan(6_000);
+    },
+    10_000,
+  );
+
+  it(
+    "surfaces UNKNOWN when supervisor timeout termination cannot be confirmed",
+    async () => {
+      process.env["MOCK_BEHAVIOR"] = "slow";
+      const controller: PlatformProcessController = {
+        strategy: "windows_taskkill",
+        isAlive: () => "alive",
+        terminate: async (pid) => {
+          try { process.kill(pid); } catch { /* cleanup is best effort */ }
+          return {
+            confirmedGone: false,
+            gracefulAttempted: true,
+            forcedAttempted: true,
+            strategy: "windows_taskkill",
+            error: "test probe refused confirmation",
+          };
+        },
+      };
+      const options = {
+        processSupervisor: new ProcessSupervisor({ platformController: controller }),
+      } as unknown as ConstructorParameters<typeof MCodeAdapter>[0];
+      const adapter = new MCodeAdapter(options);
+      const inv = makeInvocation({ limits: { maxSteps: 20, timeoutMs: 500 } });
+      await adapter.start(inv);
+
+      await expect(adapter.collectResult(inv.executionId)).rejects.toMatchObject({
+        code: "UNKNOWN",
+      });
     },
     10_000,
   );

@@ -1,6 +1,7 @@
 import type { TaskEvent } from "../events/events.js";
 import { fingerprintHash } from "../execution/fingerprint.js";
 import type { TaskState } from "../execution/state-machine.js";
+import type { ValidLeaseOwner } from "../workspace/lock.js";
 import { StateDatabase } from "./database.js";
 
 export interface WorkspaceSeed {
@@ -135,6 +136,46 @@ export class ExecutionProjector implements ExecutionProjection {
     return this.database.prepare(
       "SELECT * FROM recovery_cases WHERE execution_id = ?",
     ).get(executionId) as RecoveryCaseRow | undefined;
+  }
+
+  workspaceLease(workspaceId: string): Record<string, unknown> | undefined {
+    return this.database.prepare(
+      "SELECT * FROM workspace_locks WHERE workspace_id = ?",
+    ).get(workspaceId) as Record<string, unknown> | undefined;
+  }
+
+  upsertWorkspaceLease(owner: ValidLeaseOwner): void {
+    this.database.prepare(`
+      INSERT INTO workspace_locks(
+        workspace_id, execution_id, lease_id, pid, hostname, heartbeat_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id) DO UPDATE SET
+        execution_id = excluded.execution_id,
+        lease_id = excluded.lease_id,
+        pid = excluded.pid,
+        hostname = excluded.hostname,
+        heartbeat_at = excluded.heartbeat_at
+    `).run(
+      owner.workspace_id,
+      owner.execution_id,
+      owner.lease_id,
+      owner.pid,
+      owner.hostname,
+      owner.heartbeat_at,
+    );
+  }
+
+  deleteWorkspaceLease(workspaceId: string, leaseId: string): void {
+    this.database.prepare(
+      "DELETE FROM workspace_locks WHERE workspace_id = ? AND lease_id = ?",
+    ).run(workspaceId, leaseId);
+  }
+
+  replaceWorkspaceLeases(owners: readonly ValidLeaseOwner[]): void {
+    this.database.transaction(() => {
+      this.database.exec("DELETE FROM workspace_locks");
+      for (const owner of owners) this.upsertWorkspaceLease(owner);
+    });
   }
 
   /**

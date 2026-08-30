@@ -1,32 +1,24 @@
 /**
- * Independent Verification Runner — plan §28 + §67 + Phase 6
+ * Independent Verification Runner.
  *
- * 真正的 review evidence 必须由 G2M 独立运行,不能只信 Worker self-report
- * (plan §28)。这个 module 负责:
- * - 用 program+argv 跑 verification profile(plan §32 严格禁止 shell)
- * - 捕获 stdout / stderr / exitCode / duration(plan §37 stdout/stderr 分离)
- * - 区分 passed / failed / timed_out / spawn_error / skipped
- * - 返回带 resultHash 的 VerificationResult(plan §45 anti-replay binding)
- *
- * 约束:
- * - 不接受 shell string(plan §32 明确要求 program+argv,不拼接字符串)
- * - 不修改 MCodeAdapter(本轮约束)
- * - 不写 State Machine / Engine(本轮只提供 API,Phase 8 阶段才调用)
- * - Profile = undefined 时返回 status = "skipped"(对应 verification_profile = "none")
+ * Verification commands use the same ProcessSupervisor as workers. The
+ * runner owns output capture and result classification; the supervisor owns
+ * process-tree termination and termination proof.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
 import { sha256 } from "../protocol/hash.js";
+import {
+  ProcessSupervisor,
+  type ProcessOutcome,
+  type TerminationResult,
+} from "../process/supervisor.js";
 import type { VerificationProfile } from "../policy/verification.js";
-
-const execFileAsync = promisify(execFile);
 
 export type VerificationStatus =
   | "passed"
   | "failed"
   | "timed_out"
+  | "termination_unconfirmed"
   | "spawn_error"
   | "skipped";
 
@@ -37,6 +29,13 @@ export class VerificationError extends Error {
     this.name = "VerificationError";
     this.code = code;
   }
+}
+
+export interface VerificationTermination {
+  readonly confirmedGone: boolean;
+  readonly gracefulAttempted: boolean;
+  readonly forcedAttempted: boolean;
+  readonly strategy: string;
 }
 
 export interface VerificationResult {
@@ -55,13 +54,13 @@ export interface VerificationResult {
   readonly finishedAt: number;
   readonly resultHash: string;
   readonly errorMessage?: string;
+  readonly termination?: VerificationTermination;
 }
 
-/**
- * resultHash 绑定的"逻辑结果"字段(排除 timing 元数据)。
- * 同一命令两次跑 stdout/stderr/status/exitCode 都一致时 resultHash 稳定,
- * 用于 plan §45 Review Bundle 的 anti-replay / anti-stale 绑定。
- */
+export interface VerificationRunOptions {
+  readonly processSupervisor?: ProcessSupervisor;
+}
+
 function hashablePayload(r: VerificationResult): unknown {
   return {
     profileId: r.profileId,
@@ -75,6 +74,14 @@ function hashablePayload(r: VerificationResult): unknown {
     stdout: r.stdout,
     stderr: r.stderr,
     errorMessage: r.errorMessage,
+    ...(r.termination !== undefined
+      ? {
+          termination: {
+            confirmedGone: r.termination.confirmedGone,
+            strategy: r.termination.strategy,
+          },
+        }
+      : {}),
   };
 }
 
@@ -110,19 +117,6 @@ function makeSkippedResult(
   });
 }
 
-interface ExecFailure {
-  readonly killed?: boolean;
-  readonly code?: string | number;
-  readonly signal?: NodeJS.Signals;
-  readonly stdout?: string;
-  readonly stderr?: string;
-  readonly message?: string;
-}
-
-function isExecFailure(e: unknown): e is ExecFailure {
-  return typeof e === "object" && e !== null;
-}
-
 interface RunOutcome {
   readonly status: VerificationStatus;
   readonly exitCode: number | null;
@@ -130,65 +124,64 @@ interface RunOutcome {
   readonly stdout: string;
   readonly stderr: string;
   readonly errorMessage?: string;
+  readonly termination?: VerificationTermination;
 }
 
-function classifyExecution(
+function terminationEvidence(
+  termination: TerminationResult,
+): VerificationTermination {
+  return {
+    confirmedGone: termination.confirmedGone,
+    gracefulAttempted: termination.gracefulAttempted,
+    forcedAttempted: termination.forcedAttempted,
+    strategy: termination.strategy,
+  };
+}
+
+function classifyProcessOutcome(
   profile: VerificationProfile,
-  execError: ExecFailure | null,
+  outcome: ProcessOutcome,
+  stdout: string,
+  stderr: string,
 ): RunOutcome {
-  // 没抛错:正常 exit。execFile 在 exit 0 时 resolve,exit 非 0 时 reject,
-  // 所以"正常 resolve"只对应 exit 0。
-  if (execError === null) {
-    return { status: "passed", exitCode: 0, signal: null, stdout: "", stderr: "" };
-  }
-
-  const stdout = execError.stdout ?? "";
-  const stderr = execError.stderr ?? "";
-  const signal = typeof execError.signal === "string" ? execError.signal : null;
-
-  // Timeout:Node 杀掉子进程,killed=true。
-  if (execError.killed === true) {
+  if (outcome.kind === "exited") {
     return {
-      status: "timed_out",
-      exitCode: null,
-      signal,
+      status: outcome.exitCode === 0 ? "passed" : "failed",
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
       stdout,
       stderr,
-      errorMessage: `verification timed out after ${profile.timeoutMs}ms`,
     };
   }
-
-  // 程序不存在:ENOENT。
-  if (execError.code === "ENOENT") {
+  if (outcome.kind === "spawn_error") {
     return {
       status: "spawn_error",
       exitCode: null,
-      signal,
+      signal: null,
       stdout,
       stderr,
-      errorMessage: `program "${profile.program}" not found: ${execError.message ?? ""}`,
+      errorMessage: `program "${profile.program}" not found: ${outcome.error.message}`,
     };
   }
-
-  // 非零退出:execFile 把 exit code 放在 err.code(number)。
-  if (typeof execError.code === "number") {
+  if (outcome.kind === "timed_out") {
     return {
-      status: "failed",
-      exitCode: execError.code,
-      signal,
+      status: "timed_out",
+      exitCode: null,
+      signal: null,
       stdout,
       stderr,
+      errorMessage: `verification timed out after ${profile.timeoutMs}ms`,
+      termination: terminationEvidence(outcome.termination),
     };
   }
-
-  // 其他:spawn 阶段失败(权限、cwd 不存在等)。
   return {
-    status: "spawn_error",
+    status: "termination_unconfirmed",
     exitCode: null,
-    signal,
+    signal: null,
     stdout,
     stderr,
-    errorMessage: execError.message ?? "unknown spawn error",
+    errorMessage: `verification termination could not be confirmed: ${outcome.reason}`,
+    termination: terminationEvidence(outcome.termination),
   };
 }
 
@@ -196,33 +189,29 @@ async function runProfile(
   profile: VerificationProfile,
   workspaceId: string,
   workspacePath: string,
+  options: VerificationRunOptions,
 ): Promise<VerificationResult> {
   const startedAt = Date.now();
-  let outcome: RunOutcome;
-  try {
-    const result = await execFileAsync(profile.program, [...profile.args], {
-      cwd: workspacePath,
-      timeout: profile.timeoutMs,
-      env: profile.env !== undefined
-        ? { ...process.env, ...profile.env }
-        : process.env,
-      windowsHide: true,
-    });
-    outcome = classifyExecution(profile, null);
-    outcome = {
-      ...outcome,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    };
-  } catch (e) {
-    if (!isExecFailure(e)) {
-      throw new VerificationError(
-        "PROFILE_INVALID",
-        `unexpected non-object error from execFile: ${String(e)}`,
-      );
-    }
-    outcome = classifyExecution(profile, e);
-  }
+  const supervisor = options.processSupervisor ?? new ProcessSupervisor();
+  const managed = supervisor.spawn({
+    program: profile.program,
+    args: profile.args,
+    cwd: workspacePath,
+    env: profile.env !== undefined ? { ...process.env, ...profile.env } : process.env,
+    timeoutMs: profile.timeoutMs,
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  managed.stdout?.on("data", (chunk: Buffer | string) => {
+    stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  });
+  managed.stderr?.on("data", (chunk: Buffer | string) => {
+    stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  });
+
+  const processOutcome = await managed.wait();
+  const outcome = classifyProcessOutcome(profile, processOutcome, stdout, stderr);
   const finishedAt = Date.now();
   return withResultHash({
     profileId: profile.id,
@@ -238,27 +227,17 @@ async function runProfile(
     durationMs: finishedAt - startedAt,
     startedAt,
     finishedAt,
-    ...(outcome.errorMessage !== undefined
-      ? { errorMessage: outcome.errorMessage }
-      : {}),
+    ...(outcome.errorMessage !== undefined ? { errorMessage: outcome.errorMessage } : {}),
+    ...(outcome.termination !== undefined ? { termination: outcome.termination } : {}),
   });
 }
 
-/**
- * 跑一次独立 verification。
- * - profile = undefined → 返回 status = "skipped"(对应 verification_profile = "none")
- * - profile 给定 → 实际 execFile,返回 passed / failed / timed_out / spawn_error
- *
- * 永远不抛错(只把异常转成 status = spawn_error),调用方拿到 result 就能判定。
- * 唯一会抛的场景是 execFile 返回了非 Error 对象(理论不会发生),用作防御。
- */
 export async function runVerification(
   profile: VerificationProfile | undefined,
   workspaceId: string,
   workspacePath: string,
+  options: VerificationRunOptions = {},
 ): Promise<VerificationResult> {
-  if (profile === undefined) {
-    return makeSkippedResult(workspaceId, workspacePath);
-  }
-  return await runProfile(profile, workspaceId, workspacePath);
+  if (profile === undefined) return makeSkippedResult(workspaceId, workspacePath);
+  return runProfile(profile, workspaceId, workspacePath, options);
 }

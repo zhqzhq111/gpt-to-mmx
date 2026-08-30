@@ -15,12 +15,12 @@ G2M v1.0.0 Coding Orchestrator 已完成：
 - MiniMax Code 0.2.7 Resolver、stream-json Parser、Result Normalizer；
 - Temporary Git Worktree 隔离与 binary-capable patch；
 - Worker / Workspace / Verification 三类证据；
-- 独立 Verification Profile（`execFile`，无 shell）；
+- 独立 Verification Profile（统一 ProcessSupervisor、无 shell）；
 - Event Hash Chain、State Machine、task fingerprint；
 - Review Bundle、六字段绑定、anti-stale / anti-replay；
 - ACCEPT / REVISE / BLOCK；
 - UNKNOWN Resolver 与 RECOVERY_REQUIRED；
-- Windows process-tree cancel、外层 watchdog；
+- Unified ProcessSupervisor：Windows process-tree、POSIX process-group、超时/取消终止确认；
 - `read_only` 任务的真实 diff 强制审计；
 - 可交互 `g2m run` / `g2m review` 命令；
 - 已安装的 `$gpt-to-mmx` Codex Skill。
@@ -117,6 +117,20 @@ v2 的十项持久化、恢复、证据一致性、跨进程协调和存储契�
 
 v2 实施进度见 [Implementation Status](docs/v2/implementation-status.md)。
 
+当前分支已完成并封存 Phase 7 Cross-process Workspace Lease：底层
+filesystem lease、Engine 的 `REVIEW_PENDING` 保租约、启动协调、显式恢复
+接管、Scanner 分类和真实双 Node 进程竞争 E2E 均已通过最终 Gate。
+
+Phase 8 Unified Process Supervisor 已完成：MCode 和 Verification 共用统一
+进程生命周期接口；Windows 使用 `taskkill /T` 后升级 `/F`，POSIX 使用
+detached process group 的 `SIGTERM` → `SIGKILL`；timeout/cancel 只有在终止
+得到确认后才会成为确定结果。Verification 的终止无法确认时，Engine 会进入
+`RECOVERY_REQUIRED`，保留 Lease/worktree，并禁止收集 patch/final diff。
+
+Phase 8 最终 Gate：`npm run typecheck`、`npm run build`、`git diff --check`
+通过；`npm test` 为 `479 passed / 5 skipped / 0 failed`；Lease process E2E
+为 `3/3`，Process Supervisor parent→grandchild E2E 为 `3/3`。
+
 ## 目录
 
 ```text
@@ -125,6 +139,7 @@ src/
 ├── protocol/                  Task schema、validator、hash
 ├── policy/                    Permission / Verification Profile
 ├── workspace/                 Registry、Lock、Baseline、Temporary Worktree
+├── process/                   统一外部进程与进程树监管
 ├── evidence/                  Diff、Verification、Evidence Store
 ├── events/                    Event types、Hash Chain Store、Replay、Reducer
 ├── execution/                 State Machine、Fingerprint、Execution Engine

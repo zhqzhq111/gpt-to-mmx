@@ -2,7 +2,7 @@
 
 ## Phase 0 — Specification Freeze
 
-Status: complete at Amendment 1 (`746a942`).
+Status: complete at Amendment 2.
 
 ## Phase 1 — Frozen Patch Authority
 
@@ -97,7 +97,7 @@ Nine tables, all `STRICT`:
 |-------|---------|
 | `executions` | one row per `execution_id`; state, task binding, base revision, runtime/model/fingerprint, retention class |
 | `workspaces` | one row per `workspace_id`; `canonical_path` and `updated_at` |
-| `workspace_locks` | (reserved; not yet projected — in-memory `WorkspaceLock` is authoritative) |
+| `workspace_locks` | filesystem lease projection; owner files remain authoritative and rows are lease_id-conditional |
 | `reviews` | one row per `review_bundle_id`; decision, `review_id`, `review_hash`, `applied_at` |
 | `artifacts` | one row per `artifact_id`; `kind`, `path`, `sha256`, `bytes`, `immutable` |
 | `storage_usage` | (reserved for Storage Manager) |
@@ -719,7 +719,69 @@ string returned to the caller.
   full change set).
 - The five pre-existing real-mcode skips remain unchanged.
 
+## Phase 7A — Durable Lease Foundation
+
+Status: **COMPLETE / SEALED** on branch `codex/phase-7-durable-lease`.
+
+Phase 7A implements the bottom lease layer and Engine lifecycle integration:
+
+- filesystem owner leases use physical workspace identity and `open("wx")`;
+- heartbeat sidecars use atomic replacement;
+- release and stale reclaim use a shared reclaim guard and second ownership check;
+- lease inspection refuses automatic reclaim for active, unknown, foreign-host,
+  and `RECOVERY_REQUIRED` evidence;
+- `workspace_locks` is a rebuildable SQLite projection;
+- Engine holds the same lease through `REVIEW_PENDING`, reuses it in
+  `applyReview()`, releases only after terminal Journal durability, and retains
+  it for `RECOVERY_REQUIRED`.
+- Startup reconciliation reclaims only stale terminal leases with dead PIDs;
+  explicit recovery uses guarded takeover with a new lease ID for the same
+  execution; the recovery scanner remains read-only and classifies malformed,
+  incomplete, foreign-host, stale, heartbeat-mismatch, recovery-blocked, and
+  orphan-heartbeat cases.
+- Real child-process E2E covers concurrent acquire, release/retry, and
+  concurrent stale-terminal reclaim with exactly one winner.
+
+Final verification: `npm run typecheck`, `npm run build`, and `npm test` pass
+with **463 passed, 5 skipped, 0 failed**; `npm run test:lease-process` passes
+all 3 real process tests; and `git diff --check` passes. The five skips are
+the existing real-mcode tests. Phase 7 is now sealed; later work is limited to
+the explicitly separate Phase 8+ operational and runtime phases.
+
+## Phase 8 — Unified Process Supervisor
+
+Status: **COMPLETE / SEALED** on branch `codex/phase-8-process-supervisor`.
+
+Implemented:
+
+- `src/process/supervisor.ts` owns managed process lifecycle, bounded timeout,
+  idempotent termination, spawn errors, and exactly-once timeout handling.
+- `src/process/platform.ts` provides Windows `taskkill /T` → `/F` escalation
+  and POSIX detached process-group `SIGTERM` → `SIGKILL` escalation, both with
+  termination confirmation and bounded waits.
+- `MCodeAdapter` no longer contains OS kill/watchdog helpers. It delegates
+  process lifecycle to the Supervisor while preserving stream-json logical
+  completion and prompt wrapper cleanup.
+- Verification uses the same Supervisor, preserves stdout/stderr separation,
+  records termination evidence, and distinguishes confirmed timeout from
+  `termination_unconfirmed`.
+- Engine records `recovery.required` and safe-holds the worktree and Lease when
+  Verification termination cannot be confirmed; patch/final diff collection is
+  skipped in that path.
+- Real parent→grandchild process E2E covers cancellation, timeout, and
+  Verification timeout on Windows.
+
+Final Gate evidence:
+
+- `npm run typecheck` → exit 0.
+- `npm run build` → exit 0.
+- `npm test` → **479 passed, 5 skipped, 0 failed** across **43 test files
+  passed and 3 skipped**.
+- `npm run test:lease-process` → **3/3** real lease process tests passed.
+- `npm run test:process-supervisor` → **3/3** real parent→grandchild process
+  tests passed.
+- `git diff --check` → exit 0.
+
 ## Remaining phases
 
-Cross-process lease, Process Supervisor, Storage Manager,
-GC, operational CLI, runtime hardening, and CI matrices.
+Storage Manager, GC, operational CLI, runtime hardening, and CI matrices.

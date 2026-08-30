@@ -2,8 +2,8 @@
 
 ## Phase 0 — Specification Freeze
 
-**Status:** FROZEN — Amendment 1
-**Spec Revision:** 1
+**Status:** FROZEN — Amendment 2
+**Spec Revision:** 2
 **Reviewed:** yes
 **Target:** G2M v2.0.0
 **Supersedes:** Initial freeze at commit `2356a89`
@@ -249,13 +249,17 @@ file serializes stale-lock removal and the second stale check.
 
 Lease lifecycle is explicit:
 
-- create the owner file with exclusive create and write metadata through a
-  temporary file followed by atomic rename;
+- create the owner file with `fs.open(path, "wx")`; the successful exclusive
+  create is the ownership commit point, and write the complete metadata through
+  that same file handle, then sync and close it;
 - an empty, malformed, or missing-metadata lock is INCOMPLETE_LEASE and is not
   silently deleted; it enters stale-reclaim handling after the configured age;
 - the immutable owner file is not rewritten for heartbeats;
-- heartbeat is an atomically replaced sidecar at
-  `<workspace_hash>.<lease_id>.heartbeat` containing lease_id and heartbeat_at;
+- heartbeat is written to a temporary sidecar, synced, closed, and atomically
+  renamed to `<workspace_hash>.<lease_id>.heartbeat` containing lease_id and
+  heartbeat_at;
+- `heartbeat_at` in the immutable owner file is only the initial heartbeat;
+  the sidecar is the authority for current heartbeat freshness;
 - release reads the current owner and deletes the lock only when lease_id
   matches; an old process can never delete a newer owner's lease.
 
@@ -444,3 +448,4 @@ RECOVERY_REQUIRED.
 |---|---|---|
 | 0 | `2356a89` | Initial Phase 0 contract freeze |
 | 1 | Amendment 1 | Bound critical events to artifacts, clarified hashes and sources, and resolved lease, storage, and GC lifecycle gaps |
+| 2 | Amendment 2 | Froze `wx` owner creation with same-handle durable metadata writes and atomic heartbeat sidecar replacement |
