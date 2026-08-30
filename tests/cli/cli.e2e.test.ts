@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { main } from "../../src/cli/index.js";
+import { StateDatabase } from "../../src/projection/database.js";
+import { ExecutionProjector } from "../../src/projection/execution-projector.js";
 
 const execFileAsync = promisify(execFile);
 const describeWindows = process.platform === "win32" ? describe : describe.skip;
@@ -147,6 +149,11 @@ describeWindows("G2M CLI handoff E2E", () => {
           "utf8",
         ),
       ).toContain('"schema_version":1');
+      const projectionDatabase = new StateDatabase(join(state, "g2m-state.sqlite"));
+      expect(
+        new ExecutionProjector(projectionDatabase).execution(executionDirectories[0]!),
+      ).toMatchObject({ state: "BLOCKED" });
+      projectionDatabase.close();
       expect((await readdir(join(state, "evidence"))).length).toBeGreaterThan(0);
       expect((await readFile(join(state, "replay-guard.json"), "utf8")).trim()).not.toBe("");
     } finally {

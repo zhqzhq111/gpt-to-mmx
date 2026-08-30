@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
 import { EventStore } from "../events/store.js";
+import type { TaskEvent } from "../events/events.js";
 import { reduce } from "../events/reducer.js";
 import { collectDiff } from "../evidence/diff.js";
 import {
@@ -20,6 +21,7 @@ import {
 } from "../evidence/store.js";
 import { runVerification } from "../evidence/verification.js";
 import { writeImmutableArtifact } from "../persistence/artifact-writer.js";
+import type { ExecutionProjection } from "../projection/execution-projector.js";
 import { ProfileRegistry, resolveProfile } from "../policy/verification.js";
 import { sha256, taskHash } from "../protocol/hash.js";
 import {
@@ -65,6 +67,7 @@ export interface G2MExecutionEngineOptions {
   readonly profileRegistry: ProfileRegistry;
   readonly evidenceStore: EvidenceStore;
   readonly eventStore: EventStore;
+  readonly projection?: ExecutionProjection;
   readonly fingerprintRegistry: FingerprintRegistry;
   readonly replayGuard: ReplayGuard;
   readonly worker: CodingWorkerAdapter;
@@ -162,6 +165,29 @@ export class G2MExecutionEngine {
 
   constructor(private readonly options: G2MExecutionEngineOptions) {}
 
+  private projectDurable(event: TaskEvent, state: TaskState): void {
+    if (this.options.projection === undefined || event.durability !== "CRITICAL") return;
+    try {
+      this.options.projection.project(event, state, {
+        artifactPath: resolve(this.options.artifactRoot, event.attemptId),
+        runtime: this.options.workerRuntime.runtime,
+        runtimeVersion: this.options.workerRuntime.version,
+        model: this.options.workerRuntime.model,
+      });
+    } catch (error) {
+      this.options.eventStore.append({
+        taskId: event.taskId,
+        attemptId: event.attemptId,
+        type: "projection.stale",
+        payload: {
+          failed_event_id: event.eventId,
+          failed_event_hash: event.hash,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
   private appendAndReduce(
     mutable: MutableExecutionState,
     input: {
@@ -182,6 +208,9 @@ export class G2MExecutionEngine {
     mutable.state = reduce(mutable.state, event, {
       fingerprintRegistry: this.options.fingerprintRegistry,
     });
+    // A CRITICAL append flushes itself and all prior NORMAL records. Projecting
+    // only at that barrier guarantees SQLite can never lead the Journal.
+    this.projectDurable(event, mutable.state);
     return mutable.state;
   }
 
@@ -685,7 +714,10 @@ export class G2MExecutionEngine {
         newState = "REVISION_REQUESTED";
       }
       if (review.decision !== "ACCEPT") {
-        applyBoundReview(review, pending.bundle, reviewContext);
+        const applied = applyBoundReview(review, pending.bundle, reviewContext);
+        if (applied.kind === "applied") {
+          this.projectDurable(applied.event, applied.newState);
+        }
       }
       if (review.decision === "ACCEPT") {
         await removeTemporaryWorktree(pending.worktree);

@@ -13,6 +13,7 @@ import { EventStore } from "../../src/events/store.js";
 import { EvidenceStore } from "../../src/evidence/store.js";
 import { FingerprintRegistry } from "../../src/execution/fingerprint.js";
 import { ProfileRegistry } from "../../src/policy/verification.js";
+import type { ExecutionProjection } from "../../src/projection/execution-projector.js";
 import { buildReview } from "../../src/review/ingress.js";
 import { ReplayGuard } from "../../src/review/replay-guard.js";
 import type { CodeTaskV1 } from "../../src/protocol/code-task.v1.schema.js";
@@ -172,13 +173,17 @@ describe("G2MExecutionEngine", () => {
     await rm(tempRoot, { recursive: true, force: true });
   });
 
-  function engine(worker: CodingWorkerAdapter = new EditingWorker()): G2MExecutionEngine {
+  function engine(
+    worker: CodingWorkerAdapter = new EditingWorker(),
+    projection?: ExecutionProjection,
+  ): G2MExecutionEngine {
     return new G2MExecutionEngine({
       workspaceRegistry,
       workspaceLock,
       profileRegistry,
       evidenceStore,
       eventStore,
+      ...(projection !== undefined ? { projection } : {}),
       fingerprintRegistry,
       replayGuard,
       worker,
@@ -221,6 +226,24 @@ describe("G2MExecutionEngine", () => {
       base_revision: pending.worktree.baseRevision,
     });
     expect(workspaceLock.isHeld("demo")).toBe(false);
+  });
+
+  it("keeps the durable lifecycle result when SQLite projection fails", async () => {
+    const projection: ExecutionProjection = {
+      project() {
+        throw new Error("injected sqlite busy failure");
+      },
+    };
+
+    const pending = await engine(new EditingWorker(), projection).execute(task);
+    const events = eventStore.getByAttemptId(pending.executionId);
+
+    expect(pending.state).toBe("REVIEW_PENDING");
+    expect(events.some((event) => event.type === "review.requested")).toBe(true);
+    expect(events.some((event) =>
+      event.type === "projection.stale" &&
+      event.payload["reason"] === "injected sqlite busy failure"
+    )).toBe(true);
   });
 
   it("captures files created by verification in the final workspace evidence", async () => {

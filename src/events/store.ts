@@ -96,6 +96,7 @@ function restoreEvent(event: PersistedTaskEvent): TaskEvent {
 const CRITICAL_TYPES = new Set<TaskEventType>([
   "task.created",
   "task.validation.failed",
+  "workspace.lock.busy",
   "agent.spawn.started",
   "agent.spawn.failed",
   "agent.completed",

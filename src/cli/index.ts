@@ -8,6 +8,11 @@ import { EventStore } from "../events/store.js";
 import { G2MExecutionEngine, G2MExecutionEngineError } from "../execution/engine.js";
 import { fingerprintHash, FingerprintRegistry } from "../execution/fingerprint.js";
 import { ProfileRegistry } from "../policy/verification.js";
+import { StateDatabase } from "../projection/database.js";
+import {
+  ExecutionProjector,
+  type ExecutionProjection,
+} from "../projection/execution-projector.js";
 import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
@@ -69,6 +74,7 @@ function configureEngine(
   readonly fingerprintRegistry: FingerprintRegistry;
   readonly replayGuard: ReplayGuard;
   readonly worker: MCodeAdapter;
+  readonly projectionDatabase?: StateDatabase;
 } {
   const workspaceRegistry = new WorkspaceRegistry();
   for (const workspace of config.workspaces) {
@@ -90,6 +96,19 @@ function configureEngine(
     });
   }
   const stateRoot = stateRootForConfig(config);
+  let projectionDatabase: StateDatabase | undefined;
+  let projection: ExecutionProjection;
+  try {
+    projectionDatabase = new StateDatabase(join(stateRoot, "g2m-state.sqlite"));
+    projection = new ExecutionProjector(projectionDatabase);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    projection = {
+      project() {
+        throw new Error(`projection unavailable: ${reason}`);
+      },
+    };
+  }
   const eventStore = new EventStore({
     executionDirectory: join(stateRoot, "executions"),
   });
@@ -104,6 +123,7 @@ function configureEngine(
     profileRegistry,
     evidenceStore,
     eventStore,
+    projection,
     fingerprintRegistry,
     replayGuard,
     worker,
@@ -119,6 +139,7 @@ function configureEngine(
     fingerprintRegistry,
     replayGuard,
     worker,
+    ...(projectionDatabase !== undefined ? { projectionDatabase } : {}),
   };
 }
 
@@ -149,17 +170,19 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
   const config = await loadConfig(configPath);
   const previousMCodePath = process.env["G2M_MCODE_PATH"];
   let eventStoreToClose: EventStore | undefined;
+  let projectionDatabaseToClose: StateDatabase | undefined;
   if (config.mcode_path !== undefined) process.env["G2M_MCODE_PATH"] = config.mcode_path;
 
   try {
     const worker = new MCodeAdapter();
     const runtime = await worker.probe();
-    const { engine, eventStore, evidenceStore } = configureEngine(
+    const { engine, eventStore, evidenceStore, projectionDatabase } = configureEngine(
       config,
       worker,
       runtime.version ?? "unknown",
     );
     eventStoreToClose = eventStore;
+    projectionDatabaseToClose = projectionDatabase;
     emit({ type: "g2m.runtime.ready", runtime });
     const pending = await engine.execute(await readJson(taskPath));
     const runRoot = resolve(config.artifact_root, pending.executionId);
@@ -190,6 +213,7 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
     emit({ type: "g2m.completed", outcome_path: outcomePath, ...completed });
   } finally {
     eventStoreToClose?.close();
+    projectionDatabaseToClose?.close();
     if (previousMCodePath === undefined) delete process.env["G2M_MCODE_PATH"];
     else process.env["G2M_MCODE_PATH"] = previousMCodePath;
   }

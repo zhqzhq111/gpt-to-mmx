@@ -1,0 +1,100 @@
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import {
+  DatabaseSync,
+  type SQLInputValue,
+  type StatementSync,
+} from "node:sqlite";
+
+import {
+  FROZEN_SCHEMA_SQL,
+  PROJECTION_SCHEMA_VERSION,
+} from "./schema.js";
+
+export class ProjectionDatabaseError extends Error {
+  override readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "ProjectionDatabaseError";
+    this.cause = cause;
+  }
+}
+
+export class StateDatabase {
+  private readonly database: DatabaseSync;
+  private closed = false;
+
+  constructor(readonly path: string) {
+    try {
+      if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+      this.database = new DatabaseSync(path, { timeout: 5_000 });
+      this.database.exec("PRAGMA journal_mode = WAL");
+      this.database.exec("PRAGMA synchronous = NORMAL");
+      this.database.exec("PRAGMA busy_timeout = 5000");
+      this.database.exec(FROZEN_SCHEMA_SQL);
+      this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
+    } catch (error) {
+      throw new ProjectionDatabaseError(`cannot open projection database: ${path}`, error);
+    }
+  }
+
+  prepare(sql: string): StatementSync {
+    return this.database.prepare(sql);
+  }
+
+  exec(sql: string): void {
+    this.database.exec(sql);
+  }
+
+  run(sql: string, ...parameters: SQLInputValue[]): void {
+    this.database.prepare(sql).run(...parameters);
+  }
+
+  pragma(name: "journal_mode" | "synchronous" | "busy_timeout"): string | number | bigint | null {
+    const row = this.database.prepare(`PRAGMA ${name}`).get() as
+      | Record<string, string | number | bigint | null>
+      | undefined;
+    const resultKey = name === "busy_timeout" ? "timeout" : name;
+    return row?.[resultKey] ?? null;
+  }
+
+  tableNames(): readonly string[] {
+    const rows = this.database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+    ).all() as Array<{ name: string }>;
+    return rows.map((row) => row.name);
+  }
+
+  getMeta(key: string): string | undefined {
+    const row = this.database.prepare(
+      "SELECT value FROM projection_meta WHERE key = ?",
+    ).get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.database.prepare(`
+      INSERT INTO projection_meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value);
+  }
+
+  transaction<T>(operation: () => T): T {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.database.close();
+    this.closed = true;
+  }
+}
