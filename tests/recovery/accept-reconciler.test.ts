@@ -9,7 +9,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -83,7 +83,9 @@ interface Fixture {
   database?: StateDatabase;
 }
 
-async function makeFixture(setup: "clean" | "applied" | "partial-extra" | "mid-apply"): Promise<Fixture> {
+async function makeFixture(
+  setup: "clean" | "applied" | "partial-extra" | "mid-apply" | "evidence-only-orphan" | "clean-with-evidence" | "orphan-semantic-mismatch",
+): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "g2m-accept-reconciler-"));
   roots.push(root);
   const repositoryPath = join(root, "repo");
@@ -243,11 +245,9 @@ async function makeFixture(setup: "clean" | "applied" | "partial-extra" | "mid-a
   await writeFile(join(executionArtifact, "review.json"), reviewJsonBytes);
   const reviewArtifactHash = sha256Hex(reviewJsonBytes);
 
-  if (setup === "applied") {
-    // P0#2: pre-apply the patch so target == EXACT_EXPECTED_CHANGE_SET.
-    // The apply-evidence.json and outcome.json artifacts are also on
-    // disk because the normal path writes them between `git apply` and
-    // `patch.applied`. The reconciler must verify, not overwrite.
+  if (setup === "applied" || setup === "evidence-only-orphan" || setup === "orphan-semantic-mismatch") {
+    // P0#2 / Phase 6.2: pre-apply the patch so target ==
+    // EXACT_EXPECTED_CHANGE_SET.
     await git(repositoryPath, ["apply", "--binary", join(executionArtifact, "frozen.patch")]);
   } else if (setup === "mid-apply") {
     // P0#1: pre-apply the patch so target == EXACT_EXPECTED_CHANGE_SET,
@@ -261,6 +261,9 @@ async function makeFixture(setup: "clean" | "applied" | "partial-extra" | "mid-a
     await git(repositoryPath, ["apply", "--binary", join(executionArtifact, "frozen.patch")]);
     await writeFile(join(repositoryPath, "user-note.txt"), "unrelated\n", "utf8");
   }
+  // For "clean-with-evidence" the target is CLEAN_BASE; the
+  // apply-evidence.json is written later (after the setup returns) by
+  // the test itself, to keep the fixture focused on the patch data.
 
   // In `applied` mode the immutable apply-evidence.json and outcome.json
   // artifacts are also on disk (P0#2). We compute the SAME bytes the
@@ -299,6 +302,41 @@ async function makeFixture(setup: "clean" | "applied" | "partial-extra" | "mid-a
     const outcomeBytes = Buffer.from(JSON.stringify(outcomePayload, null, 2) + "\n", "utf8");
     outcomeHash = sha256Hex(outcomeBytes);
     await writeFile(join(executionArtifact, "outcome.json"), outcomeBytes);
+  } else if (setup === "evidence-only-orphan" || setup === "orphan-semantic-mismatch") {
+    // Phase 6.2: pre-write only apply-evidence.json (no outcome.json),
+    // simulating a crash between `git apply`/`writeImmutableArtifact`
+    // and the outcome write. The evidence's `recovery_mode=false` and
+    // `applied_at=<non-zero>` legitimately differ from what Recovery
+    // would synthesize; the test verifies Recovery preserves the bytes.
+    const evidencePayload = setup === "orphan-semantic-mismatch"
+      ? {
+          // Wrong execution_id — Recovery must refuse.
+          schema_version: 1,
+          execution_id: "wrong-exec",
+          patch_blob_hash: patchBlobHash,
+          expected_change_set_hash: changeSetHash,
+          actual_change_set_hash: changeSetHash,
+          base_revision: baseRevision,
+          target_path: repositoryPath,
+          status: "applied",
+          recovery_mode: false,
+          applied_at: 1234,
+        }
+      : {
+          schema_version: 1,
+          execution_id: executionId,
+          patch_blob_hash: patchBlobHash,
+          expected_change_set_hash: changeSetHash,
+          actual_change_set_hash: changeSetHash,
+          base_revision: baseRevision,
+          target_path: repositoryPath,
+          status: "applied",
+          recovery_mode: false,
+          applied_at: 1234,
+        };
+    const evidenceBytes = Buffer.from(JSON.stringify(evidencePayload, null, 2) + "\n", "utf8");
+    applyEvidenceHash = sha256Hex(evidenceBytes);
+    await writeFile(join(executionArtifact, "apply-evidence.json"), evidenceBytes);
   }
 
   return {
@@ -896,5 +934,114 @@ describe("Accept Reconciler", () => {
     expect(stale).toBeDefined();
     expect((stale?.payload as { failed_event_hash?: string }).failed_event_hash).toBe(required?.hash);
     expect((stale?.payload as { reason?: string }).reason).toMatch(/simulated projection failure/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 6.2 — Orphan pre-commit artifact recovery.
+  //
+  // The normal ACCEPT order is:
+  //   git apply -> apply-evidence.json -> outcome.json -> patch.applied
+  // A crash anywhere in the middle leaves the Journal in
+  // ACCEPT_PREPARED + apply.started while one or both pre-commit
+  // artifacts are already on disk. Recovery must preserve the
+  // existing bytes (audit fields like recovery_mode / applied_at
+  // legitimately differ) and finish the journal using their hashes.
+  // ---------------------------------------------------------------------------
+  it("Phase 6.2: orphan apply-evidence.json (no outcome.json) is preserved; outcome is created; ACCEPTED", async () => {
+    const fixture = await makeFixture("evidence-only-orphan");
+    const evidencePath = join(fixture.artifactRoot, "exec-1", "apply-evidence.json");
+    const outcomePath = join(fixture.artifactRoot, "exec-1", "outcome.json");
+    const evidenceBefore = readFileSync(evidencePath);
+    const evidenceHashBefore = sha256Hex(evidenceBefore);
+    const events = buildBaseEvents(fixture, true); // include apply.started
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECONCILED_AND_ACCEPTED");
+    expect(result.targetState).toBe("EXACT_EXPECTED_CHANGE_SET");
+    expect(result.appendedEvents).toEqual(["patch.applied", "review.accept.completed"]);
+    // The pre-existing evidence bytes are preserved byte-for-byte.
+    expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+    expect(sha256Hex(readFileSync(evidencePath))).toBe(evidenceHashBefore);
+    // Recovery bound the existing evidence hash in the journal event.
+    expect(result.applyEvidenceHash).toBe(evidenceHashBefore);
+    // The outcome was newly created and bound to the journal.
+    expect(result.outcomeHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(existsSync(outcomePath)).toBe(true);
+  });
+
+  it("Phase 6.2: orphan apply-evidence.json + outcome.json (both pre-exist) are preserved; only journal appended", async () => {
+    const fixture = await makeFixture("applied"); // both artifacts already on disk
+    const events = buildBaseEvents(fixture, true); // include apply.started
+    // No `patch.applied` event — simulates a crash after outcome.json,
+    // before patch.applied.
+    const evidencePath = join(fixture.artifactRoot, "exec-1", "apply-evidence.json");
+    const outcomePath = join(fixture.artifactRoot, "exec-1", "outcome.json");
+    const evidenceBefore = readFileSync(evidencePath);
+    const outcomeBefore = readFileSync(outcomePath);
+    const evidenceHashBefore = sha256Hex(evidenceBefore);
+    const outcomeHashBefore = sha256Hex(outcomeBefore);
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECONCILED_AND_ACCEPTED");
+    expect(result.appendedEvents).toEqual(["patch.applied", "review.accept.completed"]);
+    // Both artifacts preserved byte-for-byte.
+    expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+    expect(readFileSync(outcomePath)).toEqual(outcomeBefore);
+    expect(result.applyEvidenceHash).toBe(evidenceHashBefore);
+    expect(result.outcomeHash).toBe(outcomeHashBefore);
+  });
+
+  it("Phase 6.2: CLEAN_BASE + existing apply-evidence.json refuses to re-apply (RECOVERY_REQUIRED)", async () => {
+    const fixture = await makeFixture("clean-with-evidence");
+    // Write apply-evidence.json even though the target is CLEAN_BASE.
+    // This simulates an external `git reset --hard` / `git checkout`
+    // that undid the previous apply after the evidence was written.
+    const evidencePayload = {
+      schema_version: 1,
+      execution_id: "exec-1",
+      patch_blob_hash: fixture.patchBlobHash,
+      expected_change_set_hash: fixture.changeSetHash,
+      actual_change_set_hash: fixture.changeSetHash,
+      base_revision: fixture.baseRevision,
+      target_path: fixture.repositoryPath,
+      status: "applied",
+      recovery_mode: false,
+      applied_at: 1234,
+    };
+    await writeFile(
+      join(fixture.artifactRoot, "exec-1", "apply-evidence.json"),
+      Buffer.from(JSON.stringify(evidencePayload, null, 2) + "\n", "utf8"),
+    );
+    const events = buildBaseEvents(fixture, false);
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.targetState).toBe("CLEAN_BASE");
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
+    // CRITICAL: `git apply` must NOT have been called — the target is
+    // still CLEAN_BASE.
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
+      cwd: fixture.repositoryPath, windowsHide: true, shell: false,
+    });
+    expect(stdout.trim()).toBe("");
+  });
+
+  it("Phase 6.2: orphan apply-evidence.json with semantic mismatch refuses (RECOVERY_REQUIRED)", async () => {
+    const fixture = await makeFixture("orphan-semantic-mismatch");
+    // The fixture pre-wrote apply-evidence.json with execution_id
+    // "wrong-exec" — a semantic mismatch Recovery must catch.
+    const events = buildBaseEvents(fixture, true); // include apply.started
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.targetState).toBe("EXACT_EXPECTED_CHANGE_SET");
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const required = persisted.find((event) => event.type === "recovery.required");
+    expect(required).toBeDefined();
+    expect((required?.payload as { reason?: string }).reason).toMatch(/orphan artifact check|execution_id/);
   });
 });

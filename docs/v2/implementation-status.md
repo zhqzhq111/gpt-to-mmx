@@ -590,12 +590,36 @@ without blocking unrelated workspaces (plan §40-§42).
   - P1#1 — every `RECOVERY_REQUIRED` verdict whose previous process
     is gone is also persisted to the Journal as `recovery.required`
     (CRITICAL), so the safe-hold is durable, not just a string
-    returned to the caller.
+    returned to the caller. Phase 6.1 unifies every proven-gone
+    failure path (missing prepared binding, missing
+    `review_bundle_hash`, verify* failures, classifyTarget failure,
+    HEAD_MOVED, DIVERGED, …) through a single `failAcceptRecovery`
+    helper. Projection failure during the helper now appends
+    `projection.stale` (mirroring `appendReduceProject`) instead of
+    being silently swallowed. The three zero-mutation early-exits
+    (ALREADY_ACCEPTED, PROCESS_NOT_PROVEN_GONE, NOT_PARTIAL_ACCEPT)
+    are explicitly excluded from this helper, per plan §19.
   - P1#2 — the projection's `artifact_path` is now
     `<artifactRoot>/<executionId>` (absolute), passed explicitly into
     `appendReduceProject`. Previously it was `attemptId` alone, which
     produced a relative path that did not match the actual artifact
     directory.
+  - Phase 6.2 — orphan pre-commit artifact recovery. The normal
+    ACCEPT order writes `apply-evidence.json` then `outcome.json`
+    then `patch.applied`. A crash anywhere in the middle used to be
+    ambiguous: the pre-existing artifact's `recovery_mode: false` and
+    `applied_at: <real ts>` legitimately differ from what Recovery
+    would synthesize, so a byte-equality check would wrongly refuse.
+    The reconciler now classifies the on-disk state into
+    `both_missing` / `evidence_only` / `both_present` /
+    `order_violation` / `semantic_mismatch`. The first three reuse
+    the existing artifact bytes (preserving the audit fields) and
+    bind their exact SHA-256 in the journal. The last two
+    → `RECOVERY_REQUIRED`. Case A (RESUMED) additionally refuses to
+    re-apply when `apply-evidence.json` is already on disk while the
+    target is `CLEAN_BASE` — the previous apply was externally undone,
+    so re-applying would silently clobber a workspace the user has
+    already modified.
 - `src/recovery/scanner.ts` — added `PARTIAL_ACCEPT_APPLY_STARTED` to
   `RecoveryIssueKind` and `ISSUE_PRIORITY`, and tightened the
   partial-accept classifier so it now reports
@@ -649,13 +673,21 @@ validateReview → freeze review.json → review.accept.prepared (CRITICAL)
 → ReplayGuard.record (AFTER journal) → best-effort worktree cleanup.
 ```
 
-### Recovery disposition table (plan §20-§25)
+### Recovery disposition table (plan §20-§25 + Phase 6.2)
 
 ```
 state              target                    verdict
 ACCEPT_PREPARED    CLEAN_BASE                RESUMED_AND_ACCEPTED
-ACCEPT_PREPARED +  EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED (P0#1)
-  apply.started       (no re-apply; freeze artifacts, finish journal)
+                       (no apply-evidence.json on disk; git apply re-runs)
+ACCEPT_PREPARED    CLEAN_BASE                RECOVERY_REQUIRED (Phase 6.2)
+                       (apply-evidence.json exists; workspace externally
+                        modified after previous apply; operator decision)
+ACCEPT_PREPARED +  EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED (P0#1 +
+  apply.started                                    Phase 6.2 orphan)
+  - both_missing:  create both recovery artifacts
+  - evidence_only: preserve evidence; create outcome
+  - both_present:  preserve both; reuse their hashes
+  - order_violation / semantic_mismatch: RECOVERY_REQUIRED
 PATCH_APPLIED      EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED (P0#2)
                        (verify-only; never overwrite artifacts)
 ACCEPT_PREPARED    EXACT_EXPECTED_CHANGE_SET RECOVERY_REQUIRED
@@ -669,17 +701,22 @@ any                review.accept.completed   ALREADY_ACCEPTED (no-op)
 ```
 
 Every `RECOVERY_REQUIRED` verdict with a proven-gone process is also
-persisted to the Journal as `recovery.required` (CRITICAL, P1#1). The
-safe-hold is durable, not just a string returned to the caller.
+persisted to the Journal as `recovery.required` (CRITICAL, P1#1 +
+Phase 6.1 unified helper). The safe-hold is durable, not just a
+string returned to the caller.
 
 ### Verification
 
 - `npm run typecheck` → exit 0.
 - `npm run build` → exit 0.
-- `npm test` → **425 passed, 5 skipped, 0 failed** across **38 test files
-  passed and 3 skipped** (10 new tests in
-  `tests/recovery/accept-reconciler.test.ts` cover the disposition table,
-  frozen-patch tampering, review.json tampering, and idempotent recovery).
+- `npm test` → **438 passed, 5 skipped, 0 failed** across **38 test files
+  passed and 3 skipped** (20 new tests in
+  `tests/recovery/accept-reconciler.test.ts` cover the full disposition
+  table, frozen-patch tampering, review.json tampering, idempotent
+  recovery, P0#1 / P0#2 / P1#1 / Phase 6.1 unified safe-hold, and
+  Phase 6.2 orphan pre-commit artifact handling; 2 new tests in
+  `tests/workspace/worktree.test.ts` cover P0#3 stdin apply and P0#4
+  full change set).
 - The five pre-existing real-mcode skips remain unchanged.
 
 ## Remaining phases

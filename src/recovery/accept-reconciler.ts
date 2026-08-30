@@ -482,6 +482,211 @@ type VerifyApplyArtifactsResult =
   | { readonly kind: "mismatch"; readonly detail: string };
 
 /**
+ * Phase 6.2 — Orphan pre-commit artifact recovery.
+ *
+ * The normal ACCEPT path writes artifacts in this order:
+ *
+ *   git apply
+ *   ↓
+ *   apply-evidence.json
+ *   ↓
+ *   outcome.json
+ *   ↓
+ *   patch.applied
+ *   ↓
+ *   review.accept.completed
+ *
+ * A crash after `apply-evidence.json` but before `patch.applied` (or
+ * after `outcome.json` but before `patch.applied`) leaves the Journal
+ * in `ACCEPT_PREPARED + apply.started` while one or both pre-commit
+ * artifacts are already on disk. We must NOT overwrite them with
+ * Recovery's own `recovery_mode: true / applied_at: 0` bytes — that
+ * would lose the original `applied_at` timestamp and corrupt the
+ * `recovery_mode` audit field.
+ *
+ * The helper below classifies the on-disk state into one of five
+ * outcomes:
+ *
+ *   - both_missing         → Recovery creates both (legacy Case A')
+ *   - both_present         → Preserve BOTH bytes; reuse their hashes
+ *                             in the journal event bindings
+ *   - evidence_only        → Preserve the evidence; Recovery creates
+ *                             outcome with recovery_mode=true (writes
+ *                             only the missing one)
+ *   - order_violation      → outcome.json exists without evidence
+ *                             (impossible under the normal path) →
+ *                             RECOVERY_REQUIRED
+ *   - semantic_mismatch    → Existing artifact's binding does not
+ *                             match the prepared event / current
+ *                             target full change set → RECOVERY_REQUIRED
+ *
+ * `recovery_mode` and `applied_at` are intentionally NOT compared —
+ * they are audit fields that legitimately differ between the normal
+ * path and Recovery.
+ */
+type OrphanApplyArtifactsResult =
+  | { readonly kind: "both_missing" }
+  | {
+      readonly kind: "both_present";
+      readonly evidenceHash: string;
+      readonly evidenceBytes: number;
+      readonly outcomeHash: string;
+      readonly outcomeBytes: number;
+    }
+  | {
+      readonly kind: "evidence_only";
+      readonly evidenceHash: string;
+      readonly evidenceBytes: number;
+    }
+  | { readonly kind: "order_violation"; readonly detail: string }
+  | { readonly kind: "semantic_mismatch"; readonly detail: string };
+
+function readJsonArtifact(path: string): Record<string, unknown> | undefined {
+  const bytes = readOptionalFile(path);
+  if (bytes === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(bytes.toString("utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function verifyApplyEvidenceSemantic(
+  artifact: Record<string, unknown>,
+  executionId: string,
+  bindings: PreparedBindings,
+  repositoryPath: string,
+  targetFullChangeSetHash: string,
+): { readonly ok: true; readonly bytes: number; readonly hash: string } | { readonly ok: false; readonly detail: string } {
+  const path = resolve(repositoryPath, "<memory>"); // not used; path is implicit in bytes
+  void path;
+  if (artifact["schema_version"] !== 1) {
+    return { ok: false, detail: "apply-evidence.json schema_version is not 1" };
+  }
+  if (artifact["execution_id"] !== executionId) {
+    return { ok: false, detail: `apply-evidence.json execution_id ${String(artifact["execution_id"])} != ${executionId}` };
+  }
+  if (artifact["patch_blob_hash"] !== bindings.patchBlobHash) {
+    return { ok: false, detail: `apply-evidence.json patch_blob_hash ${String(artifact["patch_blob_hash"])} != ${bindings.patchBlobHash}` };
+  }
+  if (artifact["expected_change_set_hash"] !== bindings.changeSetHash) {
+    return { ok: false, detail: "apply-evidence.json expected_change_set_hash does not match review.accept.prepared" };
+  }
+  if (artifact["actual_change_set_hash"] !== bindings.changeSetHash) {
+    return { ok: false, detail: "apply-evidence.json actual_change_set_hash does not match the prepared change set" };
+  }
+  if (artifact["actual_change_set_hash"] !== targetFullChangeSetHash) {
+    return { ok: false, detail: "apply-evidence.json actual_change_set_hash does not match the current target full change set" };
+  }
+  if (artifact["base_revision"] !== bindings.baseRevision) {
+    return { ok: false, detail: `apply-evidence.json base_revision ${String(artifact["base_revision"])} != ${bindings.baseRevision}` };
+  }
+  return { ok: true, bytes: 0, hash: "" };
+}
+
+function verifyOutcomeSemantic(
+  artifact: Record<string, unknown>,
+  executionId: string,
+  bindings: PreparedBindings,
+): { readonly ok: true; readonly bytes: number; readonly hash: string } | { readonly ok: false; readonly detail: string } {
+  if (artifact["schema_version"] !== 1) {
+    return { ok: false, detail: "outcome.json schema_version is not 1" };
+  }
+  if (artifact["task_id"] !== bindings.taskId) {
+    return { ok: false, detail: `outcome.json task_id ${String(artifact["task_id"])} != ${bindings.taskId}` };
+  }
+  if (artifact["execution_id"] !== executionId) {
+    return { ok: false, detail: `outcome.json execution_id ${String(artifact["execution_id"])} != ${executionId}` };
+  }
+  if (artifact["decision"] !== "ACCEPT") {
+    return { ok: false, detail: `outcome.json decision ${String(artifact["decision"])} != ACCEPT` };
+  }
+  if (artifact["state"] !== "ACCEPTED") {
+    return { ok: false, detail: `outcome.json state ${String(artifact["state"])} != ACCEPTED` };
+  }
+  if (artifact["patch_blob_hash"] !== bindings.patchBlobHash) {
+    return { ok: false, detail: `outcome.json patch_blob_hash ${String(artifact["patch_blob_hash"])} != ${bindings.patchBlobHash}` };
+  }
+  if (artifact["change_set_hash"] !== bindings.changeSetHash) {
+    return { ok: false, detail: "outcome.json change_set_hash does not match review.accept.prepared" };
+  }
+  if (artifact["review_id"] !== bindings.reviewId) {
+    return { ok: false, detail: `outcome.json review_id ${String(artifact["review_id"])} != ${bindings.reviewId}` };
+  }
+  if (artifact["review_bundle_id"] !== bindings.reviewBundleId) {
+    return { ok: false, detail: `outcome.json review_bundle_id ${String(artifact["review_bundle_id"])} != ${bindings.reviewBundleId}` };
+  }
+  return { ok: true, bytes: 0, hash: "" };
+}
+
+function classifyOrphanApplyArtifacts(
+  artifactRoot: string,
+  executionId: string,
+  bindings: PreparedBindings,
+  repositoryPath: string,
+  targetFullChangeSetHash: string,
+): OrphanApplyArtifactsResult {
+  const evidencePath = resolve(artifactRoot, executionId, "apply-evidence.json");
+  const outcomePath = resolve(artifactRoot, executionId, "outcome.json");
+  const evidenceBytes = readOptionalFile(evidencePath);
+  const outcomeBytes = readOptionalFile(outcomePath);
+  if (evidenceBytes === undefined && outcomeBytes === undefined) {
+    return { kind: "both_missing" };
+  }
+  if (evidenceBytes === undefined && outcomeBytes !== undefined) {
+    return {
+      kind: "order_violation",
+      detail: "outcome.json exists without apply-evidence.json (impossible under the normal path)",
+    };
+  }
+  if (evidenceBytes !== undefined && outcomeBytes === undefined) {
+    const evidenceArtifact = readJsonArtifact(evidencePath);
+    if (evidenceArtifact === undefined) {
+      return { kind: "semantic_mismatch", detail: "apply-evidence.json is not valid JSON" };
+    }
+    const evidenceCheck = verifyApplyEvidenceSemantic(evidenceArtifact, executionId, bindings, repositoryPath, targetFullChangeSetHash);
+    if (!evidenceCheck.ok) {
+      return { kind: "semantic_mismatch", detail: evidenceCheck.detail };
+    }
+    return {
+      kind: "evidence_only",
+      evidenceHash: sha256(evidenceBytes),
+      evidenceBytes: evidenceBytes.length,
+    };
+  }
+  // both present
+  const evidenceArtifact = readJsonArtifact(evidencePath);
+  const outcomeArtifact = readJsonArtifact(outcomePath);
+  if (evidenceArtifact === undefined) {
+    return { kind: "semantic_mismatch", detail: "apply-evidence.json is not valid JSON" };
+  }
+  if (outcomeArtifact === undefined) {
+    return { kind: "semantic_mismatch", detail: "outcome.json is not valid JSON" };
+  }
+  const evidenceCheck = verifyApplyEvidenceSemantic(evidenceArtifact, executionId, bindings, repositoryPath, targetFullChangeSetHash);
+  if (!evidenceCheck.ok) {
+    return { kind: "semantic_mismatch", detail: evidenceCheck.detail };
+  }
+  const outcomeCheck = verifyOutcomeSemantic(outcomeArtifact, executionId, bindings);
+  if (!outcomeCheck.ok) {
+    return { kind: "semantic_mismatch", detail: outcomeCheck.detail };
+  }
+  if (evidenceBytes === undefined || outcomeBytes === undefined) {
+    // Defensive: the `readOptionalFile` calls above already proved these are defined.
+    return { kind: "semantic_mismatch", detail: "internal: artifact bytes disappeared" };
+  }
+  return {
+    kind: "both_present",
+    evidenceHash: sha256(evidenceBytes),
+    evidenceBytes: evidenceBytes.length,
+    outcomeHash: sha256(outcomeBytes),
+    outcomeBytes: outcomeBytes.length,
+  };
+}
+
+/**
  * P0#2: the artifacts on disk are the immutable evidence. Read them,
  * hash them, and require their hashes to match the `patch.applied`
  * payload. We never overwrite.
@@ -821,7 +1026,23 @@ export async function runAcceptRecovery(
   // Journal tail stopped before `patch.apply.started` and the target
   // workspace is still at the frozen base. The Frozen Patch was never
   // applied, so we re-apply and complete ACCEPT.
+  //
+  // Phase 6.2 safety: if `apply-evidence.json` is already on disk
+  // while the target is CLEAN_BASE, the previous apply result has
+  // been externally undone (someone ran `git reset --hard` /
+  // `git checkout` / `git clean` after the apply). We must NOT
+  // silently re-apply — the journal is no longer consistent with the
+  // workspace. Refuse with RECOVERY_REQUIRED.
   if (originalState === "ACCEPT_PREPARED" && target.state === "CLEAN_BASE") {
+    const existingEvidence = readOptionalFile(
+      resolve(input.artifactRoot, input.executionId, "apply-evidence.json"),
+    );
+    if (existingEvidence !== undefined) {
+      return await failAcceptRecovery(input, base, mutable, {
+        targetState: "CLEAN_BASE",
+        reason: "apply-evidence.json already exists while target is CLEAN_BASE; workspace was externally modified after the previous apply — operator decision required",
+      });
+    }
     if (!applyStarted) {
       appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
         taskId: bindings.taskId,
@@ -900,37 +1121,85 @@ export async function runAcceptRecovery(
     };
   }
 
-  // --- Case A' (P0#1): ACCEPT_PREPARED + apply.started EXISTS + EXACT → RECONCILED_AND_ACCEPTED ---
+  // --- Case A' (P0#1 + Phase 6.2): ACCEPT_PREPARED + apply.started + EXACT ---
   // The crash happened AFTER `git apply` succeeded but BEFORE
-  // `patch.applied` / `review.accept.completed` were written. The Frozen
-  // Patch bytes are already on disk, the target matches, and the
-  // Journal proves G2M started the apply. We freeze the missing
-  // artifacts (defensively — they may already exist with the same
-  // bytes) and finish the journal WITHOUT re-running `git apply`.
+  // `patch.applied` / `review.accept.completed` were written. The
+  // target is `EXACT_EXPECTED_CHANGE_SET` and the Journal proves G2M
+  // started the apply.
+  //
+  // Phase 6.2: any of the four pre-commit artifact states is now
+  // handled:
+  //   - both_missing   → freeze both (recovery_mode=true)
+  //   - evidence_only  → preserve the evidence bytes; create outcome
+  //   - both_present   → preserve both bytes; reuse their hashes
+  //   - order_violation / semantic_mismatch → RECOVERY_REQUIRED
+  // We never overwrite pre-existing bytes.
   if (
     originalState === "ACCEPT_PREPARED" &&
     applyStarted &&
     target.state === "EXACT_EXPECTED_CHANGE_SET"
   ) {
-    const applied = synthesizeAppliedFromTarget(bindings, input.repositoryPath, target.actualChangeSetHash);
-    const { evidenceArtifact, outcomeArtifact } = await freezeApplyArtifacts(
+    const orphan = classifyOrphanApplyArtifacts(
       input.artifactRoot,
       input.executionId,
-      buildApplyEvidence(input.executionId, bindings.baseRevision, applied, true),
-      buildOutcome(input.executionId, bindings, applied),
+      bindings,
+      input.repositoryPath,
+      target.actualChangeSetHash,
     );
+    if (orphan.kind === "order_violation" || orphan.kind === "semantic_mismatch") {
+      return await failAcceptRecovery(input, base, mutable, {
+        targetState: "EXACT_EXPECTED_CHANGE_SET",
+        reason: `orphan artifact check: ${orphan.detail}`,
+      });
+    }
+
+    // Resolve the artifact hashes we will bind in patch.applied.
+    let evidenceHash: string;
+    let outcomeHash: string;
+    if (orphan.kind === "both_missing") {
+      const applied = synthesizeAppliedFromTarget(bindings, input.repositoryPath, target.actualChangeSetHash);
+      const written = await freezeApplyArtifacts(
+        input.artifactRoot,
+        input.executionId,
+        buildApplyEvidence(input.executionId, bindings.baseRevision, applied, true),
+        buildOutcome(input.executionId, bindings, applied),
+      );
+      evidenceHash = written.evidenceArtifact.sha256;
+      outcomeHash = written.outcomeArtifact.sha256;
+    } else if (orphan.kind === "evidence_only") {
+      // Preserve the on-disk evidence bytes; create only the missing
+      // outcome. The outcome's audit fields (recovery_mode / applied_at)
+      // legitimately differ from a normal-path write; the evidence is
+      // untouched. We do NOT call `freezeApplyArtifacts` here because
+      // that helper would also try to write the (already-present)
+      // evidence and `freezeOrVerify` would reject the bytes (the
+      // normal-path `recovery_mode: false` differs from Recovery's
+      // `recovery_mode: true`).
+      const applied = synthesizeAppliedFromTarget(bindings, input.repositoryPath, target.actualChangeSetHash);
+      const outcomePath = resolve(input.artifactRoot, input.executionId, "outcome.json");
+      const outcomePayload = buildOutcome(input.executionId, bindings, applied);
+      const outcomeBytes = Buffer.from(`${JSON.stringify(outcomePayload, null, 2)}\n`, "utf8");
+      const outcomeWrite = await writeImmutableArtifact(outcomePath, outcomeBytes);
+      evidenceHash = orphan.evidenceHash;
+      outcomeHash = outcomeWrite.sha256;
+    } else {
+      // both_present — reuse the exact existing hashes.
+      evidenceHash = orphan.evidenceHash;
+      outcomeHash = orphan.outcomeHash;
+    }
+
     appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
       taskId: bindings.taskId,
       executionId: input.executionId,
       type: "patch.applied",
       payload: {
-        patch_blob_hash: applied.patchBlobHash,
-        expected_change_set_hash: applied.expectedChangeSetHash,
-        actual_change_set_hash: applied.actualChangeSetHash,
-        apply_evidence_hash: evidenceArtifact.sha256,
-        outcome_hash: outcomeArtifact.sha256,
-        status: applied.status,
-        targetPath: applied.targetPath,
+        patch_blob_hash: bindings.patchBlobHash,
+        expected_change_set_hash: bindings.changeSetHash,
+        actual_change_set_hash: target.actualChangeSetHash,
+        apply_evidence_hash: evidenceHash,
+        outcome_hash: outcomeHash,
+        status: "applied",
+        targetPath: input.repositoryPath,
       },
     });
     appended.push("patch.applied");
@@ -942,24 +1211,29 @@ export async function runAcceptRecovery(
         reviewId: bindings.reviewId,
         reviewBundleId: bindings.reviewBundleId,
         reviewHash: bindings.reviewHash,
-        patch_blob_hash: applied.patchBlobHash,
+        patch_blob_hash: bindings.patchBlobHash,
         change_set_hash: bindings.changeSetHash,
-        apply_evidence_hash: evidenceArtifact.sha256,
-        outcome_hash: outcomeArtifact.sha256,
+        apply_evidence_hash: evidenceHash,
+        outcome_hash: outcomeHash,
       },
     });
     appended.push("review.accept.completed");
     input.replayGuard.record(signature);
+    const reason = orphan.kind === "both_missing"
+      ? "target already matches the frozen change set after apply.started; created missing artifacts and finished journal without re-apply"
+      : orphan.kind === "evidence_only"
+        ? "preserved pre-existing apply-evidence.json; created missing outcome.json and finished journal"
+        : "preserved pre-existing apply-evidence.json and outcome.json; finished journal using their existing hashes";
     return {
       verdict: "RECONCILED_AND_ACCEPTED",
       executionId: input.executionId,
       originalState: "ACCEPT_PREPARED",
       finalState: "ACCEPTED",
       targetState: "EXACT_EXPECTED_CHANGE_SET",
-      reason: "target already matches the frozen change set after apply.started; finished journal without re-apply",
+      reason,
       appendedEvents: appended,
-      applyEvidenceHash: evidenceArtifact.sha256,
-      outcomeHash: outcomeArtifact.sha256,
+      applyEvidenceHash: evidenceHash,
+      outcomeHash,
     };
   }
 
