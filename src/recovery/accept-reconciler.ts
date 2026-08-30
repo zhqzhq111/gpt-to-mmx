@@ -518,11 +518,20 @@ function verifyExistingApplyArtifacts(
 }
 
 /**
- * P1#1: when the previous process is gone and the target is in an
- * unrecoverable state, persist `recovery.required` to the Journal so the
- * safe-hold is durable, not just a string returned to the caller.
+ * Phase 6.1: unified failure path for the Accept Reconciler. Every
+ * proven-gone + unrecoverable branch (missing prepared event, missing
+ * review_bundle_hash, frozen.patch / review.json / review-bundle hash
+ * mismatch, classifyTarget failure, HEAD_MOVED, DIVERGED, artifact
+ * mismatch, apply failure, …) routes through this helper. The
+ * `recovery.required` event is durable on disk BEFORE the projector
+ * runs; if projection throws, `projection.stale` is appended so the
+ * durable fact survives (mirrors `appendReduceProject`).
+ *
+ * `processStatus ∈ {alive, unknown}` branches MUST NOT call this helper
+ * — they return without mutating Journal, ReplayGuard, or the
+ * projection. See the early-exit block at the top of `runAcceptRecovery`.
  */
-async function persistRecoveryRequired(
+async function failAcceptRecovery(
   input: AcceptRecoveryInput,
   base: AcceptRecoveryResult,
   mutable: MutableState,
@@ -546,8 +555,20 @@ async function persistRecoveryRequired(
     input.projector.project(recoveryEvent, next, {
       artifactPath: resolve(input.artifactRoot, input.executionId),
     });
-  } catch {
-    // swallow; the CRITICAL recovery.required event itself is durable
+  } catch (error) {
+    // Phase 6.1: same rule as `appendReduceProject` — a CRITICAL
+    // barrier that survives projection failure MUST leave a
+    // `projection.stale` marker, not silently swallow.
+    input.eventStore.append({
+      taskId,
+      attemptId: input.executionId,
+      type: "projection.stale",
+      payload: {
+        failed_event_id: recoveryEvent.eventId,
+        failed_event_hash: recoveryEvent.hash,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    });
   }
   return {
     ...base,
@@ -668,7 +689,12 @@ export async function runAcceptRecovery(
     appendedEvents: appended,
   };
 
-  // --- Idempotency / process / state early-exits ---
+  // --- Idempotency / process / state early-exits (ZERO MUTATION) ---
+  // These three branches must NOT call `failAcceptRecovery` — they are
+  // either no-ops (ALREADY_ACCEPTED) or refusal paths (the previous
+  // process is not proven gone, or the execution is not in a partial
+  // ACCEPT state). Mutating the Journal / projection / ReplayGuard in
+  // any of these cases would violate plan §19.
   if (input.events.some((event) => event.type === "review.accept.completed")) {
     return {
       ...base,
@@ -692,11 +718,28 @@ export async function runAcceptRecovery(
     };
   }
 
+  // From this point on, the previous process IS proven gone, so every
+  // unrecoverable branch MUST persist `recovery.required` to the
+  // Journal (P1#1). They all go through `failAcceptRecovery`.
+  const mutable: MutableState = { state: originalState };
+
   const preparedEvent = input.events.find((event) => event.type === "review.accept.prepared");
   if (preparedEvent === undefined) {
-    return { ...base, verdict: "RECOVERY_REQUIRED", reason: "no review.accept.prepared event in journal" };
+    return await failAcceptRecovery(input, base, mutable, {
+      reason: "no review.accept.prepared event in journal",
+    });
   }
-  const bindings = extractPreparedBindings(preparedEvent);
+  let bindings: PreparedBindings;
+  try {
+    bindings = extractPreparedBindings(preparedEvent);
+  } catch (error) {
+    if (error instanceof RecoverableError) {
+      return await failAcceptRecovery(input, base, mutable, {
+        reason: `review.accept.prepared binding: ${error.message}`,
+      });
+    }
+    throw error;
+  }
 
   // The review-bundle self-hash is carried on the `review.requested` event
   // (not the prepared event), so the reconciler reads it directly from the
@@ -706,7 +749,9 @@ export async function runAcceptRecovery(
     ? undefined
     : stringField(reviewRequestedEvent, "review_bundle_hash", "reviewBundleHash");
   if (reviewBundleHash === undefined) {
-    return { ...base, verdict: "RECOVERY_REQUIRED", reason: "review.requested event has no review_bundle_hash" };
+    return await failAcceptRecovery(input, base, mutable, {
+      reason: "review.requested event has no review_bundle_hash",
+    });
   }
 
   // --- Artifact verification (plan §26) ---
@@ -731,7 +776,9 @@ export async function runAcceptRecovery(
     changedFiles = readChangedFiles(input.artifactRoot, input.executionId);
   } catch (error) {
     if (error instanceof RecoverableError) {
-      return { ...base, verdict: "RECOVERY_REQUIRED", reason: error.message };
+      return await failAcceptRecovery(input, base, mutable, {
+        reason: error.message,
+      });
     }
     throw error;
   }
@@ -747,19 +794,20 @@ export async function runAcceptRecovery(
     );
   } catch (error) {
     if (error instanceof RecoverableError) {
-      return { ...base, verdict: "RECOVERY_REQUIRED", reason: error.message };
+      return await failAcceptRecovery(input, base, mutable, {
+        reason: `target classification: ${error.message}`,
+      });
     }
     throw error;
   }
 
   if (target.state === "HEAD_MOVED") {
-    return await persistRecoveryRequired(input, base, { state: originalState }, {
+    return await failAcceptRecovery(input, base, { state: originalState }, {
       targetState: "HEAD_MOVED",
       reason: `target HEAD is not at frozen base ${bindings.baseRevision}`,
     });
   }
 
-  const mutable: MutableState = { state: originalState };
   const signature: ReviewSignature = {
     reviewId: bindings.reviewId,
     reviewBundleId: bindings.reviewBundleId,
@@ -797,7 +845,7 @@ export async function runAcceptRecovery(
     try {
       applied = await applyPreflightedPatch(preflight);
     } catch (error) {
-      return await persistRecoveryRequired(input, base, mutable, {
+      return await failAcceptRecovery(input, base, mutable, {
         targetState: "CLEAN_BASE",
         reason: `reconciled apply failed: ${(error as Error).message}`,
       });
@@ -924,7 +972,7 @@ export async function runAcceptRecovery(
   // these artifacts.
   if (originalState === "PATCH_APPLIED" && target.state === "EXACT_EXPECTED_CHANGE_SET") {
     if (patchApplied === undefined) {
-      return await persistRecoveryRequired(input, base, mutable, {
+      return await failAcceptRecovery(input, base, mutable, {
         targetState: "EXACT_EXPECTED_CHANGE_SET",
         reason: "PATCH_APPLIED state but no patch.applied event in journal",
       });
@@ -935,7 +983,7 @@ export async function runAcceptRecovery(
       patchApplied,
     );
     if (verifyResult.kind === "missing" || verifyResult.kind === "mismatch") {
-      return await persistRecoveryRequired(input, base, mutable, {
+      return await failAcceptRecovery(input, base, mutable, {
         targetState: "EXACT_EXPECTED_CHANGE_SET",
         reason: `apply-evidence / outcome on disk ${verifyResult.kind} (${verifyResult.detail})`,
       });
@@ -971,19 +1019,19 @@ export async function runAcceptRecovery(
 
   // --- Remaining cases are unrecoverable without human decision ---
   if (originalState === "ACCEPT_PREPARED" && target.state === "EXACT_EXPECTED_CHANGE_SET") {
-    return await persistRecoveryRequired(input, base, mutable, {
+    return await failAcceptRecovery(input, base, mutable, {
       targetState: "EXACT_EXPECTED_CHANGE_SET",
       reason: "ACCEPT_PREPARED without apply.started but target already shows the expected change set; cannot prove G2M applied the change",
     });
   }
   if (originalState === "PATCH_APPLIED" && target.state === "CLEAN_BASE") {
-    return await persistRecoveryRequired(input, base, mutable, {
+    return await failAcceptRecovery(input, base, mutable, {
       targetState: "CLEAN_BASE",
       reason: "PATCH_APPLIED but target is CLEAN_BASE; the applied result is unprovable",
     });
   }
 
-  return await persistRecoveryRequired(input, base, mutable, {
+  return await failAcceptRecovery(input, base, mutable, {
     targetState: target.state,
     reason: `no recovery path for state=${originalState} target=${target.state}`,
   });

@@ -815,4 +815,86 @@ describe("Accept Reconciler", () => {
     expect(result.verdict).toBe("RECOVERY_REQUIRED");
     expect(result.appendedEvents).toEqual(["recovery.required"]);
   });
+
+  // ---------------------------------------------------------------------------
+  // Phase 6.1: every proven-gone + unrecoverable branch must route through
+  // `failAcceptRecovery` so the Journal carries a durable
+  // `recovery.required` event (P1#1). The tests below check the three
+  // shapes:
+  //   1) frozen.patch tampered (artifact verify failure)
+  //   2) review.requested has no review_bundle_hash (binding missing)
+  //   3) projection failure on the recovery.required event
+  //        → Journal still has recovery.required, AND a
+  //          projection.stale is appended as the durable signal.
+  // ---------------------------------------------------------------------------
+  it("Phase 6.1: frozen.patch tampered → Journal carries recovery.required + finalState RECOVERY_REQUIRED", async () => {
+    const fixture = await makeFixture("clean");
+    // Tamper frozen.patch on disk.
+    await writeFile(join(fixture.artifactRoot, "exec-1", "frozen.patch"), Buffer.from("tampered\n", "utf8"));
+    const events = buildBaseEvents(fixture, false);
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.finalState).toBe("RECOVERY_REQUIRED");
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const required = persisted.find((event) => event.type === "recovery.required");
+    expect(required).toBeDefined();
+    expect((required?.payload as { partial_accept?: unknown }).partial_accept).toBe(true);
+    expect((required?.payload as { reason?: string }).reason).toMatch(/frozen\.patch|hash/i);
+  });
+
+  it("Phase 6.1: missing review_bundle_hash → Journal carries recovery.required", async () => {
+    const fixture = await makeFixture("clean");
+    const events = buildBaseEvents(fixture, false);
+    // Wipe the review_bundle_hash from the review.requested event so the
+    // reconciler refuses with a missing-binding error.
+    const idx = events.findIndex((event) => event.type === "review.requested");
+    const target = events[idx];
+    if (target === undefined) throw new Error("setup: review.requested event missing");
+    events[idx] = {
+      ...target,
+      payload: { review_bundle_id: fixture.reviewBundleId, task_hash: "a".repeat(64), result_hash: "b".repeat(64) },
+    };
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.finalState).toBe("RECOVERY_REQUIRED");
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const required = persisted.find((event) => event.type === "recovery.required");
+    expect(required).toBeDefined();
+    expect((required?.payload as { reason?: string }).reason).toMatch(/review_bundle_hash/);
+  });
+
+  it("Phase 6.1: projection failure on recovery.required → Journal still has recovery.required AND projection.stale", async () => {
+    const fixture = await makeFixture("clean");
+    // Tamper frozen.patch so the reconciler hits the artifact-verify
+    // path and calls failAcceptRecovery.
+    await writeFile(join(fixture.artifactRoot, "exec-1", "frozen.patch"), Buffer.from("tampered\n", "utf8"));
+    const events = buildBaseEvents(fixture, false);
+    const input = makeInput(fixture, "crashed", events);
+    // Replace the projector with one whose `project` always throws.
+    // The recovery.required CRITICAL event must still land in the
+    // Journal (durable fact) and the projector failure must leave a
+    // `projection.stale` durable signal — mirroring `appendReduceProject`.
+    const brokenProjector = {
+      project: () => {
+        throw new Error("simulated projection failure");
+      },
+    };
+    const result = await runAcceptRecovery({
+      ...input,
+      projector: brokenProjector as unknown as typeof input.projector,
+    });
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const required = persisted.find((event) => event.type === "recovery.required");
+    const stale = persisted.find((event) => event.type === "projection.stale");
+    expect(required).toBeDefined();
+    expect(stale).toBeDefined();
+    expect((stale?.payload as { failed_event_hash?: string }).failed_event_hash).toBe(required?.hash);
+    expect((stale?.payload as { reason?: string }).reason).toMatch(/simulated projection failure/);
+  });
 });
