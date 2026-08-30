@@ -13,6 +13,7 @@ import { planGcCandidates, type GcCandidate } from "../storage/gc-candidate.js";
 import { readStorageManifestSync, type StorageManifest } from "../storage/usage.js";
 import { nodeFreeSpaceProvider } from "../storage/free-space.js";
 import { readTombstoneSync } from "../storage/tombstone.js";
+import { volumeIdForPath } from "../storage/volume.js";
 import {
   classifyLeasePolicy,
   scanLeaseOwnersSync,
@@ -88,6 +89,9 @@ export interface StorageVolumeStatus {
   readonly physicalFreeBytes: number | null;
   readonly activeReservedBytes: number;
   readonly effectiveAvailableBytes: number | null;
+  readonly policyAvailableBytes: number | null;
+  readonly minFreeBytes: number;
+  readonly safetyMarginBytes: number;
 }
 
 export interface StorageStatus {
@@ -266,19 +270,43 @@ function validTombstoneIds(stateRoot: string): { ids: Set<string>; invalid: numb
   return { ids, invalid };
 }
 
-async function storageVolumes(config: G2MLocalConfig, stateRoot: string, activeReservedBytes: number): Promise<readonly StorageVolumeStatus[]> {
+function activeReservationsByVolume(stateRoot: string, eventStore: EventStore): ReadonlyMap<string, number> {
+  const totals = new Map<string, number>();
+  for (const name of directNames(join(stateRoot, "reservations"), false)) {
+    try {
+      const record = JSON.parse(readFileSync(join(stateRoot, "reservations", name), "utf8")) as ReservationRecord & { readonly reservation_set_id?: string };
+      if (record.schema_version !== 1 || typeof record.execution_id !== "string" || !Array.isArray(record.reservations)) continue;
+      const events = eventStore.getByAttemptId(record.execution_id);
+      const released = ["storage.reservation.released", "storage.reservation.expired", "storage.reservation.abandoned"].some((type) => [...events].reverse().some((event) => event.type === type && (event.payload["reservation_set_id"] === undefined || event.payload["reservation_set_id"] === record.reservation_set_id)));
+      if (released) continue;
+      for (const reservation of record.reservations) {
+        const value = reservation as { readonly volume_id?: unknown; readonly reserved_bytes?: unknown };
+        if (typeof value.volume_id !== "string" || typeof value.reserved_bytes !== "number") continue;
+        totals.set(value.volume_id, (totals.get(value.volume_id) ?? 0) + value.reserved_bytes);
+      }
+    } catch { /* invalid records are reported through execution/doctor sources */ }
+  }
+  return totals;
+}
+
+async function storageVolumes(config: G2MLocalConfig, stateRoot: string, activeReservedByVolume: ReadonlyMap<string, number>): Promise<readonly StorageVolumeStatus[]> {
   const paths = [stateRoot, config.artifact_root, config.worktree_root, ...config.workspaces.map((workspace) => workspace.path)];
   const result = new Map<string, StorageVolumeStatus>();
   for (const path of paths) {
     try {
       const free = await nodeFreeSpaceProvider.freeBytes(path);
-      const volumeId = process.platform === "win32" ? `win32:${path.slice(0, 3).toLowerCase()}` : `path:${resolve(path).split(/[\\/]/)[1] ?? resolve(path)}`;
+      const volumeId = volumeIdForPath(path);
       const previous = result.get(volumeId);
+      const reserved = activeReservedByVolume.get(volumeId) ?? 0;
+      const physical = previous?.physicalFreeBytes === undefined || previous.physicalFreeBytes === null ? free : Math.max(previous.physicalFreeBytes, free);
       result.set(volumeId, {
         volumeId,
-        physicalFreeBytes: previous?.physicalFreeBytes === undefined || previous.physicalFreeBytes === null ? free : Math.max(previous.physicalFreeBytes, free),
-        activeReservedBytes: previous?.activeReservedBytes ?? activeReservedBytes,
-        effectiveAvailableBytes: Math.max(0, (previous?.physicalFreeBytes ?? free) - (previous?.activeReservedBytes ?? activeReservedBytes)),
+        physicalFreeBytes: physical,
+        activeReservedBytes: reserved,
+        effectiveAvailableBytes: physical - reserved,
+        policyAvailableBytes: physical - reserved - config.storage.min_free_bytes - config.storage.safety_margin_bytes,
+        minFreeBytes: config.storage.min_free_bytes,
+        safetyMarginBytes: config.storage.safety_margin_bytes,
       });
     } catch { /* unavailable volume is represented by the other sources */ }
   }
@@ -384,6 +412,7 @@ export async function buildOperationalSnapshot(options: OperationalOptions): Pro
         gcStatus: tombstone ? "GCED" : issues.some((item) => item.kind === "GC_INTERRUPTED") ? "INTERRUPTED" : issues.some((item) => item.kind === "GC_CLEANUP_PENDING") ? "CLEANUP_PENDING" : candidate?.decision === "ELIGIBLE" ? "ELIGIBLE" : candidate === undefined ? "NONE" : "BLOCKED",
       };
     }).filter((execution) => options.executionId === undefined || execution.executionId === options.executionId);
+    const activeReservedByVolume = activeReservationsByVolume(stateRoot, eventStore);
     const managedArtifactBytes = [...manifests.values()].reduce((sum, manifest) => sum + manifest.artifactBytes, 0);
     const managedWorktreeBytes = [...manifests.values()].reduce((sum, manifest) => sum + manifest.worktreeBytes, 0);
     const activeReservedBytes = executions.reduce((sum, execution) => sum + (execution.reservationStatus === "ACTIVE" ? reservationInfo(stateRoot, execution.executionId, eventStore.getByAttemptId(execution.executionId)).bytes : 0), 0);
@@ -391,7 +420,7 @@ export async function buildOperationalSnapshot(options: OperationalOptions): Pro
     for (const issue of recovery.issues) issuesByKind[issue.kind] = (issuesByKind[issue.kind] ?? 0) + 1;
     return {
       schemaVersion: "g2m.status.v1", generatedAt, stateRoot: stateRootStatus, executions, workspaces,
-      projection, storage: { managedArtifactBytes, managedWorktreeBytes, managedTotalBytes: managedArtifactBytes + managedWorktreeBytes, activeReservedBytes, maxTotalBytes: config.storage.max_total_bytes, maxArtifactBytes: config.storage.max_artifact_bytes, maxWorktreeBytes: config.storage.max_worktree_bytes, volumes: await storageVolumes(config, stateRoot, activeReservedBytes) },
+      projection, storage: { managedArtifactBytes, managedWorktreeBytes, managedTotalBytes: managedArtifactBytes + managedWorktreeBytes, activeReservedBytes, maxTotalBytes: config.storage.max_total_bytes, maxArtifactBytes: config.storage.max_artifact_bytes, maxWorktreeBytes: config.storage.max_worktree_bytes, volumes: await storageVolumes(config, stateRoot, activeReservedByVolume) },
       recovery: { openRecoveryCases: recovery.issues.filter((issue) => issue.severity === "SAFE_HOLD").length, executionsRequiringRecovery: executions.filter((execution) => execution.recoveryStatus === "REQUIRED").map((execution) => execution.executionId), issuesByKind, safeHoldCount: recovery.issues.filter((issue) => issue.severity === "SAFE_HOLD").length, reportOnlyCount: recovery.issues.filter((issue) => issue.severity === "REPORT_ONLY").length },
       gc: { eligibleCount: candidates.filter((candidate) => candidate.decision === "ELIGIBLE").length, estimatedReclaimBytes: candidates.filter((candidate) => candidate.decision === "ELIGIBLE").reduce((sum, candidate) => sum + candidate.artifactBytes + candidate.worktreeBytes, 0), interruptedCount: recovery.issues.filter((issue) => issue.kind === "GC_INTERRUPTED").length, cleanupPendingCount: recovery.issues.filter((issue) => issue.kind === "GC_CLEANUP_PENDING").length, tombstoneCount: tombstones.ids.size, invalidTombstoneCount: tombstones.invalid },
     };

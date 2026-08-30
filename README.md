@@ -106,7 +106,10 @@ npm run g2m -- doctor --config <config.json> --format json
 `repair` 默认只生成计划；只有显式 `--apply` 才会执行一个白名单动作：
 `projection-rebuild`、`gc-resume` 或 `storage-reconcile`。不支持
 `--all`、`--force` 或任何绕过 Journal、Recovery、Lease、SQLite 校验的选项。
-修复后应再次运行 `doctor`：
+apply 会在 Repair Lock 内重新生成并校验 plan；如果锁前后的持久状态发生
+变化，会返回 `REPAIR_PLAN_STALE`，不会执行旧 plan。Repair Lock 带有
+heartbeat、同主机 dead-PID stale reclaim 和 operation ownership 校验；live、
+unknown 或 foreign owner 都会被拒绝。修复后应再次运行 `doctor`：
 
 ```powershell
 npm run g2m -- repair --config <config.json> --action projection-rebuild

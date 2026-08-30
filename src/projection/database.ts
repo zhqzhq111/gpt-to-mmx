@@ -33,7 +33,8 @@ export class StateDatabase {
     let opened: DatabaseSync | undefined;
     try {
       if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
-      opened = new DatabaseSync(path, { timeout: 5_000, readOnly: options.readOnly ?? false });
+      const openPath = options.readOnly && path !== ":memory:" ? `file:${path}?immutable=1` : path;
+      opened = new DatabaseSync(openPath, { timeout: 5_000, readOnly: options.readOnly ?? false });
       if (!options.readOnly) {
         opened.exec("PRAGMA journal_mode = WAL");
         opened.exec("PRAGMA synchronous = NORMAL");

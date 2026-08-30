@@ -48,4 +48,26 @@ describe("operational doctor", () => {
     expect(report.checks.find((check) => check.id === "recovery.safe-holds")?.status).toBe("FAIL");
     expect(report.checks.find((check) => check.id === "projection.readable")?.status).toBe("WARN");
   });
+
+  it("surfaces stale lease owners with severity based on their disposition", () => {
+    const report = buildDoctorReport(snapshot({
+      workspaces: [
+        { workspaceId: "ws-active-stale", canonicalPath: "C:/a", canonicalPathExists: true, lease: { status: "ACTIVE_EXECUTION_STALE_OWNER", executionId: "e1", leaseId: "l1", hostname: "host", pid: 1, heartbeatAgeMs: 100 } },
+        { workspaceId: "ws-terminal-stale", canonicalPath: "C:/b", canonicalPathExists: true, lease: { status: "STALE_TERMINAL_RECLAIMABLE", executionId: "e2", leaseId: "l2", hostname: "host", pid: 2, heartbeatAgeMs: 100 } },
+      ],
+    }));
+    expect(report.checks.find((check) => check.id === "lease.consistency")?.status).toBe("FAIL");
+  });
+
+  it("fails when raw storage facts violate the configured floor or total limit", () => {
+    const report = buildDoctorReport(snapshot({
+      storage: {
+        ...snapshot().storage,
+        managedTotalBytes: 200,
+        maxTotalBytes: 100,
+        volumes: [{ volumeId: "v1", physicalFreeBytes: 50, activeReservedBytes: 40, effectiveAvailableBytes: 10, policyAvailableBytes: -10, minFreeBytes: 10, safetyMarginBytes: 10 }],
+      },
+    }));
+    expect(report.checks.find((check) => check.id === "storage.accounting")?.status).toBe("FAIL");
+  });
 });

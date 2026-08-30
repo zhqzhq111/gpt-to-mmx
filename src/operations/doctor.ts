@@ -71,12 +71,14 @@ export function buildDoctorReport(snapshot: DoctorSnapshotInput): DoctorReport {
     stale === 0 ? "projection has no stale executions or events" : `${stale} stale projection records/events detected`,
     stale === 0 ? [] : ["projection:stale"],
   ));
-  const unsafeLeases = snapshot.workspaces.filter((workspace) => ["INCOMPLETE", "MALFORMED", "HEARTBEAT_MISMATCH", "RECOVERY_CRITICAL", "FOREIGN_HOST", "UNKNOWN"].includes(workspace.lease.status));
+  const unsafeLeaseStatuses = ["INCOMPLETE", "MALFORMED", "HEARTBEAT_MISMATCH", "RECOVERY_CRITICAL", "FOREIGN_HOST", "UNKNOWN", "ACTIVE_EXECUTION_STALE_OWNER", "STALE_TERMINAL_RECLAIMABLE"];
+  const unsafeLeases = snapshot.workspaces.filter((workspace) => unsafeLeaseStatuses.includes(workspace.lease.status));
+  const staleActiveLeases = snapshot.workspaces.filter((workspace) => workspace.lease.status === "ACTIVE_EXECUTION_STALE_OWNER");
   checks.push(check(
     "lease.consistency",
     "lease",
-    unsafeLeases.length === 0 ? "PASS" : "WARN",
-    unsafeLeases.length === 0 ? "workspace leases are consistent" : `${unsafeLeases.length} workspace leases need operator review`,
+    staleActiveLeases.length > 0 ? "FAIL" : unsafeLeases.length === 0 ? "PASS" : "WARN",
+    staleActiveLeases.length > 0 ? `${staleActiveLeases.length} active execution lease owner(s) are stale` : unsafeLeases.length === 0 ? "workspace leases are consistent" : `${unsafeLeases.length} workspace leases need operator review`,
     unsafeLeases.map((workspace) => `lease:${workspace.workspaceId}`),
   ));
   const invalidReservations = snapshot.executions.filter((execution) => execution.reservationStatus === "INVALID");
@@ -87,12 +89,17 @@ export function buildDoctorReport(snapshot: DoctorSnapshotInput): DoctorReport {
     invalidReservations.length === 0 ? "storage reservation records are readable" : `${invalidReservations.length} reservation records are invalid`,
     invalidReservations.map((execution) => `reservation:${execution.executionId}`),
   ));
+  const overcommittedVolume = snapshot.storage.volumes.some((volume) => volume.effectiveAvailableBytes !== null && volume.effectiveAvailableBytes < 0);
+  const belowPolicyVolume = snapshot.storage.volumes.some((volume) => volume.policyAvailableBytes !== null && volume.policyAvailableBytes < 0);
+  const managedLimitExceeded = (snapshot.storage.maxTotalBytes > 0 && snapshot.storage.managedTotalBytes > snapshot.storage.maxTotalBytes) ||
+    (snapshot.storage.maxArtifactBytes > 0 && snapshot.storage.managedArtifactBytes > snapshot.storage.maxArtifactBytes) ||
+    (snapshot.storage.maxWorktreeBytes > 0 && snapshot.storage.managedWorktreeBytes > snapshot.storage.maxWorktreeBytes);
   checks.push(check(
     "storage.accounting",
     "storage",
-    snapshot.storage.volumes.some((volume) => volume.effectiveAvailableBytes !== null && volume.effectiveAvailableBytes < 0) ? "FAIL" : "PASS",
-    "filesystem and reservation storage accounting is available",
-    ["storage:filesystem", "storage:reservations"],
+    overcommittedVolume || managedLimitExceeded ? "FAIL" : belowPolicyVolume ? "WARN" : "PASS",
+    overcommittedVolume ? "active reservations exceed physical free space" : managedLimitExceeded ? "managed storage exceeds a configured maximum" : belowPolicyVolume ? "one or more volumes are below the configured free-space policy" : "filesystem and reservation storage accounting is within policy",
+    ["storage:filesystem", "storage:reservations", "storage:policy"],
   ));
   checks.push(check(
     "recovery.safe-holds",

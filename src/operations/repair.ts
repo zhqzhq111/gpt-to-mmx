@@ -8,7 +8,8 @@ import { StateDatabase } from "../projection/database.js";
 import { reconcileStorageReservations } from "../storage/reservation.js";
 import { resumeInterrupted } from "../storage/gc.js";
 import { WorkspaceLock } from "../workspace/lock.js";
-import { buildOperationalSnapshot, type OperationalOptions } from "./snapshot.js";
+import { sha256 } from "../protocol/hash.js";
+import { buildOperationalSnapshot, type OperationalOptions, type OperationalSnapshot } from "./snapshot.js";
 import { acquireRepairLock } from "./repair-lock.js";
 import { writeRepairAudit } from "./repair-audit.js";
 
@@ -27,6 +28,11 @@ export interface RepairOptions extends OperationalOptions {
   readonly operationId?: string;
 }
 
+export interface RepairDependencies {
+  readonly buildSnapshot?: (options: OperationalOptions) => Promise<OperationalSnapshot>;
+  readonly dispatch?: (plan: RepairPlan, config: G2MLocalConfig) => Promise<unknown>;
+}
+
 export interface RepairPlan {
   readonly schemaVersion: "g2m.repair-plan.v1";
   readonly operationId: string;
@@ -35,6 +41,7 @@ export interface RepairPlan {
   readonly executionId: string | null;
   readonly applyRequired: true;
   readonly permitted: boolean;
+  readonly preconditionHash: string;
   readonly reasons: readonly string[];
   readonly target: string;
 }
@@ -57,11 +64,18 @@ function stateRoot(config: G2MLocalConfig): string {
   return config.state_root ?? resolve(config.artifact_root, "state");
 }
 
-export async function planRepair(options: RepairOptions): Promise<RepairPlan> {
+function preconditionHash(snapshot: OperationalSnapshot): string {
+  // Acquiring the repair lock creates the control-plane directory itself. It
+  // must not make an otherwise identical data snapshot stale, especially when
+  // this is the first repair against a previously absent state root.
+  return sha256({ ...snapshot, generatedAt: 0, stateRoot: { ...snapshot.stateRoot, stateRootExists: true } });
+}
+
+export async function planRepair(options: RepairOptions, dependencies: RepairDependencies = {}): Promise<RepairPlan> {
   if (forbidden.has(options.action) || !allowlist.has(options.action)) {
     throw new RepairActionError(`repair action is not allowlisted: ${options.action}`);
   }
-  const snapshot = await buildOperationalSnapshot(options);
+  const snapshot = await (dependencies.buildSnapshot ?? buildOperationalSnapshot)(options);
   const reasons: string[] = [];
   if (options.action === "gc-resume") {
     const target = options.executionId === undefined
@@ -79,6 +93,7 @@ export async function planRepair(options: RepairOptions): Promise<RepairPlan> {
     executionId: options.executionId ?? null,
     applyRequired: true,
     permitted: reasons.length === 0,
+    preconditionHash: preconditionHash(snapshot),
     reasons: Object.freeze(reasons),
     target: options.executionId === undefined ? "state-root" : `execution:${options.executionId}`,
   };
@@ -115,8 +130,8 @@ async function dispatch(plan: RepairPlan, config: G2MLocalConfig): Promise<unkno
   } finally { resources.close(); }
 }
 
-export async function executeRepair(options: RepairOptions & { readonly apply: true }): Promise<RepairResult> {
-  const plan = await planRepair(options);
+export async function executeRepair(options: RepairOptions & { readonly apply: true }, dependencies: RepairDependencies = {}): Promise<RepairResult> {
+  const plan = await planRepair(options, dependencies);
   const resultBase = {
     schemaVersion: "g2m.repair-result.v1" as const,
     operationId: plan.operationId,
@@ -129,10 +144,17 @@ export async function executeRepair(options: RepairOptions & { readonly apply: t
   }
   const lock = await acquireRepairLock(stateRoot(options.config), { operationId: plan.operationId, nowMs: plan.generatedAt });
   try {
+    const freshPlan = await planRepair({ ...options, operationId: plan.operationId }, dependencies);
+    const stale = plan.action !== freshPlan.action || plan.executionId !== freshPlan.executionId || plan.permitted !== freshPlan.permitted || plan.target !== freshPlan.target || plan.preconditionHash !== freshPlan.preconditionHash || JSON.stringify(plan.reasons) !== JSON.stringify(freshPlan.reasons);
+    if (stale) {
+      const result: RepairResult = { ...resultBase, status: "REFUSED", result: null, reasons: ["REPAIR_PLAN_STALE"] };
+      await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "result", action: plan.action, createdAt: Date.now(), payload: result });
+      return result;
+    }
     await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "plan", action: plan.action, createdAt: plan.generatedAt, payload: plan });
     await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "start", action: plan.action, createdAt: Date.now(), payload: { target: plan.target } });
     try {
-      const value = await dispatch(plan, options.config);
+      const value = await (dependencies.dispatch ?? dispatch)(freshPlan, options.config);
       const result: RepairResult = { ...resultBase, status: "APPLIED", result: value, reasons: [] };
       await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "result", action: plan.action, createdAt: Date.now(), payload: result });
       return result;
