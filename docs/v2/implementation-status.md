@@ -870,7 +870,7 @@ or Phase 11 operational commands.
 
 ## Phase 11 — Operational CLI
 
-Status: **IMPLEMENTED** on branch `codex/phase-11-operational-cli`.
+Status: **COMPLETE / SEALED** on branch `codex/phase-11-operational-cli`.
 
 The operational layer exposes read-only `g2m status` and `g2m doctor`, plus
 explicit-apply `g2m repair`. Snapshot collection never calls
