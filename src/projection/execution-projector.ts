@@ -2,6 +2,7 @@ import type { TaskEvent } from "../events/events.js";
 import { fingerprintHash } from "../execution/fingerprint.js";
 import type { TaskState } from "../execution/state-machine.js";
 import type { ValidLeaseOwner } from "../workspace/lock.js";
+import type { Tombstone } from "../storage/tombstone.js";
 import { StateDatabase } from "./database.js";
 
 export interface WorkspaceSeed {
@@ -160,6 +161,40 @@ export class ExecutionProjector implements ExecutionProjection {
     return this.database.prepare(
       "SELECT * FROM recovery_cases WHERE execution_id = ?",
     ).get(executionId) as RecoveryCaseRow | undefined;
+  }
+
+  projectTombstone(tombstone: Tombstone): void {
+    this.database.transaction(() => {
+      for (const table of ["artifacts", "reviews", "recovery_cases", "storage_usage", "storage_reservations"]) {
+        this.database.prepare("DELETE FROM " + table + " WHERE execution_id = ?").run(tombstone.executionId);
+      }
+      this.database.prepare(`
+        INSERT INTO executions(
+          execution_id, task_id, workspace_id, state, created_at, updated_at,
+          base_revision, runtime, runtime_version, model, fingerprint_hash,
+          artifact_path, worktree_path, review_bundle_id, retention_class, gc_eligible_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL)
+        ON CONFLICT(execution_id) DO UPDATE SET
+          task_id = excluded.task_id,
+          workspace_id = excluded.workspace_id,
+          state = excluded.state,
+          created_at = excluded.created_at,
+          updated_at = excluded.updated_at,
+          artifact_path = NULL,
+          worktree_path = NULL,
+          review_bundle_id = NULL,
+          retention_class = excluded.retention_class,
+          gc_eligible_at = NULL
+      `).run(
+        tombstone.executionId,
+        tombstone.taskId,
+        tombstone.workspaceId,
+        tombstone.finalState,
+        tombstone.createdAt,
+        tombstone.gcCompletedAt,
+        tombstone.retentionClass,
+      );
+    });
   }
 
   workspaceLease(workspaceId: string): Record<string, unknown> | undefined {

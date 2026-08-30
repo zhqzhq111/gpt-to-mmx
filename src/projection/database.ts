@@ -21,22 +21,28 @@ export class ProjectionDatabaseError extends Error {
   }
 }
 
+export interface StateDatabaseOptions {
+  readonly readOnly?: boolean;
+}
+
 export class StateDatabase {
   private readonly database: DatabaseSync;
   private closed = false;
 
-  constructor(readonly path: string) {
+  constructor(readonly path: string, options: StateDatabaseOptions = {}) {
     let opened: DatabaseSync | undefined;
     try {
-      if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-      opened = new DatabaseSync(path, { timeout: 5_000 });
-      opened.exec("PRAGMA journal_mode = WAL");
-      opened.exec("PRAGMA synchronous = NORMAL");
-      opened.exec("PRAGMA busy_timeout = 5000");
-      opened.exec(FROZEN_SCHEMA_SQL);
-      this.ensureStorageReservationColumns(opened);
+      if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
+      opened = new DatabaseSync(path, { timeout: 5_000, readOnly: options.readOnly ?? false });
+      if (!options.readOnly) {
+        opened.exec("PRAGMA journal_mode = WAL");
+        opened.exec("PRAGMA synchronous = NORMAL");
+        opened.exec("PRAGMA busy_timeout = 5000");
+        opened.exec(FROZEN_SCHEMA_SQL);
+        this.ensureStorageReservationColumns(opened);
+      }
       this.database = opened;
-      this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
+      if (!options.readOnly) this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
     } catch (error) {
       // Close the SQLite handle on any failure so the underlying file
       // lock is released (otherwise a follow-up `rm` / `rename` against

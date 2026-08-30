@@ -197,6 +197,21 @@ describe("EventStore indexes", () => {
     store.append({ taskId: "t", attemptId: "a1", type: "task.created", payload: {} });
     expect(store.size()).toBe(1);
   });
+
+  it("closes only one execution writer while another remains usable", async () => {
+    const executionDirectory = await executionRoot();
+    const store = new EventStore({ executionDirectory });
+    const first = store.append({ taskId: "task-a", attemptId: "exec-a", type: "task.created", payload: {} });
+    const second = store.append({ taskId: "task-b", attemptId: "exec-b", type: "task.created", payload: {} });
+
+    store.closeExecution("exec-a");
+    const next = store.append({ taskId: "task-b", attemptId: "exec-b", type: "task.validation.started", payload: {} });
+    const reopened = store.append({ taskId: "task-a", attemptId: "exec-a", type: "task.validation.started", payload: {} });
+
+    expect(next.prevHash).toBe(second.hash);
+    expect(reopened.prevHash).toBe(first.hash);
+    store.close();
+  });
 });
 
 describe("verifyChain (user requirement 1: chain integrity, no reordering)", () => {

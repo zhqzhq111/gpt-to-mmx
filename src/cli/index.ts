@@ -20,6 +20,8 @@ import { runStartupRecovery } from "../recovery/startup.js";
 import { StorageManager, reconcileStorageReservations } from "../storage/reservation.js";
 import { rebuildStorageUsageFromManifests } from "../storage/usage.js";
 import { StorageMonitor } from "../storage/monitor.js";
+import { cleanupSafeOrphans, executeGc, resumeInterrupted } from "../storage/gc.js";
+import { planGcCandidates } from "../storage/gc-candidate.js";
 import type { TaskEvent } from "../events/events.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
@@ -45,12 +47,67 @@ function parseArguments(argv: readonly string[]): ParsedArguments {
   for (let index = 1; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
-    if (key === undefined || !key.startsWith("--") || value === undefined) {
+    if (key === undefined || !key.startsWith("--")) {
       throw new Error(`invalid argument near "${key ?? "end of input"}"`);
+    }
+    if (key === "--apply") {
+      options.set("apply", "true");
+      continue;
+    }
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`invalid argument near "${key}"`);
     }
     options.set(key.slice(2), value);
   }
   return { command, options };
+}
+
+async function gcCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  for (const forbidden of ["force", "ignore-recovery", "ignore-lease", "delete-anyway"]) {
+    if (options.has(forbidden)) throw new Error("GC does not support --" + forbidden);
+  }
+  const config = await loadConfig(resolve(required(options, "config")));
+  const apply = options.get("apply") === "true";
+  const stateRoot = stateRootForConfig(config);
+  const database = new StateDatabase(join(stateRoot, "g2m-state.sqlite"), { readOnly: !apply });
+  const eventStore = new EventStore({
+    executionDirectory: join(stateRoot, "executions"),
+    tolerateLoadErrors: true,
+    readOnly: !apply,
+  });
+  try {
+    const plannerOptions = {
+      stateRoot,
+      artifactRoot: config.artifact_root,
+      worktreeRoot: config.worktree_root,
+      eventStore,
+      database,
+      nowMs: Date.now(),
+      completedRetentionDays: config.storage.completed_retention_days,
+      workspaces: config.workspaces.map((workspace) => ({ workspaceId: workspace.workspace_id, canonicalPath: workspace.path })),
+    } as const;
+    if (!apply) {
+      const all = await planGcCandidates(plannerOptions);
+      const filtered = options.get("execution-id") === undefined ? all : all.filter((candidate) => candidate.executionId === options.get("execution-id"));
+      emit({
+        type: "g2m.gc",
+        mode: "dry-run",
+        eligible: filtered.filter((candidate) => candidate.decision === "ELIGIBLE"),
+        blocked: filtered.filter((candidate) => candidate.decision === "BLOCKED"),
+        estimated_reclaim_bytes: filtered.filter((candidate) => candidate.decision === "ELIGIBLE").reduce((sum, candidate) => sum + candidate.artifactBytes + candidate.worktreeBytes, 0),
+        message: "No files were deleted. Use --apply to perform GC.",
+      });
+      return;
+    }
+    const resumed = await resumeInterrupted(plannerOptions);
+    const executionId = options.get("execution-id");
+    const result = await executeGc({ ...plannerOptions, ...(executionId !== undefined ? { executionId } : {}) });
+    const orphans = await cleanupSafeOrphans({ ...plannerOptions, ...(executionId !== undefined ? { executionId } : {}) });
+    emit({ type: "g2m.gc", mode: "apply", resumed, result, orphans });
+  } finally {
+    eventStore.close();
+    database.close();
+  }
 }
 
 function required(options: ReadonlyMap<string, string>, name: string): string {
@@ -186,6 +243,17 @@ async function configureEngine(
       stateRoot,
       database: projectionDatabase,
       nowMs: Date.now(),
+    });
+    await resumeInterrupted({
+      stateRoot,
+      artifactRoot: config.artifact_root,
+      worktreeRoot: config.worktree_root,
+      eventStore,
+      database: projectionDatabase,
+      nowMs: Date.now(),
+      completedRetentionDays: config.storage.completed_retention_days,
+      workspaces: config.workspaces.map((entry) => ({ workspaceId: entry.workspace_id, canonicalPath: entry.path })),
+      workspaceLock,
     });
     const liveDatabase = projectionDatabase;
     if (liveDatabase === undefined) throw new Error("projection database was not initialized");
@@ -544,6 +612,7 @@ function printHelp(): void {
       "  g2m probe  --config <g2m.config.json>",
       "  g2m run    --config <config> --task <task.json> --review <review.json>",
       "  g2m recover --config <config> --execution-id <id> --process-status <status>",
+      "  g2m gc      --config <config> [--apply] [--execution-id <id>]",
       "  g2m review --bundle <review-bundle.json> --decision <ACCEPT|REVISE|BLOCK>",
       "             --output <review.json> [--findings-file <path>] [--new-task-id <id>]",
       "",
@@ -565,6 +634,9 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       return;
     case "probe":
       await probeCommand(parsed.options);
+      return;
+    case "gc":
+      await gcCommand(parsed.options);
       return;
     case "help":
     case "--help":

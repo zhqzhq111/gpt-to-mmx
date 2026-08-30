@@ -824,6 +824,47 @@ Final verification on the Phase 9 branch:
 
 Phase 9 does not perform historical GC; deletion remains a Phase 10 concern.
 
+## Phase 10 — Garbage Collection and Crash-safe Retention Cleanup
+
+Status: **COMPLETE / IMPLEMENTED** on branch `codex/phase-10-garbage-collection`.
+
+Implemented:
+
+- proof-first read-only candidate planning from Journal replay, independently
+  derived terminal retention, manifest bytes/hash, path containment, top-level
+  `lstat`, workspace Lease, storage Reservation, and projection cross-checks;
+- durable self-hashed Tombstones under `state_root/tombstones`, with the
+  existing immutable artifact write protocol and permanent retention;
+- per-execution `EventStore.closeExecution` so Windows can remove an execution
+  directory only after `gc.completed` is durable;
+- cross-process `state_root/gc/gc.lock` ownership with metadata, heartbeat,
+  same-host dead-PID stale reclaim, and foreign/unknown/live refusal;
+- sequential Crash-safe executor ordering: `gc.marked`, repository-bound
+  worktree removal, artifact removal, Tombstone, `gc.completed`, writer close,
+  state cleanup, and projection cleanup;
+- idempotent interrupted-GC resume for mark-only, half-deleted, pre-completed
+  Tombstone, and completed-with-leftover-state windows, plus deterministic
+  fault injection hooks used only by tests;
+- Recovery Scanner classification and missing-artifact suppression for marked
+  operations; projection rebuild from valid Tombstones with no fabricated
+  artifact/review/recovery rows and invalid-Tombstone rejection;
+- explicit `g2m gc` CLI with read-only default, `--apply`, optional execution
+  filter, and no force/bypass flags; only Tombstone-bound SAFE_ORPHAN cleanup;
+- real process coverage for two-owner races, crash after `gc.marked`, crash
+  after `gc.completed`, and `RECOVERY_REQUIRED` protection.
+
+Final verification:
+
+- `npm run typecheck` → pass;
+- `npm run build` → pass;
+- `npm test` → **540 passed, 6 skipped, 0 failed** at the Phase 10 mid gate;
+- `npm run test:gc-process` → **1/1** real process suite passed;
+- `git diff --check` → pass.
+
+The six existing skips remain the real mcode/permission probes. Phase 10 does
+not add a background GC daemon, generic force deletion, broad orphan cleanup,
+or Phase 11 operational commands.
+
 ## Remaining phases
 
 GC, operational CLI, runtime hardening, and CI matrices.

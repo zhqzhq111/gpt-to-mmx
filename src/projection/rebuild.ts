@@ -72,6 +72,7 @@ import { ExecutionProjector, type WorkspaceSeed } from "./execution-projector.js
 import { EventStore } from "../events/store.js";
 import { rebuildStorageUsageFromManifests } from "../storage/usage.js";
 import { reconcileStorageReservations } from "../storage/reservation.js";
+import { readTombstoneSync } from "../storage/tombstone.js";
 
 export interface RebuildWorkspaceConfig {
   readonly workspaceId: string;
@@ -103,6 +104,7 @@ export interface RebuildReport {
   readonly truncatedTails: number;
   readonly failureReasons: readonly RebuildFailureReason[];
   readonly backupPath: string;
+  readonly invalidTombstones: number;
 }
 
 export interface CommitReplaceOptions {
@@ -338,6 +340,7 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
   let rebuiltExecutions = 0;
   let staleExecutions = 0;
   let truncatedTails = 0;
+  let invalidTombstones = 0;
   const failureReasons: RebuildFailureReason[] = [];
   let tempDatabase: StateDatabase | null = null;
 
@@ -398,6 +401,21 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
       });
       storageEvents.close();
 
+      const tombstonesRoot = join(stateRoot, "tombstones");
+      if (existsSync(tombstonesRoot)) {
+        for (const name of readdirSync(tombstonesRoot).filter((entry) => entry.endsWith(".json")).sort()) {
+          const executionId = name.slice(0, -".json".length);
+          try {
+            const tombstone = readTombstoneSync(join(tombstonesRoot, name));
+            if (tombstone === undefined || tombstone.executionId !== executionId) throw new Error("tombstone filename binding");
+            projector.projectTombstone(tombstone);
+          } catch (error) {
+            invalidTombstones += 1;
+            tempDatabase.setMeta(`tombstone:${executionId}:stale`, error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
+
       tempDatabase.setMeta("rebuild_status", "complete");
       tempDatabase.setMeta("rebuild_at", String(nowMs));
       tempDatabase.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -440,6 +458,7 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
       truncatedTails,
       failureReasons,
       backupPath: resolvedBackupPath,
+      invalidTombstones,
     };
   } finally {
     releaseRebuildLock(lockPath);

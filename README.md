@@ -19,6 +19,8 @@ G2M v1.0.0 Coding Orchestrator 已完成：
 - Event Hash Chain、State Machine、task fingerprint；
 - Review Bundle、六字段绑定、anti-stale / anti-replay；
 - ACCEPT / REVISE / BLOCK；
+- Phase 10 proof-first GC：只读默认的 `g2m gc`、跨进程 GC lock、Crash-safe
+  `gc.marked` / Tombstone / `gc.completed` 顺序、可重建历史投影；
 - UNKNOWN Resolver 与 RECOVERY_REQUIRED；
 - Unified ProcessSupervisor：Windows process-tree、POSIX process-group、超时/取消终止确认；
 - `read_only` 任务的真实 diff 强制审计；
@@ -83,6 +85,14 @@ npm run g2m -- review --bundle <review-bundle.json> --decision ACCEPT --output <
 npm run g2m -- recover --config <config.json> --execution-id <execution-id> --process-status crashed
 ```
 
+历史执行清理默认只做只读候选审查；只有显式 `--apply` 才会删除，并且
+不会提供绕过恢复、Lease 或路径校验的 `--force` 选项：
+
+```powershell
+npm run g2m -- gc --config <config.json>
+npm run g2m -- gc --config <config.json> --apply
+```
+
 ## Codex Skill
 
 Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
@@ -137,6 +147,14 @@ usage scanner 使用 symlink-safe traversal，manifest 原子更新且可重建�
 storage reservation Journal/projection 支持启动恢复；Worker 和 Verification
 均受运行时磁盘监控保护。详细契约见
 [docs/v2/phase-9-storage-manager.md](docs/v2/phase-9-storage-manager.md)。
+
+Phase 10 Garbage Collection 已完成：GC 候选必须通过 Journal、Manifest、
+Lease、Reservation、Recovery 与文件系统的交叉证明；`gc.marked` 在所有
+破坏性操作前持久化，Tombstone 自校验且永久保留，`gc.completed` 后才关闭
+Journal writer 并删除 execution state。中断操作可在下次启动或显式 `g2m gc
+--apply` 时幂等续做；`RECOVERY_REQUIRED`、未知孤儿目录和不确定的
+worktree 绑定永不自动删除。详细契约见
+[docs/v2/phase-10-garbage-collection.md](docs/v2/phase-10-garbage-collection.md)。
 
 ## 目录
 

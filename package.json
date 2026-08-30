@@ -18,7 +18,8 @@
     "test:watch": "vitest",
     "test:lease-process": "npm run build --silent && node --test tests/process/workspace-lease.process.e2e.mjs",
     "test:process-supervisor": "npm run build --silent && node --test tests/process/process-supervisor.process.e2e.mjs",
-    "test:storage-process": "npm run build --silent && node --test tests/process/storage-reservation.process.e2e.mjs"
+    "test:storage-process": "npm run build --silent && node --test tests/process/storage-reservation.process.e2e.mjs",
+    "test:gc-process": "npm run build --silent && node --test tests/process/gc.process.e2e.mjs"
   },
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",
