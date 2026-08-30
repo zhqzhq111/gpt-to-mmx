@@ -48,4 +48,12 @@ describe("operational CLI", () => {
     await expect(main(["repair", "--config", f.config, "--action", "projection-rebuild", "--force", "true"])).rejects.toThrow(/force|allowlisted/i);
     await expect(main(["repair", "--config", f.config, "--action", "all"])).rejects.toThrow(/allowlisted/i);
   });
+
+  it("applies projection rebuild only when explicitly requested", async () => {
+    const f = await fixture();
+    const output = JSON.parse(await runCli(["repair", "--config", f.config, "--action", "projection-rebuild", "--apply", "--format", "json"]));
+    expect(output.schema_version).toBe("g2m.repair-result.v1");
+    expect(output.status).toBe("APPLIED");
+    expect(output.result.rebuilt_executions).toBe(0);
+  });
 });

@@ -48,7 +48,7 @@ function emit(value: unknown): void {
 function parseArguments(argv: readonly string[]): ParsedArguments {
   const command = argv[0] ?? "help";
   const options = new Map<string, string>();
-  for (let index = 1; index < argv.length; index += 2) {
+  for (let index = 1; index < argv.length;) {
     const key = argv[index];
     const value = argv[index + 1];
     if (key === undefined || !key.startsWith("--")) {
@@ -56,12 +56,14 @@ function parseArguments(argv: readonly string[]): ParsedArguments {
     }
     if (key === "--apply") {
       options.set("apply", "true");
+      index += 1;
       continue;
     }
     if (value === undefined || value.startsWith("--")) {
       throw new Error(`invalid argument near "${key}"`);
     }
     options.set(key.slice(2), value);
+    index += 2;
   }
   return { command, options };
 }

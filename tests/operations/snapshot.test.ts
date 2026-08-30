@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { G2MLocalConfig } from "../../src/cli/config.js";
 import { buildOperationalSnapshot } from "../../src/operations/snapshot.js";
+import { StateDatabase } from "../../src/projection/database.js";
 
 const roots: string[] = [];
 
@@ -65,5 +66,18 @@ describe("read-only operational snapshot", () => {
     expect(snapshot.stateRoot.executionsDirectoryExists).toBe(true);
     expect(before.size).toBe(after.size);
     expect(before.mtimeMs).toBe(after.mtimeMs);
+  });
+
+  it("continues filesystem reporting when an opened SQLite projection is unusable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-snapshot-"));
+    roots.push(root);
+    const database = new StateDatabase(join(root, "state", "g2m-state.sqlite"));
+    database.exec("DROP TABLE projection_meta");
+    database.close();
+
+    const snapshot = await buildOperationalSnapshot({ config: config(root), nowMs: 100 });
+
+    expect(snapshot.projection.status).toBe("UNREADABLE");
+    expect(snapshot.stateRoot.projectionDatabaseExists).toBe(true);
   });
 });
