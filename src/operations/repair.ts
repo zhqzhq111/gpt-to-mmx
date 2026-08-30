@@ -147,7 +147,12 @@ export async function executeRepair(options: RepairOptions & { readonly apply: t
     const freshPlan = await planRepair({ ...options, operationId: plan.operationId }, dependencies);
     const stale = plan.action !== freshPlan.action || plan.executionId !== freshPlan.executionId || plan.permitted !== freshPlan.permitted || plan.target !== freshPlan.target || plan.preconditionHash !== freshPlan.preconditionHash || JSON.stringify(plan.reasons) !== JSON.stringify(freshPlan.reasons);
     if (stale) {
-      const result: RepairResult = { ...resultBase, status: "REFUSED", result: null, reasons: ["REPAIR_PLAN_STALE"] };
+      const result: RepairResult = {
+        ...resultBase,
+        status: "REFUSED",
+        result: { originalPreconditionHash: plan.preconditionHash, freshPreconditionHash: freshPlan.preconditionHash },
+        reasons: ["REPAIR_PLAN_STALE"],
+      };
       await writeRepairAudit({ stateRoot: stateRoot(options.config), operationId: plan.operationId, phase: "result", action: plan.action, createdAt: Date.now(), payload: result });
       return result;
     }
