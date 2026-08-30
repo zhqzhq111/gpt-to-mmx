@@ -444,7 +444,7 @@ Startup Backfill never appends Journal events, invokes `RecoveryResolver`,
 inspects processes, reclaims leases, or reconciles ACCEPT transactions.
 
 Phase 5 remains explicitly out of scope here: Recovery Scanner and process
-supervision, crash-safe ACCEPT, cross-process leases and reclaim, Storage
+supervision, cross-process leases and reclaim, Storage
 Manager, GC, operational CLI expansion, runtime hardening, and CI matrices are
 not implemented by this phase.
 
@@ -554,7 +554,14 @@ without blocking unrelated workspaces (plan §40-§42).
   `preflightAcceptedPatch` (read-only target / patch validation) and
   `applyPreflightedPatch` (the actual `git apply` + change-set verify).
   `applyAcceptedPatch` is now a thin wrapper for backward compatibility
-  with the engine and existing tests.
+  with the engine and existing tests. The apply step pipes
+  `preflight.patchBytes` to `git apply --check --binary -` /
+  `git apply --binary -` via stdin so the bytes that were hash-verified in
+  preflight are exactly the bytes that get applied (P0#3). After apply,
+  the function now verifies the **full** working-tree change set (no
+  pathspec) so an unrelated user edit or untracked file in the target
+  workspace flips the comparison to DIVERGED, never silently accepted
+  (P0#4).
 - `src/workspace/change-set.ts` — added
   `computeFullWorkingTreeChangeSet`, which stages `git add -A` (no
   pathspec) against the frozen base so the reconciler can detect
@@ -565,6 +572,30 @@ without blocking unrelated workspaces (plan §40-§42).
   `RESUMED_AND_ACCEPTED`, `RECONCILED_AND_ACCEPTED`, `RECOVERY_REQUIRED`.
   Zero mutations when `processStatus ∈ {alive, unknown}`. SHA-256 verifies
   every correctness-critical artifact before any target write.
+
+  - P0#1 — a partial ACCEPT with `patch.apply.started` durable and the
+    target at `EXACT_EXPECTED_CHANGE_SET` is auto-reconciled: the
+    reconciler freezes the missing artifacts, appends `patch.applied`
+    and `review.accept.completed`, and records the ReplayGuard. Without
+    this disposition, the most common crash window
+    (apply succeeded, journal tail lost before `patch.applied`) would
+    be wrongly classified as `RECOVERY_REQUIRED`.
+  - P0#2 — `PATCH_APPLIED` recovery is verify-only. When the Journal
+    already contains `patch.applied`, the reconciler hashes the
+    on-disk `apply-evidence.json` and `outcome.json`, requires them to
+    match the `patch.applied` payload bindings, and only appends
+    `review.accept.completed`. The two artifacts are never overwritten
+    by the recovery path; mismatch or missing artifacts
+    → `RECOVERY_REQUIRED`.
+  - P1#1 — every `RECOVERY_REQUIRED` verdict whose previous process
+    is gone is also persisted to the Journal as `recovery.required`
+    (CRITICAL), so the safe-hold is durable, not just a string
+    returned to the caller.
+  - P1#2 — the projection's `artifact_path` is now
+    `<artifactRoot>/<executionId>` (absolute), passed explicitly into
+    `appendReduceProject`. Previously it was `attemptId` alone, which
+    produced a relative path that did not match the actual artifact
+    directory.
 - `src/recovery/scanner.ts` — added `PARTIAL_ACCEPT_APPLY_STARTED` to
   `RecoveryIssueKind` and `ISSUE_PRIORITY`, and tightened the
   partial-accept classifier so it now reports
@@ -584,13 +615,20 @@ without blocking unrelated workspaces (plan §40-§42).
   - Emits `patch.apply.started` (CRITICAL) BETWEEN preflight and the
     real `git apply` so a crash mid-apply is distinguishable from
     "apply never started".
+  - Pipes `preflight.patchBytes` to `git apply` via stdin (P0#3) and
+    verifies the **full** working-tree change set after apply (P0#4).
   - Freezes `apply-evidence.json` and `outcome.json` BEFORE
     `patch.applied`, satisfying Phase 0 Artifact-First (plan §28-§30).
   - `review.accept.completed` payload now binds the full result
     (review + patch + apply-evidence + outcome hashes).
   - `ReplayGuard.record` moved AFTER `review.accept.completed` is
     durable (plan §32-§33). The guard is a derived anti-replay cache;
-    the Journal is the authority.
+    the Journal is the authority. A failure here is best-effort
+    maintenance (P1#3) and does not surface as a failed ACCEPT.
+  - `removeTemporaryWorktree` after `review.accept.completed` is also
+    best-effort (P1#3); ACCEPT is already durable, so a cleanup
+    failure cannot reverse it. The leftover worktree will surface as
+    a `RETAINED_WORKTREE_CANDIDATE` for the operator.
   - REVISE / BLOCK decisions now also freeze `outcome.json` so the
     scanner's `MISSING_OUTCOME` check is satisfied for every terminal
     execution.
@@ -616,14 +654,23 @@ validateReview → freeze review.json → review.accept.prepared (CRITICAL)
 ```
 state              target                    verdict
 ACCEPT_PREPARED    CLEAN_BASE                RESUMED_AND_ACCEPTED
-PATCH_APPLIED      EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED
+ACCEPT_PREPARED +  EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED (P0#1)
+  apply.started       (no re-apply; freeze artifacts, finish journal)
+PATCH_APPLIED      EXACT_EXPECTED_CHANGE_SET RECONCILED_AND_ACCEPTED (P0#2)
+                       (verify-only; never overwrite artifacts)
 ACCEPT_PREPARED    EXACT_EXPECTED_CHANGE_SET RECOVERY_REQUIRED
+                       (no apply.started → cannot prove G2M applied the change)
 PATCH_APPLIED      CLEAN_BASE                RECOVERY_REQUIRED
+                       (applied result unprovable)
 PATCH_APPLIED/...  DIVERGED                  RECOVERY_REQUIRED
 PATCH_APPLIED/...  HEAD_MOVED                RECOVERY_REQUIRED
 any                alive / unknown           PROCESS_NOT_PROVEN_GONE
 any                review.accept.completed   ALREADY_ACCEPTED (no-op)
 ```
+
+Every `RECOVERY_REQUIRED` verdict with a proven-gone process is also
+persisted to the Journal as `recovery.required` (CRITICAL, P1#1). The
+safe-hold is durable, not just a string returned to the caller.
 
 ### Verification
 
@@ -637,5 +684,5 @@ any                review.accept.completed   ALREADY_ACCEPTED (no-op)
 
 ## Remaining phases
 
-Crash-safe ACCEPT, cross-process lease, Process Supervisor, Storage Manager,
+Cross-process lease, Process Supervisor, Storage Manager,
 GC, operational CLI, runtime hardening, and CI matrices.

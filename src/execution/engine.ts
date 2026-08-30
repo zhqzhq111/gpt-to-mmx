@@ -859,8 +859,16 @@ export class G2MExecutionEngine {
         });
         // Phase 6 §32: ReplayGuard is a derived anti-replay cache. It
         // MUST never lead the Journal — record only after
-        // review.accept.completed is durable.
-        this.options.replayGuard.record(reviewSignature(review));
+        // review.accept.completed is durable. P1#3: any failure here is
+        // a maintenance issue, not a reason to undo ACCEPT — the
+        // Journal has already committed ACCEPT.
+        try {
+          this.options.replayGuard.record(reviewSignature(review));
+        } catch (error) {
+          // ReplayGuard sync failure cannot reverse ACCEPT. Log and
+          // continue; the next recover / scan will rebuild the cache.
+          void error;
+        }
         newState = "ACCEPTED";
       } else if (review.decision === "BLOCK") {
         await removeTemporaryWorktree(pending.worktree);
@@ -893,7 +901,12 @@ export class G2MExecutionEngine {
         }
       }
       if (review.decision === "ACCEPT") {
-        await removeTemporaryWorktree(pending.worktree);
+        // P1#3: cleanup is best-effort maintenance. ACCEPT is already
+        // durable in the Journal (review.accept.completed). A failure
+        // here must not surface to the caller as a "failed ACCEPT".
+        // The scanner's RETAINED_WORKTREE_CANDIDATE will surface the
+        // leftover for the next operator.
+        await removeTemporaryWorktree(pending.worktree).catch(() => undefined);
       }
       this.pending.delete(pending.bundle.bundleId);
 

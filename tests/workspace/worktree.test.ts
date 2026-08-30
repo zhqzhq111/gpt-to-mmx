@@ -11,6 +11,8 @@ import {
   applyAcceptedPatch,
   collectWorktreePatch,
   createTemporaryWorktree,
+  preflightAcceptedPatch,
+  applyPreflightedPatch,
   removeTemporaryWorktree,
   type TemporaryWorktreeHandle,
 } from "../../src/workspace/worktree.js";
@@ -116,6 +118,73 @@ describe("Temporary Git Worktree", () => {
     expect((await readFile(join(repositoryPath, "new-file.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("accepted new\n");
     expect(await git(repositoryPath, ["rev-parse", "HEAD"])).toBe(baseRevision);
     expect(await git(repositoryPath, ["status", "--porcelain"])).not.toBe("");
+  });
+
+  // ---------------------------------------------------------------------------
+  // P0#3 — Reviewed patch bytes == Applied patch bytes (byte-for-byte).
+  // The preflight already hash-verified the Frozen Patch. The apply step
+  // must pipe the SAME bytes to `git apply` (via stdin), not re-read
+  // `frozen.patch` from disk. We verify by tampering the on-disk file
+  // between preflight and apply — the apply must still succeed because
+  // it uses the preflight bytes, not the tampered file.
+  // ---------------------------------------------------------------------------
+  it("P0#3: apply uses preflight-verified bytes via stdin, not the on-disk patch file", async () => {
+    handle = await createTemporaryWorktree({
+      workspaceId: "robot-arm",
+      repositoryPath,
+      baseRevision,
+      worktreeRoot,
+    });
+    await writeFile(join(handle.worktreePath, "source.txt"), "accepted\n", "utf8");
+    const patch = await collectWorktreePatch(handle, artifactRoot);
+
+    const preflight = await preflightAcceptedPatch(handle, patch, repositoryPath);
+
+    // Tamper the on-disk patch file AFTER preflight. If the apply step
+    // re-reads from disk it will fail; if it pipes the preflight bytes
+    // (correct path) it will succeed.
+    await writeFile(patch.patchPath, Buffer.from("--- this is not a real git patch ---\n", "utf8"));
+    expect(createHash("sha256").update(await readFile(patch.patchPath)).digest("hex"))
+      .not.toBe(patch.patchBlobHash);
+
+    const applied = await applyPreflightedPatch(preflight);
+
+    expect(applied.status).toBe("applied");
+    expect((await readFile(join(repositoryPath, "source.txt"), "utf8")).replace(/\r\n/g, "\n"))
+      .toBe("accepted\n");
+  });
+
+  // ---------------------------------------------------------------------------
+  // P0#4 — Normal ACCEPT must verify the FULL working-tree change set
+  // after `git apply`. An unrelated user edit / untracked file in the
+  // target workspace must flip the comparison to DIVERGED, never
+  // silently accepted. We inject the unrelated file AFTER preflight
+  // (which would otherwise catch it via DIRTY_TARGET) and BEFORE the
+  // post-apply full change set check.
+  // ---------------------------------------------------------------------------
+  it("P0#4: full working-tree change set rejects an unrelated file in the target", async () => {
+    handle = await createTemporaryWorktree({
+      workspaceId: "robot-arm",
+      repositoryPath,
+      baseRevision,
+      worktreeRoot,
+    });
+    await writeFile(join(handle.worktreePath, "source.txt"), "accepted\n", "utf8");
+    const patch = await collectWorktreePatch(handle, artifactRoot);
+
+    // Run preflight first while the target is still clean (otherwise
+    // preflight would refuse with DIRTY_TARGET before the apply step).
+    const preflight = await preflightAcceptedPatch(handle, patch, repositoryPath);
+    // Now inject the unrelated file into the target workspace. This
+    // simulates a concurrent user edit / untracked file that lands
+    // between preflight and the post-apply full change set check.
+    await writeFile(join(repositoryPath, "unrelated.txt"), "user-added\n", "utf8");
+
+    await expect(applyPreflightedPatch(preflight))
+      .rejects.toMatchObject({ code: "PATCH_RESULT_MISMATCH" });
+    // The unrelated file must not be touched by the failed apply.
+    expect((await readFile(join(repositoryPath, "unrelated.txt"), "utf8")).replace(/\r\n/g, "\n"))
+      .toBe("user-added\n");
   });
 
   it("refuses to apply when the target workspace is dirty", async () => {

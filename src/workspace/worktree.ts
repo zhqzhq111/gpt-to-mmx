@@ -7,7 +7,7 @@
  * pushes and never runs through a shell.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 
 import { writeImmutableArtifact } from "../persistence/artifact-writer.js";
 import {
+  computeFullWorkingTreeChangeSet,
   computeIndexedChangeSet,
   computeWorkingTreeChangeSet,
   type ChangeSetEntry,
@@ -145,6 +146,96 @@ async function git(
       error,
     );
   }
+}
+
+/**
+ * Phase 6 P0#3: feed `patchBytes` to `git` via stdin. The preflight already
+ * verified the bytes against `patch_blob_hash`; piping the same bytes here
+ * (instead of re-reading `patchPath` from disk) closes the
+ * "reviewed A / applied B" race where the artifact file is rewritten between
+ * preflight and apply.
+ *
+ * Uses `spawn` (not `execFile({ input })`) because Node's execFile on
+ * Windows does not always close stdin after writing the input buffer —
+ * `git apply` then waits forever for EOF and the call times out. `spawn`
+ * lets us explicitly write the buffer and call `stdin.end()`, which
+ * reliably signals EOF.
+ */
+async function gitStdin(
+  cwd: string,
+  args: readonly string[],
+  patchBytes: Buffer,
+  errorCode: TemporaryWorktreeError["code"],
+): Promise<string> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn("git", [...args], {
+      cwd,
+      windowsHide: true,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, GIT_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+      if (stdout.length > 20 * 1024 * 1024) {
+        child.kill();
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      rejectPromise(
+        new TemporaryWorktreeError(
+          errorCode,
+          `git ${args.join(" ")} (stdin) failed to spawn in ${cwd}: ${error.message}`,
+          error,
+        ),
+      );
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        rejectPromise(
+          new TemporaryWorktreeError(
+            errorCode,
+            `git ${args.join(" ")} (stdin) timed out in ${cwd}`,
+          ),
+        );
+        return;
+      }
+      if (code === 0) {
+        resolvePromise(stdout);
+        return;
+      }
+      rejectPromise(
+        new TemporaryWorktreeError(
+          errorCode,
+          `git ${args.join(" ")} (stdin) failed in ${cwd} (exit ${code}): ${stderr.trim()}`,
+        ),
+      );
+    });
+    // Write the patch bytes, then explicitly close stdin so `git apply`
+    // sees EOF and proceeds.
+    child.stdin.on("error", (error) => {
+      clearTimeout(timer);
+      rejectPromise(
+        new TemporaryWorktreeError(
+          errorCode,
+          `git ${args.join(" ")} (stdin) failed to write: ${error.message}`,
+          error,
+        ),
+      );
+    });
+    child.stdin.end(patchBytes);
+  });
 }
 
 async function gitBuffer(
@@ -390,21 +481,33 @@ export async function preflightAcceptedPatch(
 }
 
 /**
- * Phase 6 apply — runs `git apply --check` / `git apply` and computes the
- * full working-tree change set. Caller MUST have emitted
- * `patch.apply.started` to the Journal BEFORE calling this; recovery
- * assumes the event is durable so it can distinguish
- * "apply never started" from "apply succeeded, journal tail missing".
+ * Phase 6 apply — runs `git apply --check --binary -` and
+ * `git apply --binary -` (stdin) and verifies the FULL working-tree change
+ * set. Caller MUST have emitted `patch.apply.started` to the Journal
+ * BEFORE calling this; recovery assumes the event is durable so it can
+ * distinguish "apply never started" from "apply succeeded, journal tail
+ * missing".
+ *
+ * P0#3: we feed `preflight.patchBytes` to git via stdin instead of re-reading
+ * the patch file from disk. This guarantees the bytes that were hash-verified
+ * in preflight are the bytes actually applied — closing the
+ * "reviewed A / applied B" window where `frozen.patch` is rewritten between
+ * preflight and apply.
+ *
+ * P0#4: after `git apply` we compute the FULL working-tree change set
+ * (`git add -A`, no pathspec) and require its hash to match the Frozen
+ * Patch's expected change set. An unrelated user edit / untracked file in
+ * the target workspace now flips the comparison to DIVERGED, never
+ * silently accepted.
  */
 export async function applyPreflightedPatch(
   preflight: AcceptedPatchPreflight,
 ): Promise<ApplyAcceptedPatchResult> {
   if (preflight.changedFiles.length === 0) {
     // No changes expected: verify the working tree is still CLEAN_BASE.
-    const actualChangeSet = await computeWorkingTreeChangeSet(
+    const actualChangeSet = await computeFullWorkingTreeChangeSet(
       preflight.repositoryPath,
       preflight.baseRevision,
-      preflight.changedFiles,
       preflight.temporaryRoot,
     );
     if (actualChangeSet.hash !== preflight.expectedChangeSetHash) {
@@ -425,21 +528,25 @@ export async function applyPreflightedPatch(
     });
   }
 
-  await git(
+  await gitStdin(
     preflight.repositoryPath,
-    ["apply", "--check", "--binary", preflight.patchPath],
+    ["apply", "--check", "--binary", "-"],
+    preflight.patchBytes,
     "APPLY_CHECK_FAILED",
   );
-  await git(
+  await gitStdin(
     preflight.repositoryPath,
-    ["apply", "--binary", preflight.patchPath],
+    ["apply", "--binary", "-"],
+    preflight.patchBytes,
     "APPLY_FAILED",
   );
 
-  const actualChangeSet = await computeWorkingTreeChangeSet(
+  // P0#4: full-tree change set (no pathspec) so unrelated user edits /
+  // untracked files in the target break ACCEPT instead of being silently
+  // carried into the journal.
+  const actualChangeSet = await computeFullWorkingTreeChangeSet(
     preflight.repositoryPath,
     preflight.baseRevision,
-    preflight.changedFiles,
     preflight.temporaryRoot,
   );
   if (actualChangeSet.hash !== preflight.expectedChangeSetHash) {

@@ -74,10 +74,16 @@ interface Fixture {
   readonly reviewBundleId: string;
   readonly reviewHash: string;
   readonly baseRevision: string;
+  /** Pre-applied apply-evidence hash (only set when artifacts were pre-written). */
+  readonly applyEvidenceHash?: string;
+  /** Pre-applied outcome hash (only set when artifacts were pre-written). */
+  readonly outcomeHash?: string;
+  /** Number of times the target file was written. Used by tamper detection. */
+  readonly applyInvocations?: number;
   database?: StateDatabase;
 }
 
-async function makeFixture(setup: "clean" | "applied" | "partial-extra"): Promise<Fixture> {
+async function makeFixture(setup: "clean" | "applied" | "partial-extra" | "mid-apply"): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "g2m-accept-reconciler-"));
   roots.push(root);
   const repositoryPath = join(root, "repo");
@@ -238,12 +244,61 @@ async function makeFixture(setup: "clean" | "applied" | "partial-extra"): Promis
   const reviewArtifactHash = sha256Hex(reviewJsonBytes);
 
   if (setup === "applied") {
-    // Pre-apply the patch so target == EXACT_EXPECTED_CHANGE_SET.
+    // P0#2: pre-apply the patch so target == EXACT_EXPECTED_CHANGE_SET.
+    // The apply-evidence.json and outcome.json artifacts are also on
+    // disk because the normal path writes them between `git apply` and
+    // `patch.applied`. The reconciler must verify, not overwrite.
+    await git(repositoryPath, ["apply", "--binary", join(executionArtifact, "frozen.patch")]);
+  } else if (setup === "mid-apply") {
+    // P0#1: pre-apply the patch so target == EXACT_EXPECTED_CHANGE_SET,
+    // but DO NOT pre-write the apply-evidence / outcome artifacts. The
+    // crash happened after `git apply` but before either artifact was
+    // written. The recovery path is what creates them with
+    // `recovery_mode: true`.
     await git(repositoryPath, ["apply", "--binary", join(executionArtifact, "frozen.patch")]);
   } else if (setup === "partial-extra") {
     // Apply the patch and add an extra user file.
     await git(repositoryPath, ["apply", "--binary", join(executionArtifact, "frozen.patch")]);
     await writeFile(join(repositoryPath, "user-note.txt"), "unrelated\n", "utf8");
+  }
+
+  // In `applied` mode the immutable apply-evidence.json and outcome.json
+  // artifacts are also on disk (P0#2). We compute the SAME bytes the
+  // normal path would write (recovery_mode: false) so the SHA-256
+  // bindings in the `patch.applied` test event match the file contents.
+  let applyEvidenceHash: string | undefined;
+  let outcomeHash: string | undefined;
+  if (setup === "applied") {
+    const evidencePayload = {
+      schema_version: 1,
+      execution_id: executionId,
+      patch_blob_hash: patchBlobHash,
+      expected_change_set_hash: changeSetHash,
+      actual_change_set_hash: changeSetHash,
+      base_revision: baseRevision,
+      target_path: repositoryPath,
+      status: "applied",
+      recovery_mode: false,
+      applied_at: 0,
+    };
+    const evidenceBytes = Buffer.from(JSON.stringify(evidencePayload, null, 2) + "\n", "utf8");
+    applyEvidenceHash = sha256Hex(evidenceBytes);
+    await writeFile(join(executionArtifact, "apply-evidence.json"), evidenceBytes);
+    const outcomePayload = {
+      schema_version: 1,
+      task_id: "task-1",
+      execution_id: executionId,
+      decision: "ACCEPT",
+      state: "ACCEPTED",
+      patch_status: "applied",
+      patch_blob_hash: patchBlobHash,
+      change_set_hash: changeSetHash,
+      review_id: reviewId,
+      review_bundle_id: reviewBundleId,
+    };
+    const outcomeBytes = Buffer.from(JSON.stringify(outcomePayload, null, 2) + "\n", "utf8");
+    outcomeHash = sha256Hex(outcomeBytes);
+    await writeFile(join(executionArtifact, "outcome.json"), outcomeBytes);
   }
 
   return {
@@ -258,6 +313,8 @@ async function makeFixture(setup: "clean" | "applied" | "partial-extra"): Promis
     reviewBundleId,
     reviewHash,
     baseRevision,
+    ...(applyEvidenceHash !== undefined ? { applyEvidenceHash } : {}),
+    ...(outcomeHash !== undefined ? { outcomeHash } : {}),
   };
 }
 
@@ -506,7 +563,7 @@ describe("Accept Reconciler", () => {
     expect(content).toBe("after\n");
   });
 
-  it("reconciles a target already at EXACT_EXPECTED_CHANGE_SET without re-applying", async () => {
+  it("reconciles a target already at EXACT_EXPECTED_CHANGE_SET without re-applying (P0#2 verify-only)", async () => {
     const fixture = await makeFixture("applied");
     const events = buildBaseEvents(fixture, true);
     events.push({
@@ -525,8 +582,8 @@ describe("Accept Reconciler", () => {
         patch_blob_hash: fixture.patchBlobHash,
         expected_change_set_hash: fixture.changeSetHash,
         actual_change_set_hash: fixture.changeSetHash,
-        apply_evidence_hash: "0".repeat(64),
-        outcome_hash: "0".repeat(64),
+        apply_evidence_hash: fixture.applyEvidenceHash ?? "0".repeat(64),
+        outcome_hash: fixture.outcomeHash ?? "0".repeat(64),
         status: "applied",
         targetPath: fixture.repositoryPath,
       },
@@ -537,6 +594,15 @@ describe("Accept Reconciler", () => {
     expect(result.verdict).toBe("RECONCILED_AND_ACCEPTED");
     expect(result.targetState).toBe("EXACT_EXPECTED_CHANGE_SET");
     expect(result.appendedEvents).toEqual(["review.accept.completed"]);
+    // P0#2: artifacts on disk are immutable evidence. The reconciler
+    // verifies their hashes and only appends the terminal journal event.
+    // Re-running recovery with the persisted events is idempotent and
+    // must not duplicate the journal.
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const second = await runAcceptRecovery({ ...input, events: persisted });
+    expect(second.verdict).toBe("ALREADY_ACCEPTED");
+    const completed = persisted.filter((event) => event.type === "review.accept.completed").length;
+    expect(completed).toBe(1);
   });
 
   it("refuses when HEAD has moved (no target mutation)", async () => {
@@ -613,5 +679,140 @@ describe("Accept Reconciler", () => {
     expect(second.verdict).toBe("ALREADY_ACCEPTED");
     const completed = persisted.filter((event) => event.type === "review.accept.completed").length;
     expect(completed).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // P0#1: ACCEPT_PREPARED + patch.apply.started + EXACT_EXPECTED_CHANGE_SET
+  //        must auto-reconcile (no re-apply, no REVOVERY_REQUIRED).
+  //        The most common crash window: apply succeeded, journal tail
+  //        lost before `patch.applied`.
+  // ---------------------------------------------------------------------------
+  it("P0#1: auto-reconciles ACCEPT_PREPARED + apply.started + EXACT (no re-apply)", async () => {
+    const fixture = await makeFixture("mid-apply");
+    const events = buildBaseEvents(fixture, true); // include apply.started
+    // No `patch.applied` event — the crash happened between `git apply`
+    // success and the `patch.applied` journal line.
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECONCILED_AND_ACCEPTED");
+    expect(result.targetState).toBe("EXACT_EXPECTED_CHANGE_SET");
+    expect(result.originalState).toBe("ACCEPT_PREPARED");
+    // The journal events appended by recovery — note `patch.apply.started`
+    // is NOT in this list because it was already durable before the crash.
+    expect(result.appendedEvents).toEqual(["patch.applied", "review.accept.completed"]);
+    // The target file content is "after\n" and the reconciler must NOT
+    // have re-applied the patch (re-apply is for the CLEAN_BASE path).
+    const content = readFileSync(join(fixture.repositoryPath, "source.txt"), "utf8").replace(/\r\n/g, "\n");
+    expect(content).toBe("after\n");
+    // Recovery is idempotent.
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const second = await runAcceptRecovery({ ...input, events: persisted });
+    expect(second.verdict).toBe("ALREADY_ACCEPTED");
+  });
+
+  // ---------------------------------------------------------------------------
+  // P0#1 negative case: ACCEPT_PREPARED + EXACT but NO apply.started.
+  //                  G2M cannot prove the change set was applied by us
+  //                  (maybe a stale worktree from a prior session) —
+  //                  must refuse.
+  // ---------------------------------------------------------------------------
+  it("P0#1 negative: ACCEPT_PREPARED + EXACT without apply.started → RECOVERY_REQUIRED", async () => {
+    const fixture = await makeFixture("applied");
+    const events = buildBaseEvents(fixture, false); // NO apply.started
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.targetState).toBe("EXACT_EXPECTED_CHANGE_SET");
+    // P1#1: the safe-hold is persisted to the Journal.
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
+    const persisted = input.eventStore.getByAttemptId("exec-1");
+    const required = persisted.find((event) => event.type === "recovery.required");
+    expect(required).toBeDefined();
+    expect((required?.payload as { partial_accept?: unknown }).partial_accept).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // P0#2: PATCH_APPLIED + EXACT + matching on-disk artifacts
+  //        → verify-only, NEVER overwrite, only append
+  //        `review.accept.completed`.
+  // ---------------------------------------------------------------------------
+  it("P0#2: PATCH_APPLIED verifies existing artifacts and never overwrites them", async () => {
+    const fixture = await makeFixture("applied");
+    const events = buildBaseEvents(fixture, true);
+    events.push({
+      schemaVersion: 1,
+      eventId: "applied",
+      seq: 14,
+      timestampMs: 13,
+      taskId: "task-1",
+      attemptId: "exec-1",
+      domain: "lifecycle",
+      type: "patch.applied",
+      durability: "CRITICAL",
+      prevHash: "h13",
+      hash: "h14",
+      payload: {
+        patch_blob_hash: fixture.patchBlobHash,
+        expected_change_set_hash: fixture.changeSetHash,
+        actual_change_set_hash: fixture.changeSetHash,
+        apply_evidence_hash: fixture.applyEvidenceHash ?? "0".repeat(64),
+        outcome_hash: fixture.outcomeHash ?? "0".repeat(64),
+        status: "applied",
+        targetPath: fixture.repositoryPath,
+      },
+      fingerprint: FINGERPRINT,
+    });
+    // Record the on-disk bytes BEFORE recovery. P0#2 says: they must be
+    // identical AFTER recovery (the reconciler MUST NOT overwrite).
+    const evidencePath = join(fixture.artifactRoot, "exec-1", "apply-evidence.json");
+    const outcomePath = join(fixture.artifactRoot, "exec-1", "outcome.json");
+    const evidenceBefore = readFileSync(evidencePath);
+    const outcomeBefore = readFileSync(outcomePath);
+    const input = makeInput(fixture, "exited_clean", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECONCILED_AND_ACCEPTED");
+    expect(result.appendedEvents).toEqual(["review.accept.completed"]);
+    expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+    expect(readFileSync(outcomePath)).toEqual(outcomeBefore);
+  });
+
+  // ---------------------------------------------------------------------------
+  // P0#2 negative: PATCH_APPLIED + EXACT but on-disk artifact hash
+  //                  does NOT match the event binding
+  //                  → RECOVERY_REQUIRED (corrupted; operator decides).
+  // ---------------------------------------------------------------------------
+  it("P0#2 negative: PATCH_APPLIED + tampered outcome.json → RECOVERY_REQUIRED", async () => {
+    const fixture = await makeFixture("applied");
+    // Tamper outcome.json on disk after pre-write.
+    const outcomePath = join(fixture.artifactRoot, "exec-1", "outcome.json");
+    await writeFile(outcomePath, Buffer.from("{ \"tampered\": true }\n", "utf8"));
+    const events = buildBaseEvents(fixture, true);
+    events.push({
+      schemaVersion: 1,
+      eventId: "applied",
+      seq: 14,
+      timestampMs: 13,
+      taskId: "task-1",
+      attemptId: "exec-1",
+      domain: "lifecycle",
+      type: "patch.applied",
+      durability: "CRITICAL",
+      prevHash: "h13",
+      hash: "h14",
+      payload: {
+        patch_blob_hash: fixture.patchBlobHash,
+        expected_change_set_hash: fixture.changeSetHash,
+        actual_change_set_hash: fixture.changeSetHash,
+        apply_evidence_hash: fixture.applyEvidenceHash ?? "0".repeat(64),
+        outcome_hash: fixture.outcomeHash ?? "0".repeat(64),
+        status: "applied",
+        targetPath: fixture.repositoryPath,
+      },
+      fingerprint: FINGERPRINT,
+    });
+    const input = makeInput(fixture, "crashed", events);
+    const result = await runAcceptRecovery(input);
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.appendedEvents).toEqual(["recovery.required"]);
   });
 });

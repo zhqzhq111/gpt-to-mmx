@@ -2,20 +2,30 @@
  * Phase 6 Accept Reconciler — plan §15-§26.
  *
  * Resumes or reconciles a partial ACCEPT execution whose previous process
- * has been proven gone. Three forward dispositions:
+ * has been proven gone. Forward dispositions:
  *
- *   1. RESUMED_AND_ACCEPTED   — apply never started (or was rolled back);
- *                                target is CLEAN_BASE; re-apply the Frozen
- *                                Patch and complete ACCEPT.
- *   2. RECONCILED_AND_ACCEPTED — apply succeeded but the Journal was cut
- *                                off before `patch.applied` /
- *                                `review.accept.completed`; target is
- *                                EXACT_EXPECTED_CHANGE_SET; freeze the
- *                                missing artifacts and finish the journal
- *                                WITHOUT touching the target.
- *   3. RECOVERY_REQUIRED      — any evidence gap (mismatch, divergence,
+ *   1. RESUMED_AND_ACCEPTED    — Journal has `review.accept.prepared` but
+ *                                no `patch.apply.started`; target is
+ *                                CLEAN_BASE. Append the lifecycle events
+ *                                and re-apply the Frozen Patch.
+ *   2. RECONCILED_AND_ACCEPTED — two sub-cases (P0#1, P0#2):
+ *      a) Journal has `patch.apply.started` but neither `patch.applied`
+ *         nor `review.accept.completed`; target is
+ *         EXACT_EXPECTED_CHANGE_SET. Apply already succeeded; just
+ *         freeze the missing artifacts and complete the journal WITHOUT
+ *         touching the target.
+ *      b) Journal has `patch.applied`; target is
+ *         EXACT_EXPECTED_CHANGE_SET; `apply-evidence.json` and
+ *         `outcome.json` exist on disk with hashes matching the
+ *         `patch.applied` payload. Verify (do NOT overwrite) and only
+ *         append `review.accept.completed`.
+ *   3. RECOVERY_REQUIRED       — any evidence gap (mismatch, divergence,
  *                                head movement, missing artifact) forces
  *                                a human decision. ZERO target mutation.
+ *                                The verdict is also persisted to the
+ *                                Journal as `recovery.required` (P1#1) so
+ *                                the safe-hold is durable, not just
+ *                                returned to the caller.
  *
  * Plus three early-exit verdicts:
  *
@@ -39,6 +49,14 @@
  *   - When target == EXACT_EXPECTED_CHANGE_SET we verify the FULL working
  *     tree, not just the patch's declared files (so an unrelated user
  *     edit makes us abort, not silently overwrite).
+ *   - When `patch.applied` is already in the Journal, the
+ *     `apply-evidence.json` and `outcome.json` artifacts on disk are
+ *     treated as IMMUTABLE EVIDENCE — verify their hashes, never
+ *     overwrite (P0#2).
+ *   - `review.accept.completed` in the Journal is the terminal commit
+ *     point. Once it is durable, subsequent failures (ReplayGuard sync,
+ *     worktree cleanup) are best-effort maintenance, not a way to undo
+ *     ACCEPT.
  */
 
 import { createHash } from "node:crypto";
@@ -367,6 +385,7 @@ interface MutableState {
 function appendReduceProject(
   eventStore: EventStore,
   projector: ExecutionProjection,
+  artifactRoot: string,
   fingerprintRegistry: FingerprintRegistry,
   mutable: MutableState,
   input: {
@@ -386,7 +405,13 @@ function appendReduceProject(
   mutable.state = next;
   if (event.durability === "CRITICAL") {
     try {
-      projector.project(event, next, { artifactPath: resolve(event.attemptId) });
+      // P1#2: the projection `artifact_path` is the absolute directory the
+      // engine / recovery wrote artifacts into — `<artifactRoot>/<executionId>`
+      // — NOT a relative attemptId. Passing only `attemptId` made the
+      // projection column point at a non-existent relative path.
+      projector.project(event, next, {
+        artifactPath: resolve(artifactRoot, input.executionId),
+      });
     } catch (error) {
       eventStore.append({
         taskId: input.taskId,
@@ -404,9 +429,135 @@ function appendReduceProject(
 }
 
 // ---------------------------------------------------------------------------
-// Apply-evidence / outcome builders — kept deterministic so Normal Path
-// and Recovery Path generate the same bytes for the same inputs.
+// Apply-artifact freeze + verify helpers.
 // ---------------------------------------------------------------------------
+
+/**
+ * Freeze both `apply-evidence.json` and `outcome.json` as immutable
+ * artifacts. Used by RESUMED and Case A' (mid-apply crash) where the
+ * Journal never reached `patch.applied`. Idempotent: if a file with the
+ * same name already exists with the same hash, we return the existing
+ * hash instead of writing. If the existing file has different content,
+ * we throw — recovery must NOT silently overwrite immutable evidence
+ * with different bytes.
+ */
+async function freezeApplyArtifacts(
+  artifactRoot: string,
+  executionId: string,
+  evidencePayload: Record<string, unknown>,
+  outcomePayload: Record<string, unknown>,
+): Promise<{ readonly evidenceArtifact: { readonly path: string; readonly sha256: string; readonly bytes: number }; readonly outcomeArtifact: { readonly path: string; readonly sha256: string; readonly bytes: number } }> {
+  const evidenceBytes = Buffer.from(`${JSON.stringify(evidencePayload, null, 2)}\n`, "utf8");
+  const outcomeBytes = Buffer.from(`${JSON.stringify(outcomePayload, null, 2)}\n`, "utf8");
+  const evidencePath = resolve(artifactRoot, executionId, "apply-evidence.json");
+  const outcomePath = resolve(artifactRoot, executionId, "outcome.json");
+  const evidenceArtifact = await freezeOrVerify(evidencePath, evidenceBytes, "apply-evidence.json");
+  const outcomeArtifact = await freezeOrVerify(outcomePath, outcomeBytes, "outcome.json");
+  return { evidenceArtifact, outcomeArtifact };
+}
+
+async function freezeOrVerify(
+  path: string,
+  bytes: Buffer,
+  label: string,
+): Promise<{ readonly path: string; readonly sha256: string; readonly bytes: number }> {
+  const existing = readOptionalFile(path);
+  if (existing !== undefined) {
+    const existingHash = sha256(existing);
+    const expectedHash = sha256(bytes);
+    if (existingHash !== expectedHash) {
+      throw new RecoverableError(
+        "ARTIFACT_HASH_MISMATCH",
+        `${label} exists but its hash ${existingHash} does not match the expected ${expectedHash}`,
+      );
+    }
+    return { path, sha256: existingHash, bytes: existing.length };
+  }
+  return writeImmutableArtifact(path, bytes);
+}
+
+type VerifyApplyArtifactsResult =
+  | { readonly kind: "ok"; readonly evidenceHash: string; readonly outcomeHash: string }
+  | { readonly kind: "missing"; readonly detail: string }
+  | { readonly kind: "mismatch"; readonly detail: string };
+
+/**
+ * P0#2: the artifacts on disk are the immutable evidence. Read them,
+ * hash them, and require their hashes to match the `patch.applied`
+ * payload. We never overwrite.
+ */
+function verifyExistingApplyArtifacts(
+  artifactRoot: string,
+  executionId: string,
+  patchAppliedEvent: TaskEvent,
+): VerifyApplyArtifactsResult {
+  const expectedEvidence = stringField(patchAppliedEvent, "apply_evidence_hash", "applyEvidenceHash");
+  const expectedOutcome = stringField(patchAppliedEvent, "outcome_hash", "outcomeHash");
+  if (expectedEvidence === undefined || expectedOutcome === undefined) {
+    return { kind: "mismatch", detail: "patch.applied event has no apply_evidence_hash / outcome_hash" };
+  }
+  const evidencePath = resolve(artifactRoot, executionId, "apply-evidence.json");
+  const evidenceBytes = readOptionalFile(evidencePath);
+  if (evidenceBytes === undefined) {
+    return { kind: "missing", detail: "apply-evidence.json is missing" };
+  }
+  const evidenceHash = sha256(evidenceBytes);
+  if (evidenceHash !== expectedEvidence) {
+    return { kind: "mismatch", detail: `apply-evidence.json hash ${evidenceHash} != expected ${expectedEvidence}` };
+  }
+  const outcomePath = resolve(artifactRoot, executionId, "outcome.json");
+  const outcomeBytes = readOptionalFile(outcomePath);
+  if (outcomeBytes === undefined) {
+    return { kind: "missing", detail: "outcome.json is missing" };
+  }
+  const outcomeHash = sha256(outcomeBytes);
+  if (outcomeHash !== expectedOutcome) {
+    return { kind: "mismatch", detail: `outcome.json hash ${outcomeHash} != expected ${expectedOutcome}` };
+  }
+  return { kind: "ok", evidenceHash, outcomeHash };
+}
+
+/**
+ * P1#1: when the previous process is gone and the target is in an
+ * unrecoverable state, persist `recovery.required` to the Journal so the
+ * safe-hold is durable, not just a string returned to the caller.
+ */
+async function persistRecoveryRequired(
+  input: AcceptRecoveryInput,
+  base: AcceptRecoveryResult,
+  mutable: MutableState,
+  detail: { readonly targetState?: AcceptTargetState; readonly reason: string },
+): Promise<AcceptRecoveryResult> {
+  const taskIdEvent = input.events.find((event) => event.type === "task.created");
+  const taskId = taskIdEvent?.taskId ?? "unknown";
+  const recoveryEvent = input.eventStore.append({
+    taskId,
+    attemptId: input.executionId,
+    type: "recovery.required",
+    payload: {
+      reason: detail.reason,
+      partial_accept: true,
+      ...(detail.targetState !== undefined ? { target_state: detail.targetState } : {}),
+    },
+  });
+  const next = reduce(mutable.state, recoveryEvent, { fingerprintRegistry: input.fingerprintRegistry });
+  mutable.state = next;
+  try {
+    input.projector.project(recoveryEvent, next, {
+      artifactPath: resolve(input.artifactRoot, input.executionId),
+    });
+  } catch {
+    // swallow; the CRITICAL recovery.required event itself is durable
+  }
+  return {
+    ...base,
+    verdict: "RECOVERY_REQUIRED",
+    ...(detail.targetState !== undefined ? { targetState: detail.targetState } : {}),
+    finalState: mutable.state ?? base.finalState,
+    reason: detail.reason,
+    appendedEvents: [recoveryEvent.type],
+  };
+}
 
 function buildApplyEvidence(
   executionId: string,
@@ -602,12 +753,10 @@ export async function runAcceptRecovery(
   }
 
   if (target.state === "HEAD_MOVED") {
-    return {
-      ...base,
-      verdict: "RECOVERY_REQUIRED",
+    return await persistRecoveryRequired(input, base, { state: originalState }, {
       targetState: "HEAD_MOVED",
       reason: `target HEAD is not at frozen base ${bindings.baseRevision}`,
-    };
+    });
   }
 
   const mutable: MutableState = { state: originalState };
@@ -617,11 +766,16 @@ export async function runAcceptRecovery(
     reviewHash: bindings.reviewHash,
     decision: "ACCEPT",
   };
+  const applyStarted = input.events.some((event) => event.type === "patch.apply.started");
+  const patchApplied = input.events.find((event) => event.type === "patch.applied");
 
   // --- Case A: ACCEPT_PREPARED + CLEAN_BASE → RESUMED_AND_ACCEPTED ---
+  // Journal tail stopped before `patch.apply.started` and the target
+  // workspace is still at the frozen base. The Frozen Patch was never
+  // applied, so we re-apply and complete ACCEPT.
   if (originalState === "ACCEPT_PREPARED" && target.state === "CLEAN_BASE") {
-    if (!input.events.some((event) => event.type === "patch.apply.started")) {
-      appendReduceProject(input.eventStore, input.projector, input.fingerprintRegistry, mutable, {
+    if (!applyStarted) {
+      appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
         taskId: bindings.taskId,
         executionId: input.executionId,
         type: "patch.apply.started",
@@ -643,28 +797,18 @@ export async function runAcceptRecovery(
     try {
       applied = await applyPreflightedPatch(preflight);
     } catch (error) {
-      return {
-        ...base,
-        verdict: "RECOVERY_REQUIRED",
+      return await persistRecoveryRequired(input, base, mutable, {
         targetState: "CLEAN_BASE",
         reason: `reconciled apply failed: ${(error as Error).message}`,
-      };
+      });
     }
-    const evidenceArtifact = await writeImmutableArtifact(
-      resolve(input.artifactRoot, input.executionId, "apply-evidence.json"),
-      Buffer.from(
-        `${JSON.stringify(buildApplyEvidence(input.executionId, bindings.baseRevision, applied, true), null, 2)}\n`,
-        "utf8",
-      ),
+    const { evidenceArtifact, outcomeArtifact } = await freezeApplyArtifacts(
+      input.artifactRoot,
+      input.executionId,
+      buildApplyEvidence(input.executionId, bindings.baseRevision, applied, true),
+      buildOutcome(input.executionId, bindings, applied),
     );
-    const outcomeArtifact = await writeImmutableArtifact(
-      resolve(input.artifactRoot, input.executionId, "outcome.json"),
-      Buffer.from(
-        `${JSON.stringify(buildOutcome(input.executionId, bindings, applied), null, 2)}\n`,
-        "utf8",
-      ),
-    );
-    appendReduceProject(input.eventStore, input.projector, input.fingerprintRegistry, mutable, {
+    appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
       taskId: bindings.taskId,
       executionId: input.executionId,
       type: "patch.applied",
@@ -679,7 +823,7 @@ export async function runAcceptRecovery(
       },
     });
     appended.push("patch.applied");
-    appendReduceProject(input.eventStore, input.projector, input.fingerprintRegistry, mutable, {
+    appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
       taskId: bindings.taskId,
       executionId: input.executionId,
       type: "review.accept.completed",
@@ -708,24 +852,41 @@ export async function runAcceptRecovery(
     };
   }
 
-  // --- Case C: PATCH_APPLIED + EXACT_EXPECTED_CHANGE_SET → RECONCILED_AND_ACCEPTED ---
-  if (originalState === "PATCH_APPLIED" && target.state === "EXACT_EXPECTED_CHANGE_SET") {
+  // --- Case A' (P0#1): ACCEPT_PREPARED + apply.started EXISTS + EXACT → RECONCILED_AND_ACCEPTED ---
+  // The crash happened AFTER `git apply` succeeded but BEFORE
+  // `patch.applied` / `review.accept.completed` were written. The Frozen
+  // Patch bytes are already on disk, the target matches, and the
+  // Journal proves G2M started the apply. We freeze the missing
+  // artifacts (defensively — they may already exist with the same
+  // bytes) and finish the journal WITHOUT re-running `git apply`.
+  if (
+    originalState === "ACCEPT_PREPARED" &&
+    applyStarted &&
+    target.state === "EXACT_EXPECTED_CHANGE_SET"
+  ) {
     const applied = synthesizeAppliedFromTarget(bindings, input.repositoryPath, target.actualChangeSetHash);
-    const evidenceArtifact = await writeImmutableArtifact(
-      resolve(input.artifactRoot, input.executionId, "apply-evidence.json"),
-      Buffer.from(
-        `${JSON.stringify(buildApplyEvidence(input.executionId, bindings.baseRevision, applied, true), null, 2)}\n`,
-        "utf8",
-      ),
+    const { evidenceArtifact, outcomeArtifact } = await freezeApplyArtifacts(
+      input.artifactRoot,
+      input.executionId,
+      buildApplyEvidence(input.executionId, bindings.baseRevision, applied, true),
+      buildOutcome(input.executionId, bindings, applied),
     );
-    const outcomeArtifact = await writeImmutableArtifact(
-      resolve(input.artifactRoot, input.executionId, "outcome.json"),
-      Buffer.from(
-        `${JSON.stringify(buildOutcome(input.executionId, bindings, applied), null, 2)}\n`,
-        "utf8",
-      ),
-    );
-    appendReduceProject(input.eventStore, input.projector, input.fingerprintRegistry, mutable, {
+    appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
+      taskId: bindings.taskId,
+      executionId: input.executionId,
+      type: "patch.applied",
+      payload: {
+        patch_blob_hash: applied.patchBlobHash,
+        expected_change_set_hash: applied.expectedChangeSetHash,
+        actual_change_set_hash: applied.actualChangeSetHash,
+        apply_evidence_hash: evidenceArtifact.sha256,
+        outcome_hash: outcomeArtifact.sha256,
+        status: applied.status,
+        targetPath: applied.targetPath,
+      },
+    });
+    appended.push("patch.applied");
+    appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
       taskId: bindings.taskId,
       executionId: input.executionId,
       type: "review.accept.completed",
@@ -744,38 +905,86 @@ export async function runAcceptRecovery(
     return {
       verdict: "RECONCILED_AND_ACCEPTED",
       executionId: input.executionId,
-      originalState: "PATCH_APPLIED",
+      originalState: "ACCEPT_PREPARED",
       finalState: "ACCEPTED",
       targetState: "EXACT_EXPECTED_CHANGE_SET",
-      reason: "target already matches the frozen change set; finished journal without re-apply",
+      reason: "target already matches the frozen change set after apply.started; finished journal without re-apply",
       appendedEvents: appended,
       applyEvidenceHash: evidenceArtifact.sha256,
       outcomeHash: outcomeArtifact.sha256,
     };
   }
 
-  // --- Remaining cases are unrecoverable without human decision ---
-  if (originalState === "ACCEPT_PREPARED" && target.state === "EXACT_EXPECTED_CHANGE_SET") {
+  // --- Case C (P0#2): PATCH_APPLIED + EXACT → RECONCILED_AND_ACCEPTED (verify-only) ---
+  // The Journal has `patch.applied`; the target is
+  // EXACT_EXPECTED_CHANGE_SET. The `apply-evidence.json` and
+  // `outcome.json` artifacts on disk are IMMUTABLE EVIDENCE — we
+  // MUST verify their hashes match the `patch.applied` payload
+  // and only append `review.accept.completed`. We never overwrite
+  // these artifacts.
+  if (originalState === "PATCH_APPLIED" && target.state === "EXACT_EXPECTED_CHANGE_SET") {
+    if (patchApplied === undefined) {
+      return await persistRecoveryRequired(input, base, mutable, {
+        targetState: "EXACT_EXPECTED_CHANGE_SET",
+        reason: "PATCH_APPLIED state but no patch.applied event in journal",
+      });
+    }
+    const verifyResult = verifyExistingApplyArtifacts(
+      input.artifactRoot,
+      input.executionId,
+      patchApplied,
+    );
+    if (verifyResult.kind === "missing" || verifyResult.kind === "mismatch") {
+      return await persistRecoveryRequired(input, base, mutable, {
+        targetState: "EXACT_EXPECTED_CHANGE_SET",
+        reason: `apply-evidence / outcome on disk ${verifyResult.kind} (${verifyResult.detail})`,
+      });
+    }
+    appendReduceProject(input.eventStore, input.projector, input.artifactRoot, input.fingerprintRegistry, mutable, {
+      taskId: bindings.taskId,
+      executionId: input.executionId,
+      type: "review.accept.completed",
+      payload: {
+        reviewId: bindings.reviewId,
+        reviewBundleId: bindings.reviewBundleId,
+        reviewHash: bindings.reviewHash,
+        patch_blob_hash: bindings.patchBlobHash,
+        change_set_hash: bindings.changeSetHash,
+        apply_evidence_hash: verifyResult.evidenceHash,
+        outcome_hash: verifyResult.outcomeHash,
+      },
+    });
+    appended.push("review.accept.completed");
+    input.replayGuard.record(signature);
     return {
-      ...base,
-      verdict: "RECOVERY_REQUIRED",
+      verdict: "RECONCILED_AND_ACCEPTED",
+      executionId: input.executionId,
+      originalState: "PATCH_APPLIED",
+      finalState: "ACCEPTED",
       targetState: "EXACT_EXPECTED_CHANGE_SET",
-      reason: "ACCEPT_PREPARED but target already shows the expected change set; possible stale worktree",
-    };
-  }
-  if (originalState === "PATCH_APPLIED" && target.state === "CLEAN_BASE") {
-    return {
-      ...base,
-      verdict: "RECOVERY_REQUIRED",
-      targetState: "CLEAN_BASE",
-      reason: "PATCH_APPLIED but target is CLEAN_BASE; the applied result is unprovable",
+      reason: "patch.applied present; verified apply-evidence and outcome hashes, finished journal without re-writing artifacts",
+      appendedEvents: appended,
+      applyEvidenceHash: verifyResult.evidenceHash,
+      outcomeHash: verifyResult.outcomeHash,
     };
   }
 
-  return {
-    ...base,
-    verdict: "RECOVERY_REQUIRED",
+  // --- Remaining cases are unrecoverable without human decision ---
+  if (originalState === "ACCEPT_PREPARED" && target.state === "EXACT_EXPECTED_CHANGE_SET") {
+    return await persistRecoveryRequired(input, base, mutable, {
+      targetState: "EXACT_EXPECTED_CHANGE_SET",
+      reason: "ACCEPT_PREPARED without apply.started but target already shows the expected change set; cannot prove G2M applied the change",
+    });
+  }
+  if (originalState === "PATCH_APPLIED" && target.state === "CLEAN_BASE") {
+    return await persistRecoveryRequired(input, base, mutable, {
+      targetState: "CLEAN_BASE",
+      reason: "PATCH_APPLIED but target is CLEAN_BASE; the applied result is unprovable",
+    });
+  }
+
+  return await persistRecoveryRequired(input, base, mutable, {
     targetState: target.state,
     reason: `no recovery path for state=${originalState} target=${target.state}`,
-  };
+  });
 }
