@@ -414,6 +414,7 @@ async function runCommand(options: ReadonlyMap<string, string>): Promise<void> {
       ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
       maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
       maxWorkerStdoutBytes: config.runtime_hardening.max_worker_stdout_bytes,
+      maxWorkerStderrBytes: config.runtime_hardening.max_worker_stderr_bytes,
       maxStreamJsonLineBytes: config.runtime_hardening.max_stream_json_line_bytes,
       maxWorkerEvents: config.runtime_hardening.max_worker_events,
     });
@@ -528,6 +529,7 @@ async function recoverCommand(options: ReadonlyMap<string, string>): Promise<voi
       ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
       maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
       maxWorkerStdoutBytes: config.runtime_hardening.max_worker_stdout_bytes,
+      maxWorkerStderrBytes: config.runtime_hardening.max_worker_stderr_bytes,
       maxStreamJsonLineBytes: config.runtime_hardening.max_stream_json_line_bytes,
       maxWorkerEvents: config.runtime_hardening.max_worker_events,
     });
@@ -679,6 +681,7 @@ async function probeCommand(options: ReadonlyMap<string, string>): Promise<void>
       ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
       maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
       maxWorkerStdoutBytes: config.runtime_hardening.max_worker_stdout_bytes,
+      maxWorkerStderrBytes: config.runtime_hardening.max_worker_stderr_bytes,
       maxStreamJsonLineBytes: config.runtime_hardening.max_stream_json_line_bytes,
       maxWorkerEvents: config.runtime_hardening.max_worker_events,
     });
