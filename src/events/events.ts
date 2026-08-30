@@ -54,6 +54,10 @@ export type TaskEventType =
   // Recovery (plan §51) — 任何 active state 看到 recovery.required 都会进 RECOVERY_REQUIRED
   | "recovery.required"
   | "recovery.reconciled"
+  | "storage.reservation.created"
+  | "storage.reservation.released"
+  | "storage.reservation.expired"
+  | "storage.reservation.abandoned"
   | "gc.marked"
   | "gc.completed"
   | "projection.stale"

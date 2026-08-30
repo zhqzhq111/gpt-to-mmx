@@ -131,6 +131,13 @@ Phase 8 最终 Gate：`npm run typecheck`、`npm run build`、`git diff --check`
 通过；`npm test` 为 `479 passed / 5 skipped / 0 failed`；Lease process E2E
 为 `3/3`，Process Supervisor parent→grandchild E2E 为 `3/3`。
 
+Phase 9 Storage Manager 已完成：策略配置保持旧配置兼容；Storage Manager
+按卷执行逻辑容量预留，使用 `BEGIN IMMEDIATE` 防止并发 G2M 进程重复预留；
+usage scanner 使用 symlink-safe traversal，manifest 原子更新且可重建；
+storage reservation Journal/projection 支持启动恢复；Worker 和 Verification
+均受运行时磁盘监控保护。详细契约见
+[docs/v2/phase-9-storage-manager.md](/F:/gpt-mmx/docs/v2/phase-9-storage-manager.md)。
+
 ## 目录
 
 ```text

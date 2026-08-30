@@ -31,6 +31,7 @@ import type {
 import { FakeMCodeAdapter } from "../../src/workers/mcode/fake.js";
 import { WorkspaceLock } from "../../src/workspace/lock.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
+import { StorageAdmissionError, type StorageManager } from "../../src/storage/reservation.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -180,6 +181,7 @@ describe("G2MExecutionEngine", () => {
     worker: CodingWorkerAdapter = new EditingWorker(),
     projection?: ExecutionProjection,
     processSupervisor?: ProcessSupervisor,
+    storageManager?: StorageManager,
   ): G2MExecutionEngine {
     return new G2MExecutionEngine({
       workspaceRegistry,
@@ -192,12 +194,27 @@ describe("G2MExecutionEngine", () => {
       replayGuard,
       worker,
       ...(processSupervisor !== undefined ? { processSupervisor } : {}),
+      ...(storageManager !== undefined ? { storageManager } : {}),
       workerRuntime: { runtime: "fake", version: "editing-worker-1", model: "fake" },
       adapterContractVersion: "g2m-worker-v1",
       worktreeRoot,
       artifactRoot,
     });
   }
+
+  it("denies storage before validation passes and never creates a lease", async () => {
+    const reserveExecution = vi.fn().mockRejectedValue(
+      new StorageAdmissionError("STORAGE_ADMISSION_DENIED", "not enough space"),
+    );
+    const storageManager = { reserveExecution, releaseReservation: vi.fn() } as unknown as StorageManager;
+
+    await expect(engine(new EditingWorker(), undefined, undefined, storageManager).execute(task))
+      .rejects.toMatchObject({ code: "STORAGE_ADMISSION_DENIED" });
+    expect(reserveExecution).toHaveBeenCalledOnce();
+    expect(workspaceLock.isHeld("demo")).toBe(false);
+    const events = eventStore.list();
+    expect(events.at(-1)?.type).toBe("task.validation.failed");
+  });
 
   it("executes in an isolated worktree and returns a bound review bundle", async () => {
     const pending = await engine().execute(task);

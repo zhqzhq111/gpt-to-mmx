@@ -19,6 +19,17 @@
   "worktree_root": "F:/g2m-state/worktrees",
   "artifact_root": "F:/g2m-state/artifacts",
   "state_root": "F:/g2m-state/state",
+  "storage": {
+    "min_free_bytes": 1073741824,
+    "safety_margin_bytes": 536870912,
+    "default_execution_reservation_bytes": 1073741824,
+    "max_total_bytes": 0,
+    "max_artifact_bytes": 0,
+    "max_worktree_bytes": 0,
+    "completed_retention_days": 30,
+    "reservation_ttl_ms": 86400000,
+    "monitor_interval_ms": 5000
+  },
   "mcode_path": "C:/Users/USER/AppData/Roaming/npm/mcode.cmd",
   "review_timeout_ms": 1800000
 }

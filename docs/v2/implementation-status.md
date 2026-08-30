@@ -782,6 +782,43 @@ Final Gate evidence:
   tests passed.
 - `git diff --check` → exit 0.
 
+## Phase 9 — Storage Manager and Storage Admission
+
+Status: **COMPLETE / SEALED** on branch `codex/phase-9-storage-manager`.
+
+Implemented:
+
+- backward-compatible storage policy configuration with minimum free space,
+  safety margin, per-execution and managed-storage limits, reservation TTL,
+  monitor interval, and retention inputs;
+- cross-platform volume identity for Windows drives/UNC shares and POSIX
+  device numbers, with same-volume root deduplication;
+- symlink-safe logical-byte usage scanning and versioned atomic
+  `storage-manifest.json` updates;
+- durable reservation records under `state_root/reservations`, SQLite
+  `BEGIN IMMEDIATE` admission, all-or-nothing multi-volume inserts,
+  conditional idempotent release, and rebuildable `storage_reservations`;
+- CRITICAL storage-domain reservation events that never advance lifecycle
+  state, plus startup reconciliation that retains `RECOVERY_REQUIRED` rows and
+  releases only proven-safe terminal leaks;
+- Engine admission before validation passes, reservation release on known
+  terminal paths, Worker/Verification free-space monitoring, and exact usage
+  checkpoints;
+- real two-process reservation race, release/retry, and independent-volume
+  E2E coverage.
+
+Final verification on the Phase 9 branch:
+
+- `npm run typecheck` → pass;
+- `npm run build` → pass;
+- `npm test` → **502 passed, 6 skipped, 0 failed**;
+- `npm run test:lease-process` → **3/3**;
+- `npm run test:process-supervisor` → **3/3**;
+- `npm run test:storage-process` → **3/3**;
+- `git diff --check` → pass.
+
+Phase 9 does not perform historical GC; deletion remains a Phase 10 concern.
+
 ## Remaining phases
 
-Storage Manager, GC, operational CLI, runtime hardening, and CI matrices.
+GC, operational CLI, runtime hardening, and CI matrices.

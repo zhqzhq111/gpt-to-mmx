@@ -69,6 +69,9 @@ import type { TaskState } from "../execution/state-machine.js";
 import { scanLeaseOwners } from "../workspace/lock.js";
 import { StateDatabase } from "./database.js";
 import { ExecutionProjector, type WorkspaceSeed } from "./execution-projector.js";
+import { EventStore } from "../events/store.js";
+import { rebuildStorageUsageFromManifests } from "../storage/usage.js";
+import { reconcileStorageReservations } from "../storage/reservation.js";
 
 export interface RebuildWorkspaceConfig {
   readonly workspaceId: string;
@@ -375,6 +378,20 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
         tempDatabase.setMeta(staleMetaKey(executionId), reason);
         if (!scan.isTruncated) staleExecutions += 1;
       }
+
+      rebuildStorageUsageFromManifests({ stateRoot, database: tempDatabase, nowMs });
+      const storageEvents = new EventStore({
+        executionDirectory: join(stateRoot, "executions"),
+        tolerateLoadErrors: true,
+      });
+      await reconcileStorageReservations({
+        stateRoot,
+        database: tempDatabase,
+        eventStore: storageEvents,
+        nowMs,
+        releaseTerminal: false,
+      });
+      storageEvents.close();
 
       tempDatabase.setMeta("rebuild_status", "complete");
       tempDatabase.setMeta("rebuild_at", String(nowMs));

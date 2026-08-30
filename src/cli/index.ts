@@ -17,6 +17,9 @@ import { runAcceptRecovery, isPartialAccept, type AcceptProcessStatus } from "..
 import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
 import { scanRecovery } from "../recovery/scanner.js";
 import { runStartupRecovery } from "../recovery/startup.js";
+import { StorageManager, reconcileStorageReservations } from "../storage/reservation.js";
+import { rebuildStorageUsageFromManifests } from "../storage/usage.js";
+import { StorageMonitor } from "../storage/monitor.js";
 import type { TaskEvent } from "../events/events.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
@@ -84,6 +87,7 @@ async function configureEngine(
   readonly worker: MCodeAdapter;
   readonly projectionDatabase: StateDatabase;
   readonly workspaceLock: WorkspaceLock;
+  readonly storageManager: StorageManager;
 }> {
   const stateRoot = stateRootForConfig(config);
   let projectionDatabase: StateDatabase | undefined;
@@ -163,6 +167,29 @@ async function configureEngine(
     }
     await workspaceLock.reconcileStartupLeases(leaseStates);
     projection.replaceWorkspaceLeases(await scanLeaseOwners(stateRoot));
+    const storageManager = new StorageManager({
+      database: projectionDatabase,
+      eventStore,
+      stateRoot,
+      policy: config.storage,
+    });
+    await reconcileStorageReservations({
+      stateRoot,
+      database: projectionDatabase,
+      eventStore,
+      nowMs: Date.now(),
+    });
+    rebuildStorageUsageFromManifests({
+      stateRoot,
+      database: projectionDatabase,
+      nowMs: Date.now(),
+    });
+    const liveDatabase = projectionDatabase;
+    if (liveDatabase === undefined) throw new Error("projection database was not initialized");
+    const storageMonitor = new StorageMonitor({
+      policy: config.storage,
+      managedUsageBytes: () => Number((liveDatabase.prepare("SELECT COALESCE(SUM(artifact_bytes + worktree_bytes), 0) AS total FROM storage_usage").get() as { total: number | bigint }).total),
+    });
     const profileRegistry = new ProfileRegistry();
     for (const profile of config.verification_profiles) {
       profileRegistry.register({
@@ -193,6 +220,8 @@ async function configureEngine(
       adapterContractVersion: "g2m-worker-v1",
       worktreeRoot: config.worktree_root,
       artifactRoot: config.artifact_root,
+      storageManager,
+      storageMonitor,
     });
     return {
       engine,
@@ -203,6 +232,7 @@ async function configureEngine(
       worker,
       projectionDatabase,
       workspaceLock,
+      storageManager,
     };
   } catch (error) {
     eventStore?.close();

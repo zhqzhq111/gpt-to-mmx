@@ -117,6 +117,10 @@ const CRITICAL_TYPES = new Set<TaskEventType>([
   "review.decision.block",
   "recovery.required",
   "recovery.reconciled",
+  "storage.reservation.created",
+  "storage.reservation.released",
+  "storage.reservation.expired",
+  "storage.reservation.abandoned",
   "gc.marked",
   "gc.completed",
   "projection.stale",
@@ -124,6 +128,7 @@ const CRITICAL_TYPES = new Set<TaskEventType>([
 ]);
 
 function defaultDomain(type: TaskEventType): EventDomain {
+  if (type.startsWith("storage.")) return "storage";
   if (type.startsWith("gc.")) return "storage";
   if (type.startsWith("projection.")) return "projection";
   if (type === "recovery.reconciled") return "recovery";

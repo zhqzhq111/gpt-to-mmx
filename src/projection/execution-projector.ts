@@ -206,6 +206,11 @@ export class ExecutionProjector implements ExecutionProjection {
     state: TaskState,
     metadata: ProjectionMetadata,
   ): void {
+    if (event.domain === "storage") {
+      this.projectStorage(event);
+      this.updateCursor(event);
+      return;
+    }
     if (event.domain === "projection") {
       this.updateCursor(event);
       return;
@@ -227,6 +232,42 @@ export class ExecutionProjector implements ExecutionProjection {
     this.projectReview(event);
     this.projectRecovery(event);
     this.updateCursor(event);
+  }
+
+  private projectStorage(event: TaskEvent): void {
+    const rawReservations = event.payload["reservations"];
+    const reservations = Array.isArray(rawReservations) ? rawReservations : [];
+    if (event.type === "storage.reservation.created") {
+      const setId = typeof event.payload["reservation_set_id"] === "string" ? event.payload["reservation_set_id"] : null;
+      const recordPath = typeof event.payload["record_path"] === "string" ? event.payload["record_path"] : null;
+      const recordHash = typeof event.payload["record_hash"] === "string" ? event.payload["record_hash"] : null;
+      for (const raw of reservations) {
+        if (raw === null || typeof raw !== "object") continue;
+        const value = raw as Record<string, unknown>;
+        if (typeof value["reservation_id"] !== "string" || typeof value["volume_id"] !== "string" || typeof value["reserved_bytes"] !== "number") continue;
+        const roles = Array.isArray(value["roles"]) ? value["roles"].filter((role): role is string => typeof role === "string") : [];
+        this.database.prepare(`
+          INSERT INTO storage_reservations(
+            reservation_id, reservation_set_id, execution_id, volume_id,
+            reserved_bytes, created_at, expires_at, state, roles_json,
+            record_path, record_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+          ON CONFLICT(reservation_id) DO UPDATE SET
+            state = CASE WHEN storage_reservations.state = 'ACTIVE' THEN 'ACTIVE' ELSE storage_reservations.state END
+        `).run(
+          value["reservation_id"], setId, event.attemptId, value["volume_id"], value["reserved_bytes"],
+          event.timestampMs, typeof event.payload["expires_at"] === "number" ? event.payload["expires_at"] : event.timestampMs,
+          JSON.stringify(roles), recordPath, recordHash,
+        );
+      }
+      return;
+    }
+    const ids = reservations.length > 0
+      ? reservations.map((raw) => raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>)["reservation_id"] : undefined).filter((id): id is string => typeof id === "string")
+      : (Array.isArray(event.payload["reservation_ids"]) ? event.payload["reservation_ids"].filter((id): id is string => typeof id === "string") : []);
+    const state = event.type === "storage.reservation.expired" ? "EXPIRED" : event.type === "storage.reservation.abandoned" ? "ABANDONED" : "RELEASED";
+    const statement = this.database.prepare("UPDATE storage_reservations SET state = ? WHERE reservation_id = ? AND state = 'ACTIVE'");
+    for (const id of ids) statement.run(state, id);
   }
 
   private updateCursor(event: TaskEvent): void {

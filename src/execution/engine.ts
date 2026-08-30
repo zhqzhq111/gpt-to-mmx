@@ -62,6 +62,8 @@ import {
   type TaskFingerprint,
 } from "./fingerprint.js";
 import type { TaskState } from "./state-machine.js";
+import { StorageAdmissionError, type StorageManager, type StorageReservationHandle } from "../storage/reservation.js";
+import type { StorageMonitor, StorageMonitorHandle } from "../storage/monitor.js";
 
 export interface G2MExecutionEngineOptions {
   readonly workspaceRegistry: WorkspaceRegistry;
@@ -78,6 +80,8 @@ export interface G2MExecutionEngineOptions {
   readonly adapterContractVersion: string;
   readonly worktreeRoot: string;
   readonly artifactRoot: string;
+  readonly storageManager?: StorageManager;
+  readonly storageMonitor?: StorageMonitor;
 }
 
 export interface PendingReviewExecution {
@@ -90,6 +94,7 @@ export interface PendingReviewExecution {
   readonly patch: WorktreePatch;
   readonly fingerprint: TaskFingerprint;
   readonly lease: LockHandle;
+  readonly reservation?: StorageReservationHandle;
 }
 
 export interface CompletedReviewExecution {
@@ -116,6 +121,11 @@ export class G2MExecutionEngineError extends Error {
     | "RECOVERY_REQUIRED"
     | "CAPABILITY_VIOLATION"
     | "VERIFICATION_FAILED"
+    | "STORAGE_ADMISSION_DENIED"
+    | "STORAGE_LIMIT_EXCEEDED"
+    | "STORAGE_SCAN_FAILED"
+    | "STORAGE_RESERVATION_FAILED"
+    | "STORAGE_STATE_INCONSISTENT"
     | "WORKTREE_CHANGED_AFTER_REVIEW"
     | "UNKNOWN_PENDING_EXECUTION";
   override readonly cause?: unknown;
@@ -247,6 +257,26 @@ export class G2MExecutionEngine {
 
   constructor(private readonly options: G2MExecutionEngineOptions) {}
 
+  private async snapshotStorage(
+    executionId: string,
+    worktreePath: string,
+    retentionClass: string | null = null,
+    gcEligibleAt: number | null = null,
+  ): Promise<void> {
+    if (this.options.storageManager === undefined) return;
+    try {
+      await this.options.storageManager.snapshotExecution({
+        executionId,
+        artifactPath: resolve(this.options.artifactRoot, executionId),
+        worktreePath,
+        retentionClass,
+        gcEligibleAt,
+      });
+    } catch (error) {
+      throw new G2MExecutionEngineError("STORAGE_SCAN_FAILED", "storage usage scan failed", error);
+    }
+  }
+
   private projectDurable(event: TaskEvent, state: TaskState): void {
     if (this.options.projection === undefined || event.durability !== "CRITICAL") return;
     try {
@@ -310,6 +340,8 @@ export class G2MExecutionEngine {
     let lockHandle: LockHandle | undefined;
     let worktree: TemporaryWorktreeHandle | undefined;
     let preserveWorktree = false;
+    let reservation: StorageReservationHandle | undefined;
+    let workerMonitor: StorageMonitorHandle | undefined;
 
     this.appendAndReduce(mutable, {
       taskId: task.task_id,
@@ -346,6 +378,28 @@ export class G2MExecutionEngine {
         task.verification_profile,
       );
       const runtimeSnapshot = await this.options.worker.probe();
+
+      if (this.options.storageManager !== undefined) {
+        try {
+          reservation = await this.options.storageManager.reserveExecution({
+            executionId,
+            taskId: task.task_id,
+            roots: [
+              { rootPath: this.options.worktreeRoot, roles: ["worktree"] },
+              { rootPath: this.options.artifactRoot, roles: ["artifact"] },
+            ],
+          });
+        } catch (error) {
+          const code = error instanceof StorageAdmissionError ? error.code : "STORAGE_RESERVATION_FAILED";
+          this.appendAndReduce(mutable, {
+            taskId: task.task_id,
+            executionId,
+            type: "task.validation.failed",
+            payload: { reason: error instanceof Error ? error.message : String(error), storageErrorCode: code },
+          });
+          throw new G2MExecutionEngineError(code, "storage admission failed", error);
+        }
+      }
 
       this.appendAndReduce(mutable, {
         taskId: task.task_id,
@@ -387,6 +441,7 @@ export class G2MExecutionEngine {
         baseRevision: task.workspace_scope.base_revision,
         worktreeRoot: this.options.worktreeRoot,
       });
+      await this.snapshotStorage(executionId, worktree.worktreePath);
       const baseline = await captureBaseline(worktree.worktreePath);
       const stableTaskHash = taskHash(task);
       const fingerprint = computeTaskFingerprint(
@@ -435,6 +490,11 @@ export class G2MExecutionEngine {
         type: "agent.spawn.started",
         fingerprint,
       });
+
+      workerMonitor = this.options.storageMonitor?.start(
+        { worktreePath: worktree.worktreePath, artifactPath: this.options.artifactRoot },
+        async () => { await this.options.worker.cancel(executionId); },
+      );
 
       let workerResult;
       try {
@@ -494,6 +554,8 @@ export class G2MExecutionEngine {
           fingerprint,
         });
         throw new G2MExecutionEngineError("WORKER_FAILED", "worker execution failed", error);
+      } finally {
+        workerMonitor?.stop();
       }
       this.appendAndReduce(mutable, {
         taskId: task.task_id,
@@ -501,6 +563,7 @@ export class G2MExecutionEngine {
         type: "agent.completed",
         fingerprint,
       });
+      await this.snapshotStorage(executionId, worktree.worktreePath);
 
       const workerDiff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
       recordWorkerEvidence(
@@ -545,9 +608,14 @@ export class G2MExecutionEngine {
         profile,
         task.workspace_scope.workspace_id,
         worktree.worktreePath,
-        ...(this.options.processSupervisor !== undefined
-          ? [{ processSupervisor: this.options.processSupervisor }]
-          : []),
+        {
+          ...(this.options.processSupervisor !== undefined
+            ? { processSupervisor: this.options.processSupervisor }
+            : {}),
+          ...(this.options.storageMonitor !== undefined
+            ? { storageMonitor: this.options.storageMonitor, storageArtifactPath: this.options.artifactRoot }
+            : {}),
+        },
       );
       recordVerificationEvidence(
         this.options.evidenceStore,
@@ -577,6 +645,7 @@ export class G2MExecutionEngine {
         );
       }
 
+      await this.snapshotStorage(executionId, worktree.worktreePath);
       const executionArtifactRoot = resolve(this.options.artifactRoot, executionId);
       const patch = await collectWorktreePatch(worktree, executionArtifactRoot);
       const diff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
@@ -693,10 +762,17 @@ export class G2MExecutionEngine {
         patch,
         fingerprint,
         lease: lockHandle,
+        ...(reservation !== undefined ? { reservation } : {}),
       });
       this.pending.set(bundle.bundleId, pending);
       return pending;
     } catch (error) {
+      if (reservation !== undefined && mutable.state !== "REVIEW_PENDING" && mutable.state !== "RECOVERY_REQUIRED") {
+        await this.options.storageManager?.releaseReservation(
+          reservation,
+          error instanceof Error ? error.message : "execution ended before review",
+        ).catch(() => undefined);
+      }
       if (
         worktree !== undefined &&
         mutable.state !== "REVIEW_PENDING" &&
@@ -933,6 +1009,12 @@ export class G2MExecutionEngine {
           this.projectDurable(applied.event, applied.newState);
           releaseLease = true;
         }
+      }
+      if (pending.reservation !== undefined && newState !== undefined) {
+        await this.options.storageManager?.releaseReservation(
+          pending.reservation,
+          `review decision ${review.decision}`,
+        ).catch(() => undefined);
       }
       if (review.decision === "ACCEPT") {
         // P1#3: cleanup is best-effort maintenance. ACCEPT is already

@@ -13,6 +13,7 @@ import {
   type TerminationResult,
 } from "../process/supervisor.js";
 import type { VerificationProfile } from "../policy/verification.js";
+import type { StorageMonitor, StorageMonitorHandle } from "../storage/monitor.js";
 
 export type VerificationStatus =
   | "passed"
@@ -59,6 +60,8 @@ export interface VerificationResult {
 
 export interface VerificationRunOptions {
   readonly processSupervisor?: ProcessSupervisor;
+  readonly storageMonitor?: StorageMonitor;
+  readonly storageArtifactPath?: string;
 }
 
 function hashablePayload(r: VerificationResult): unknown {
@@ -210,7 +213,19 @@ async function runProfile(
     stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
   });
 
-  const processOutcome = await managed.wait();
+  let storageMonitorHandle: StorageMonitorHandle | undefined;
+  if (options.storageMonitor !== undefined) {
+    storageMonitorHandle = options.storageMonitor.start(
+      { worktreePath: workspacePath, artifactPath: options.storageArtifactPath ?? workspacePath },
+      async () => { await managed.terminate("timeout"); },
+    );
+  }
+  let processOutcome;
+  try {
+    processOutcome = await managed.wait();
+  } finally {
+    storageMonitorHandle?.stop();
+  }
   const outcome = classifyProcessOutcome(profile, processOutcome, stdout, stderr);
   const finishedAt = Date.now();
   return withResultHash({
