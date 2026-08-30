@@ -235,6 +235,19 @@ describe("buildMCodeInvocation (plan §32)", () => {
     expect(JSON.parse(inv.args[idx + 1] as string)).toEqual(schema);
   });
 
+  it("includes an explicitly pinned model in the invocation", () => {
+    const inv = buildMCodeInvocation("mcode", {
+      workspacePath: "D:/x",
+      prompt: "p",
+      permissionPolicy: "smart",
+      timeoutMs: 60_000,
+      maxSteps: 5,
+      model: "MiniMax-M2",
+    });
+    expect(inv.args).toContain("--model");
+    expect(inv.args[inv.args.indexOf("--model") + 1]).toBe("MiniMax-M2");
+  });
+
   it("does NOT construct any shell string (plan §32: argv only)", () => {
     const inv = buildMCodeInvocation("mcode", {
       workspacePath: "D:/x",
