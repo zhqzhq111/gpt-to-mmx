@@ -177,10 +177,30 @@ const OWNER_KEYS = [
   "pid", "hostname", "created_at", "heartbeat_at",
 ] as const;
 const HEARTBEAT_KEYS = ["heartbeat_version", "workspace_key", "lease_id", "heartbeat_at"] as const;
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
-const DEFAULT_STALE_AFTER_MS = 30_000;
-const DEFAULT_INCOMPLETE_GRACE_MS = 30_000;
-const DEFAULT_RECLAIM_GUARD_STALE_MS = 30_000;
+export interface EffectiveWorkspaceLeasePolicy {
+  readonly heartbeat_interval_ms: number;
+  readonly stale_after_ms: number;
+  readonly incomplete_lease_grace_ms: number;
+  readonly reclaim_guard_stale_ms: number;
+}
+
+export const DEFAULT_WORKSPACE_LEASE_POLICY: EffectiveWorkspaceLeasePolicy = Object.freeze({
+  heartbeat_interval_ms: 5_000,
+  stale_after_ms: 30_000,
+  incomplete_lease_grace_ms: 30_000,
+  reclaim_guard_stale_ms: 30_000,
+});
+
+export function resolveEffectiveLeasePolicy(
+  options: Pick<WorkspaceLockOptions, "heartbeatIntervalMs" | "staleAfterMs" | "incompleteLeaseGraceMs" | "reclaimGuardStaleMs"> = {},
+): EffectiveWorkspaceLeasePolicy {
+  return {
+    heartbeat_interval_ms: options.heartbeatIntervalMs ?? DEFAULT_WORKSPACE_LEASE_POLICY.heartbeat_interval_ms,
+    stale_after_ms: options.staleAfterMs ?? DEFAULT_WORKSPACE_LEASE_POLICY.stale_after_ms,
+    incomplete_lease_grace_ms: options.incompleteLeaseGraceMs ?? DEFAULT_WORKSPACE_LEASE_POLICY.incomplete_lease_grace_ms,
+    reclaim_guard_stale_ms: options.reclaimGuardStaleMs ?? DEFAULT_WORKSPACE_LEASE_POLICY.reclaim_guard_stale_ms,
+  };
+}
 const DEFAULT_STATE_ROOT = process.env.G2M_STATE_ROOT ?? join(process.cwd(), ".g2m-state");
 const MAX_LEASE_FILE_BYTES = 64 * 1024;
 
@@ -462,10 +482,11 @@ export class WorkspaceLock {
   constructor(options: WorkspaceLockOptions = {}) {
     this.stateRoot = options.stateRoot ?? DEFAULT_STATE_ROOT;
     this.workspacePathResolver = options.workspacePathResolver;
-    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
-    this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
-    this.incompleteLeaseGraceMs = options.incompleteLeaseGraceMs ?? DEFAULT_INCOMPLETE_GRACE_MS;
-    this.reclaimGuardStaleMs = options.reclaimGuardStaleMs ?? DEFAULT_RECLAIM_GUARD_STALE_MS;
+    const policy = resolveEffectiveLeasePolicy(options);
+    this.heartbeatIntervalMs = policy.heartbeat_interval_ms;
+    this.staleAfterMs = policy.stale_after_ms;
+    this.incompleteLeaseGraceMs = policy.incomplete_lease_grace_ms;
+    this.reclaimGuardStaleMs = policy.reclaim_guard_stale_ms;
     assertPositiveFinite("heartbeatIntervalMs", this.heartbeatIntervalMs);
     assertPositiveFinite("staleAfterMs", this.staleAfterMs);
     assertPositiveFinite("incompleteLeaseGraceMs", this.incompleteLeaseGraceMs);

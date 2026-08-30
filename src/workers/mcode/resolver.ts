@@ -332,6 +332,8 @@ export interface ResolveMCodeOptions {
   readonly maxProbeOutputBytes?: number;
   /** Injected supervisor for deterministic lifecycle tests. */
   readonly processSupervisor?: ProcessSupervisor;
+  /** Preserve the original provenance when rechecking a frozen path. */
+  readonly preserveResolvedVia?: MCodeLaunchDescriptor["resolvedVia"];
 }
 
 /**
@@ -382,10 +384,14 @@ export async function resolveMCode(
         execHelpSha256: hashText("(skipped)"),
         outputSchemaSupported: false,
         resolvedAt: Date.now(),
-        resolvedVia: "trusted-override",
+        resolvedVia: options.preserveResolvedVia ?? "trusted-override",
       };
     }
-    return buildDescriptor(canonicalPath, "trusted-override", probeOptions);
+    return buildDescriptor(
+      canonicalPath,
+      options.preserveResolvedVia ?? "trusted-override",
+      probeOptions,
+    );
   }
 
   const onPath = await locateOnPath();

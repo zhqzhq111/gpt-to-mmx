@@ -37,6 +37,45 @@ async function waitForBundle(
   throw new Error("review bundle was not produced");
 }
 
+describeWindows("Phase 12 configured probe limits", () => {
+  it("passes max_probe_output_bytes from config to g2m probe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-cli-probe-limit-"));
+    const configPath = join(root, "config.json");
+    const mcodePath = join(root, "mcode.cmd");
+    try {
+      await writeFile(mcodePath, [
+        "@echo off",
+        "if \"%~1\"==\"--version\" (echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx & exit /b 0)",
+        "if \"%~1\"==\"--help\" (echo Usage: mcode & exit /b 0)",
+        "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo --output-schema & exit /b 0)",
+        "exit /b 1",
+        "",
+      ].join("\r\n"), "utf8");
+      await writeFile(configPath, JSON.stringify({
+        protocol_version: "g2m.local-config.v1",
+        workspaces: [{ workspace_id: "demo", path: root }],
+        verification_profiles: [],
+        worktree_root: join(root, "worktrees"),
+        artifact_root: join(root, "artifacts"),
+        mcode_path: mcodePath,
+        runtime_hardening: { max_probe_output_bytes: 32 },
+      }), "utf8");
+      let failure: unknown;
+      try {
+        await main(["probe", "--config", configPath]);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({
+        code: expect.stringMatching(/^PROBE_(OUTPUT_LIMIT|TERMINATION_UNCONFIRMED)$/),
+      });
+      expect(failure).toMatchObject({ message: expect.stringMatching(/exceeded 32 bytes/i) });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
 describeWindows("G2M CLI handoff E2E", () => {
   it("runs until review pending, accepts a bound BLOCK file, and completes", async () => {
     const root = await mkdtemp(join(tmpdir(), "g2m-cli-e2e-"));

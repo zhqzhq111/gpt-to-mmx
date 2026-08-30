@@ -126,6 +126,7 @@ export class G2MExecutionEngineError extends Error {
     | "DIRTY_WORKSPACE"
     | "WORKSPACE_BUSY"
     | "WORKER_FAILED"
+    | "RUNTIME_DRIFT"
     | "WORKER_TIMED_OUT"
     | "WORKER_CANCELLED"
     | "RECOVERY_REQUIRED"
@@ -557,12 +558,23 @@ export class G2MExecutionEngine {
       try {
         await this.options.worker.start(invocation);
       } catch (error) {
+        const workerErrorCode = error instanceof AdapterError ? error.code : undefined;
         this.appendAndReduce(mutable, {
           taskId: task.task_id,
           executionId,
           type: "agent.spawn.failed",
-          payload: { message: (error as Error).message },
+          payload: {
+            message: (error as Error).message,
+            ...(workerErrorCode !== undefined ? { workerErrorCode } : {}),
+          },
         });
+        if (workerErrorCode === "RUNTIME_DRIFT") {
+          throw new G2MExecutionEngineError(
+            "RUNTIME_DRIFT",
+            "worker runtime identity changed before spawn",
+            error,
+          );
+        }
         throw new G2MExecutionEngineError("WORKER_FAILED", "worker start failed", error);
       }
       this.appendAndReduce(mutable, {

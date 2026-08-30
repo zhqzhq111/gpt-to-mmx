@@ -7,6 +7,7 @@ import {
   WorkspaceLock,
   WorkspaceLockError,
   classifyLeasePolicy,
+  resolveEffectiveLeasePolicy,
   workspaceKeyForPath,
   type LockHandle,
 } from "../../src/workspace/lock.js";
@@ -344,5 +345,32 @@ describe("durable WorkspaceLock", () => {
       .toBe("RECOVERY_CRITICAL");
     expect(classifyLeasePolicy({ inspection: base, journalState: "TERMINAL", staleAfterMs: 30, currentHostname: "other-host" }))
       .toBe("FOREIGN_HOST");
+  });
+});
+
+describe("effective workspace lease policy", () => {
+  it("uses the same defaults and overrides as WorkspaceLock", () => {
+    const defaults = resolveEffectiveLeasePolicy();
+    expect(defaults).toEqual({
+      heartbeat_interval_ms: 5_000,
+      stale_after_ms: 30_000,
+      incomplete_lease_grace_ms: 30_000,
+      reclaim_guard_stale_ms: 30_000,
+    });
+    const custom = resolveEffectiveLeasePolicy({
+      heartbeatIntervalMs: 1_000,
+      staleAfterMs: 3_000,
+      incompleteLeaseGraceMs: 4_000,
+      reclaimGuardStaleMs: 5_000,
+    });
+    const lock = new WorkspaceLock({
+      heartbeatIntervalMs: custom.heartbeat_interval_ms,
+      staleAfterMs: custom.stale_after_ms,
+      incompleteLeaseGraceMs: custom.incomplete_lease_grace_ms,
+      reclaimGuardStaleMs: custom.reclaim_guard_stale_ms,
+    });
+    expect(lock.staleAfter).toBe(custom.stale_after_ms);
+    expect(lock.incompleteGraceAfterMs).toBe(custom.incomplete_lease_grace_ms);
+    expect(lock.reclaimGuardStaleAfterMs).toBe(custom.reclaim_guard_stale_ms);
   });
 });

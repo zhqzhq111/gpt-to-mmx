@@ -26,7 +26,7 @@ import type { TaskEvent } from "../events/events.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
 import { MCodeAdapter } from "../workers/mcode/adapter.js";
-import { scanLeaseOwners, WorkspaceLock, type LeaseJournalState, type LockHandle } from "../workspace/lock.js";
+import { resolveEffectiveLeasePolicy, scanLeaseOwners, WorkspaceLock, type LeaseJournalState, type LockHandle } from "../workspace/lock.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { captureBaseline } from "../workspace/baseline.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
@@ -206,9 +206,7 @@ async function configureEngine(
         ? { excludeExecutionIds: options.excludeExecutionIds }
         : {}),
     });
-    const workspaceLock = new WorkspaceLock({
-      stateRoot,
-      workspacePathResolver: (workspaceId) => workspaceRegistry.get(workspaceId).canonicalPath,
+    const leasePolicy = resolveEffectiveLeasePolicy({
       ...(config.workspace_lease?.heartbeat_interval_ms !== undefined
         ? { heartbeatIntervalMs: config.workspace_lease.heartbeat_interval_ms } : {}),
       ...(config.workspace_lease?.stale_after_ms !== undefined
@@ -217,6 +215,14 @@ async function configureEngine(
         ? { incompleteLeaseGraceMs: config.workspace_lease.incomplete_lease_grace_ms } : {}),
       ...(config.workspace_lease?.reclaim_guard_stale_ms !== undefined
         ? { reclaimGuardStaleMs: config.workspace_lease.reclaim_guard_stale_ms } : {}),
+    });
+    const workspaceLock = new WorkspaceLock({
+      stateRoot,
+      workspacePathResolver: (workspaceId) => workspaceRegistry.get(workspaceId).canonicalPath,
+      heartbeatIntervalMs: leasePolicy.heartbeat_interval_ms,
+      staleAfterMs: leasePolicy.stale_after_ms,
+      incompleteLeaseGraceMs: leasePolicy.incomplete_lease_grace_ms,
+      reclaimGuardStaleMs: leasePolicy.reclaim_guard_stale_ms,
       leaseProjection: {
         upsert: (owner) => projection.upsertWorkspaceLease(owner),
         removeIfLeaseMatches: (workspaceId, leaseId) => projection.deleteWorkspaceLease(workspaceId, leaseId),
@@ -301,7 +307,7 @@ async function configureEngine(
       stateRoot,
       runtimeHardening: config.runtime_hardening,
       storagePolicyHash: sha256(config.storage),
-      leasePolicyHash: sha256(config.workspace_lease ?? {}),
+      leasePolicyHash: sha256(leasePolicy),
       storageManager,
       storageMonitor,
     });
@@ -663,7 +669,11 @@ async function probeCommand(options: ReadonlyMap<string, string>): Promise<void>
   const previousMCodePath = process.env["G2M_MCODE_PATH"];
   if (config.mcode_path !== undefined) process.env["G2M_MCODE_PATH"] = config.mcode_path;
   try {
-    emit({ type: "g2m.runtime.probe", runtime: await new MCodeAdapter().probe() });
+    const worker = new MCodeAdapter({
+      ...(config.mcode_model !== undefined ? { model: config.mcode_model } : {}),
+      maxProbeOutputBytes: config.runtime_hardening.max_probe_output_bytes,
+    });
+    emit({ type: "g2m.runtime.probe", runtime: await worker.probe() });
   } finally {
     if (previousMCodePath === undefined) delete process.env["G2M_MCODE_PATH"];
     else process.env["G2M_MCODE_PATH"] = previousMCodePath;

@@ -121,6 +121,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
   async revalidateRuntimeIdentity(expected: RuntimeIdentity): Promise<void> {
     const descriptor = await resolveMCode({
       explicitPath: expected.resolved_executable_path,
+      preserveResolvedVia: expected.resolved_via,
       ...(this.maxProbeOutputBytes !== undefined
         ? { maxProbeOutputBytes: this.maxProbeOutputBytes }
         : {}),
@@ -311,7 +312,12 @@ export class MCodeAdapter implements CodingWorkerAdapter {
 
   private async getDescriptor(): Promise<MCodeLaunchDescriptor> {
     if (this.cachedDescriptor) return this.cachedDescriptor;
-    const d = await resolveMCode();
+    const d = await resolveMCode({
+      ...(this.maxProbeOutputBytes !== undefined
+        ? { maxProbeOutputBytes: this.maxProbeOutputBytes }
+        : {}),
+      processSupervisor: this.processSupervisor,
+    });
     this.cachedDescriptor = d;
     return d;
   }

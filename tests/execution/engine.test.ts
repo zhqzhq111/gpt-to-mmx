@@ -110,6 +110,12 @@ class EditingWorker implements CodingWorkerAdapter {
   }
 }
 
+class RuntimeDriftWorker extends EditingWorker {
+  override start(invocation: WorkerInvocation): Promise<void> {
+    return Promise.reject(new AdapterError("RUNTIME_DRIFT", `runtime drift for ${invocation.executionId}`));
+  }
+}
+
 class UnknownAfterStorageCancelWorker implements CodingWorkerAdapter {
   private invocation: WorkerInvocation | undefined;
 
@@ -601,6 +607,14 @@ describe("G2MExecutionEngine", () => {
     });
     expect(workspaceLock.isHeld("demo")).toBe(false);
     expect(eventStore.getByTaskId(task.task_id).at(-1)?.type).toBe("agent.timed_out");
+  });
+
+  it("preserves RUNTIME_DRIFT when the worker refuses pre-spawn", async () => {
+    const runner = engine(new RuntimeDriftWorker());
+    await expect(runner.execute(task)).rejects.toMatchObject({ code: "RUNTIME_DRIFT" });
+    const event = eventStore.getByTaskId(task.task_id).at(-1);
+    expect(event?.type).toBe("agent.spawn.failed");
+    expect(event?.payload["workerErrorCode"]).toBe("RUNTIME_DRIFT");
   });
 
   it("moves an unknown worker outcome to RECOVERY_REQUIRED and preserves the worktree", async () => {

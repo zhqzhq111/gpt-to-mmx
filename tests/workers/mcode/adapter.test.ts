@@ -88,6 +88,7 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
         "if \"%~1\"==\"exec\" goto :exec",
         "exit /b 1",
         ":exec",
+        "if defined RUNTIME_DRIFT_MARKER echo spawned>\"%RUNTIME_DRIFT_MARKER%\"",
         "if \"%MOCK_BEHAVIOR%\"==\"fail\" (",
         "  echo something bad 1>&2",
         "  exit /b 7",
@@ -325,6 +326,59 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
       });
     } finally {
       await writeFile(mockCmdPath, original);
+    }
+  }, 15_000);
+
+  it("preserves PATH provenance during pre-spawn identity revalidation", async () => {
+    const previousMCodePath = process.env["G2M_MCODE_PATH"];
+    const previousPath = process.env["PATH"];
+    delete process.env["G2M_MCODE_PATH"];
+    process.env["PATH"] = `${tmpRoot};${previousPath ?? ""}`;
+    try {
+      const adapter = new MCodeAdapter();
+      const snapshot = await adapter.probe();
+      expect((snapshot as unknown as Record<string, unknown>).launchResolvedVia).toBe("path-lookup");
+      const identity = await adapter.getRuntimeIdentity!(sha256(snapshot));
+      const invocation = makeInvocation({
+        expectedRuntimeIdentityHash: identity.identity_hash,
+      });
+      await adapter.start(invocation);
+      const result = await adapter.collectResult(invocation.executionId);
+      expect(result.summary).toBe("Mocked success");
+    } finally {
+      if (previousMCodePath === undefined) delete process.env["G2M_MCODE_PATH"];
+      else process.env["G2M_MCODE_PATH"] = previousMCodePath;
+      if (previousPath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previousPath;
+    }
+  }, 15_000);
+
+  it("refuses a changed PATH launcher without spawning the worker", async () => {
+    const previousMCodePath = process.env["G2M_MCODE_PATH"];
+    const previousPath = process.env["PATH"];
+    const previousMarker = process.env["RUNTIME_DRIFT_MARKER"];
+    const marker = join(tmpRoot, "runtime-drift-worker-spawned.txt");
+    delete process.env["G2M_MCODE_PATH"];
+    process.env["PATH"] = `${tmpRoot};${previousPath ?? ""}`;
+    process.env["RUNTIME_DRIFT_MARKER"] = marker;
+    const original = await readFile(mockCmdPath);
+    try {
+      const adapter = new MCodeAdapter();
+      const snapshot = await adapter.probe();
+      const identity = await adapter.getRuntimeIdentity!(sha256(snapshot));
+      await writeFile(mockCmdPath, Buffer.concat([original, Buffer.from("\r\n")]));
+      await expect(adapter.start(makeInvocation({
+        expectedRuntimeIdentityHash: identity.identity_hash,
+      }))).rejects.toMatchObject({ code: "RUNTIME_DRIFT" });
+      await expect(readFile(marker)).rejects.toThrow();
+    } finally {
+      await writeFile(mockCmdPath, original);
+      if (previousMCodePath === undefined) delete process.env["G2M_MCODE_PATH"];
+      else process.env["G2M_MCODE_PATH"] = previousMCodePath;
+      if (previousPath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previousPath;
+      if (previousMarker === undefined) delete process.env["RUNTIME_DRIFT_MARKER"];
+      else process.env["RUNTIME_DRIFT_MARKER"] = previousMarker;
     }
   }, 15_000);
 });
