@@ -362,6 +362,21 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
     }
   }, 15_000);
 
+  it("maps a missing frozen launcher to RUNTIME_DRIFT", async () => {
+    const adapter = new MCodeAdapter();
+    const snapshot = await adapter.probe();
+    const identity = await adapter.getRuntimeIdentity!(sha256(snapshot));
+    const original = await readFile(mockCmdPath);
+    try {
+      await rm(mockCmdPath);
+      await expect(adapter.revalidateRuntimeIdentity!(identity)).rejects.toMatchObject({
+        code: "RUNTIME_DRIFT",
+      });
+    } finally {
+      await writeFile(mockCmdPath, original);
+    }
+  }, 15_000);
+
   it("preserves PATH provenance during pre-spawn identity revalidation", async () => {
     const previousMCodePath = process.env["G2M_MCODE_PATH"];
     const previousPath = process.env["PATH"];

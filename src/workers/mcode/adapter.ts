@@ -144,24 +144,32 @@ export class MCodeAdapter implements CodingWorkerAdapter {
   }
 
   async revalidateRuntimeIdentity(expected: RuntimeIdentity): Promise<void> {
-    const descriptor = await resolveMCode({
-      explicitPath: expected.resolved_executable_path,
-      preserveResolvedVia: expected.resolved_via,
-      ...(this.maxProbeOutputBytes !== undefined
-        ? { maxProbeOutputBytes: this.maxProbeOutputBytes }
-        : {}),
-      processSupervisor: this.processSupervisor,
-    });
-    const current = buildRuntimeIdentity({
-      descriptor,
-      capabilitySnapshotHash: expected.capability_snapshot_hash,
-      workerSummarySchemaHash: expected.worker_summary_schema_hash,
-      ...(this.model !== undefined ? { model: this.model } : {}),
-    });
-    if (current.identity_hash !== expected.identity_hash) {
+    try {
+      const descriptor = await resolveMCode({
+        explicitPath: expected.resolved_executable_path,
+        preserveResolvedVia: expected.resolved_via,
+        ...(this.maxProbeOutputBytes !== undefined
+          ? { maxProbeOutputBytes: this.maxProbeOutputBytes }
+          : {}),
+        processSupervisor: this.processSupervisor,
+      });
+      const current = buildRuntimeIdentity({
+        descriptor,
+        capabilitySnapshotHash: expected.capability_snapshot_hash,
+        workerSummarySchemaHash: expected.worker_summary_schema_hash,
+        ...(this.model !== undefined ? { model: this.model } : {}),
+      });
+      if (current.identity_hash === expected.identity_hash) return;
       throw new AdapterError(
         "RUNTIME_DRIFT",
         `mcode runtime identity changed before spawn (expected ${expected.identity_hash}, got ${current.identity_hash})`,
+      );
+    } catch (error) {
+      if (error instanceof AdapterError) throw error;
+      throw new AdapterError(
+        "RUNTIME_DRIFT",
+        `mcode runtime identity could not be revalidated before spawn: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }

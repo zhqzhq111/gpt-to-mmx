@@ -295,11 +295,20 @@ async function buildDescriptor(
   resolvedVia: MCodeLaunchDescriptor["resolvedVia"],
   options: ProbeOptions,
 ): Promise<MCodeLaunchDescriptor> {
-  const [version, helpText, execHelpText] = await Promise.all([
+  const probes = await Promise.allSettled([
     probeVersion(executablePath, options),
     probeHelp(executablePath, options),
     probeExecHelp(executablePath, options),
   ]);
+  const firstFailure = probes.find((probe) => probe.status === "rejected");
+  if (firstFailure?.status === "rejected") throw firstFailure.reason;
+  const settledValue = <T>(probe: PromiseSettledResult<T>): T => {
+    if (probe.status === "rejected") throw probe.reason;
+    return probe.value;
+  };
+  const version = settledValue(probes[0]);
+  const helpText = settledValue(probes[1]);
+  const execHelpText = settledValue(probes[2]);
   const executable = await hashFile(executablePath);
   return {
     kind: kindFromPath(executablePath),

@@ -10,6 +10,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
+import { Readable } from "node:stream";
 
 import {
   resolveMCode,
@@ -153,6 +154,52 @@ describe("resolveMCode (plan §33-35)", () => {
       resolveMCode({ explicitPath: oversizedMcode, maxProbeOutputBytes: 32 }),
     ).rejects.toThrow(/exceeded 32 bytes/i);
   });
+
+  it("waits for sibling probes to settle before returning an output-limit failure", async () => {
+    let releaseSiblings!: () => void;
+    const siblings = new Promise<void>((resolve) => { releaseSiblings = resolve; });
+    let spawnCount = 0;
+    const supervisor = {
+      spawn(spec: { readonly args: readonly string[] }) {
+        spawnCount += 1;
+        const isVersion = spec.args[0] === "--version";
+        const isExecHelp = spec.args[0] === "exec";
+        const stdout = isVersion
+          ? Readable.from([Buffer.alloc(64, 120)])
+          : Readable.from([isExecHelp ? "--output-schema\n" : "Usage: mcode\n"]);
+        return {
+          pid: 12345,
+          stdout,
+          stderr: Readable.from([]),
+          wait: async () => {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            if (!isVersion) await siblings;
+            return { kind: "exited", exitCode: 0, signal: null } as const;
+          },
+          terminate: async () => ({
+            confirmedGone: true,
+            gracefulAttempted: false,
+            forcedAttempted: true,
+            strategy: "windows_taskkill" as const,
+          }),
+          isRunning: () => false,
+        };
+      },
+    };
+    const resolution = resolveMCode({
+      explicitPath: mockMcode,
+      maxProbeOutputBytes: 32,
+      processSupervisor: supervisor as never,
+    });
+    const state = await Promise.race([
+      resolution.then(() => "settled" as const, () => "settled" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 50)),
+    ]);
+    expect(spawnCount).toBe(3);
+    expect(state).toBe("pending");
+    releaseSiblings();
+    await expect(resolution).rejects.toThrow(/exceeded 32 bytes/i);
+  }, 15_000);
 
   it("requires locally verified --output-schema support", async () => {
     await expect(resolveMCode({ explicitPath: noSchemaMcode })).rejects.toMatchObject({

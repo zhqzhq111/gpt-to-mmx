@@ -2,7 +2,8 @@
 
 **Base:** `e494cb961abfb109f45ea05d2c2763c9470e3a5a`
 **Branch:** `codex/phase-12-runtime-hardening`
-**Scope:** Tasks 0–5 before the MID GATE. Tasks 6–12 and Phase 13 are out of scope until an explicit review approval.
+**Scope:** Phase 12 Tasks 0–12 are complete on the integrated Phase 12 HEAD. Phase 13 remains out of scope and has not started.
+**Status:** **COMPLETE / SEALED** after the fresh full Phase 12 gate below.
 
 ## Goal
 
@@ -174,7 +175,7 @@ Terminal legacy executions are informational; active or recovery-critical
 legacy executions receive an evidence-limited warning rather than fabricated
 Phase 12 artifacts.
 
-## MID GATE
+## MID GATE (historical checkpoint)
 
 After Tasks 0–5, stop for review. Required checks are:
 
@@ -189,3 +190,11 @@ The review must specifically confirm legacy v1 readability, immutable artifact
 semantics, runtime drift prevention before spawn, Journal authority, absence of
 Phase 13 work, and unchanged Phase 0–11 authority rules before Tasks 6–12 may
 begin.
+
+## FINAL GATE
+
+The final Phase 12 gate runs the type/build/unit checks, all five real process
+E2E suites, and `git diff --check`. The final candidate must report exact
+pass/skip/fail counts and preserve the distinction between a first-run Windows
+environment contention and a controlled rerun. No Phase 13 workflow or CI,
+ACP, OpenCode, or Agent-Team integration is included.

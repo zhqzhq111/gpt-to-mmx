@@ -179,6 +179,14 @@ Journal writer 并删除 execution state。中断操作可在下次启动或显�
 worktree 绑定永不自动删除。详细契约见
 [docs/v2/phase-10-garbage-collection.md](docs/v2/phase-10-garbage-collection.md)。
 
+Phase 11 Operational CLI 与 Phase 12 Runtime Hardening 已在当前集成分支
+完成。Phase 12 固化 Runtime Identity、Protected Policy、Fingerprint v2、
+模型 pin、Worker/Verification 输出与协议边界、运行时 drift、Repair reclaim
+guard，以及只读 Status/Doctor 和 legacy ACCEPT recovery 证据边界。最终
+Phase 12 gate 的单元测试为 `637 passed / 6 skipped / 0 failed`；五组真实
+process E2E 分别为 `3/3`、`3/3`、`3/3`、`1/1`、`6/6`。Phase 13 CI /
+Regression 尚未开始。
+
 ## 目录
 
 ```text

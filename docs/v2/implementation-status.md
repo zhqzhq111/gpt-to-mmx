@@ -892,7 +892,34 @@ the stable `g2m.status.v1`, `g2m.doctor.v1`, `g2m.repair-plan.v1`, and
 volume availability, reservation load, configured free-space floors, and
 managed-storage maximums rather than a clamped derived value.
 
+## Phase 12 — Runtime Hardening
+
+Status: **COMPLETE / SEALED** on the integrated
+`codex/phase-12-runtime-hardening` HEAD.
+
+Implemented:
+
+- immutable Runtime Identity, Protected Policy, and Fingerprint v2 artifacts;
+  PATH/trusted-override launcher revalidation and pinned-model binding;
+- strict bounded Worker stream protocol with bounded stdout, stderr, line, and
+  event handling; bounded Verification streams with byte-prefix hashes and
+  executable revalidation;
+- deterministic `RUNTIME_DRIFT` and `VERIFICATION_RUNTIME_DRIFT` handling;
+- guarded Repair reclaim with same-host, stale, dead-PID, and ownership
+  revalidation;
+- zero-mutation Status/Doctor observations, legacy v1 readability, patch-only
+  ACCEPT recovery, and evidence-preserving refusal of fabricated history.
+
+The final gate recorded `npm run typecheck` and `npm run build` as
+passing, `npm test` as **637 passed, 6 skipped, 0 failed**, and the five real
+process suites as **3/3**, **3/3**, **3/3**, **1/1**, and **6/6** respectively
+for lease, Process Supervisor, Storage, GC, and Operations. A first full unit
+run encountered one Windows `EBUSY` cleanup contention; the controlled failing
+test reproduced the probe-lifecycle cause, the minimal settlement fix passed,
+and the subsequent original `npm test` rerun passed with zero failures.
+
+Phase 13 — CI / Regression remains explicitly unstarted.
+
 ## Remaining phases
 
-- Phase 12 — Runtime Hardening
 - Phase 13 — CI / Regression
