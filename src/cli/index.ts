@@ -31,6 +31,10 @@ import { WorkspaceRegistry } from "../workspace/registry.js";
 import { captureBaseline } from "../workspace/baseline.js";
 import { parseLocalConfig, type G2MLocalConfig } from "./config.js";
 import { createReviewForBundle, writeJsonAtomic } from "./review-file.js";
+import { buildOperationalSnapshot } from "../operations/snapshot.js";
+import { runDoctor } from "../operations/doctor.js";
+import { executeRepair, planRepair } from "../operations/repair.js";
+import { renderJson, renderText } from "../operations/format.js";
 
 interface ParsedArguments {
   readonly command: string;
@@ -314,6 +318,53 @@ async function configureEngine(
 
 function stateRootForConfig(config: G2MLocalConfig): string {
   return config.state_root ?? resolve(config.artifact_root, "state");
+}
+
+type OutputFormat = "text" | "json";
+
+function outputFormat(options: ReadonlyMap<string, string>): OutputFormat {
+  const format = options.get("format") ?? "text";
+  if (format !== "text" && format !== "json") throw new Error("--format must be text or json");
+  return format;
+}
+
+function emitOperational(value: unknown, format: OutputFormat): void {
+  process.stdout.write(format === "json" ? renderJson(value) : renderText(value));
+}
+
+async function statusCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  const config = await loadConfig(resolve(required(options, "config")));
+  const executionId = options.get("execution-id");
+  emitOperational(await buildOperationalSnapshot({
+    config,
+    ...(executionId !== undefined ? { executionId } : {}),
+  }), outputFormat(options));
+}
+
+async function doctorCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  const config = await loadConfig(resolve(required(options, "config")));
+  const executionId = options.get("execution-id");
+  emitOperational(await runDoctor({
+    config,
+    ...(executionId !== undefined ? { executionId } : {}),
+  }), outputFormat(options));
+}
+
+async function repairCommand(options: ReadonlyMap<string, string>): Promise<void> {
+  const config = await loadConfig(resolve(required(options, "config")));
+  const action = required(options, "action");
+  const executionId = options.get("execution-id");
+  const common = {
+    config,
+    action,
+    ...(executionId !== undefined ? { executionId } : {}),
+  } as const;
+  const format = outputFormat(options);
+  if (options.get("apply") === "true") {
+    emitOperational(await executeRepair({ ...common, apply: true }), format);
+  } else {
+    emitOperational(await planRepair({ ...common, apply: false }), format);
+  }
 }
 
 async function waitForReview(path: string, timeoutMs: number): Promise<Review> {
@@ -613,6 +664,9 @@ function printHelp(): void {
       "  g2m run    --config <config> --task <task.json> --review <review.json>",
       "  g2m recover --config <config> --execution-id <id> --process-status <status>",
       "  g2m gc      --config <config> [--apply] [--execution-id <id>]",
+      "  g2m status  --config <config> [--execution-id <id>] [--format text|json]",
+      "  g2m doctor  --config <config> [--execution-id <id>] [--format text|json]",
+      "  g2m repair  --config <config> --action <action> [--apply] [--format text|json]",
       "  g2m review --bundle <review-bundle.json> --decision <ACCEPT|REVISE|BLOCK>",
       "             --output <review.json> [--findings-file <path>] [--new-task-id <id>]",
       "",
@@ -637,6 +691,15 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       return;
     case "gc":
       await gcCommand(parsed.options);
+      return;
+    case "status":
+      await statusCommand(parsed.options);
+      return;
+    case "doctor":
+      await doctorCommand(parsed.options);
+      return;
+    case "repair":
+      await repairCommand(parsed.options);
       return;
     case "help":
     case "--help":
