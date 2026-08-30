@@ -80,6 +80,7 @@ const FAKE_SNAPSHOT: RuntimeCapabilitySnapshot = {
   locallyVerified: {
     jsonContract: true,
     streamJsonContract: true,
+    outputSchema: true,
     sessionIdExtraction: true,
     permissionMapping: true,
     timeoutBehavior: true,

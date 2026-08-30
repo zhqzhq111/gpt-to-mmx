@@ -99,6 +99,7 @@ export interface RuntimeCapabilitySnapshot {
   readonly locallyVerified: {
     readonly jsonContract: boolean;
     readonly streamJsonContract: boolean;
+    readonly outputSchema: boolean;
     readonly sessionIdExtraction: boolean;
     readonly permissionMapping: boolean;
     readonly timeoutBehavior: boolean;

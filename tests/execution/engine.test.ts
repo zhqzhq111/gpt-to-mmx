@@ -70,6 +70,7 @@ class EditingWorker implements CodingWorkerAdapter {
       locallyVerified: {
         jsonContract: true,
         streamJsonContract: true,
+        outputSchema: true,
         sessionIdExtraction: true,
         permissionMapping: true,
         timeoutBehavior: true,

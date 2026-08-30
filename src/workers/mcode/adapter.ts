@@ -80,6 +80,7 @@ export class MCodeAdapter implements CodingWorkerAdapter {
       locallyVerified: {
         jsonContract: true,
         streamJsonContract: true,
+        outputSchema: d.outputSchemaSupported,
         sessionIdExtraction: true,
         permissionMapping: true,
         timeoutBehavior: false,

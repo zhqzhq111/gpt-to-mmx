@@ -20,6 +20,8 @@ import { buildMCodeInvocation } from "../../../src/workers/mcode/invocation.js";
 describe("resolveMCode (plan §33-35)", () => {
   let tmpRoot: string;
   let mockMcode: string;
+  let oversizedMcode: string;
+  let noSchemaMcode: string;
 
   beforeAll(async () => {
     tmpRoot = await mkdtemp(join(tmpdir(), "g2m-resolver-"));
@@ -32,11 +34,37 @@ describe("resolveMCode (plan §33-35)", () => {
       "@echo off",
       "if \"%~1\"==\"--version\" (echo mcode 9.9.9 & exit /b 0)",
       "if \"%~1\"==\"--help\" (echo Usage: mcode ^<command^> & echo. & echo Commands: & echo   exec & echo   acp & exit /b 0)",
-      "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo Usage: mcode exec & echo. & echo Flags: & echo   --cwd & echo   --permission & exit /b 0)",
+      "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo Usage: mcode exec & echo. & echo Flags: & echo   --cwd & echo   --permission & echo   --output-schema & exit /b 0)",
       "exit /b 1",
       "",
     ].join("\r\n");
     await writeFile(mockMcode, script, "utf8");
+    oversizedMcode = join(tmpRoot, "mcode-oversized.cmd");
+    await writeFile(
+      oversizedMcode,
+      [
+        "@echo off",
+        "if \"%~1\"==\"--version\" (echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx & exit /b 0)",
+        "if \"%~1\"==\"--help\" (echo Usage: mcode & exit /b 0)",
+        "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo --output-schema & exit /b 0)",
+        "exit /b 1",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    noSchemaMcode = join(tmpRoot, "mcode-no-schema.cmd");
+    await writeFile(
+      noSchemaMcode,
+      [
+        "@echo off",
+        "if \"%~1\"==\"--version\" (echo mcode 1.0.0 & exit /b 0)",
+        "if \"%~1\"==\"--help\" (echo Usage: mcode & exit /b 0)",
+        "if \"%~1\"==\"exec\" if \"%~2\"==\"--help\" (echo Usage: mcode exec & exit /b 0)",
+        "exit /b 1",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
   });
 
   afterAll(async () => {
@@ -51,6 +79,9 @@ describe("resolveMCode (plan §33-35)", () => {
       expect(d.resolvedVia).toBe("trusted-override");
       expect(d.kind).toBe("cmd");
       expect(d.version).toBe("mcode 9.9.9");
+      expect(d.executableSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(d.executableBytes).toBeGreaterThan(0);
+      expect(d.outputSchemaSupported).toBe(true);
       expect(d.helpText.toLowerCase()).toContain("usage");
       expect(d.execHelpText.toLowerCase()).toContain("--cwd");
     } finally {
@@ -115,6 +146,18 @@ describe("resolveMCode (plan §33-35)", () => {
     } finally {
       process.env["PATH"] = original;
     }
+  });
+
+  it("refuses probe output beyond the configured bound", async () => {
+    await expect(
+      resolveMCode({ explicitPath: oversizedMcode, maxProbeOutputBytes: 32 }),
+    ).rejects.toThrow(/exceeded 32 bytes/i);
+  });
+
+  it("requires locally verified --output-schema support", async () => {
+    await expect(resolveMCode({ explicitPath: noSchemaMcode })).rejects.toMatchObject({
+      code: "EXEC_HELP_PROBE_FAILED",
+    });
   });
 });
 
