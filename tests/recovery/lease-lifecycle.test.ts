@@ -26,12 +26,12 @@ describe("startup lease reconciliation and recovery takeover", () => {
     let now = 0;
     const lock = new WorkspaceLock({
       stateRoot,
-      heartbeatIntervalMs: 10,
-      staleAfterMs: 30,
+      heartbeatIntervalMs: 1_000,
+      staleAfterMs: 3_000,
       dependencies: { now: () => now, hostname: () => "test-host", randomUUID: () => "lease-terminal", pidProbe: () => "DEAD" },
     });
     const handle = await lock.acquire({ workspaceId: "demo", canonicalPath: workspacePath, executionId: "exec-terminal" });
-    now = 31;
+    now = 3_001;
 
     const report = await lock.reconcileStartupLeases(new Map([["exec-terminal", "TERMINAL"]]));
 
@@ -46,13 +46,13 @@ describe("startup lease reconciliation and recovery takeover", () => {
     let now = 0;
     const lock = new WorkspaceLock({
       stateRoot,
-      heartbeatIntervalMs: 10,
-      staleAfterMs: 30,
+      heartbeatIntervalMs: 1_000,
+      staleAfterMs: 3_000,
       dependencies: { now: () => now, hostname: () => "test-host", randomUUID: () => "lease-held", pidProbe: () => "DEAD" },
     });
     const handle = await lock.acquire({ workspaceId: "demo", canonicalPath: workspacePath, executionId: "exec-held" });
     const secondHandle = await lock.acquire({ workspaceId: "demo-2", canonicalPath: secondWorkspacePath, executionId: "exec-recovery" });
-    now = 31;
+    now = 3_001;
 
     const report = await lock.reconcileStartupLeases(new Map([
       ["exec-held", "ACTIVE"],
@@ -71,8 +71,8 @@ describe("startup lease reconciliation and recovery takeover", () => {
     let nextLease = 0;
     const lock = new WorkspaceLock({
       stateRoot,
-      heartbeatIntervalMs: 10,
-      staleAfterMs: 30,
+      heartbeatIntervalMs: 1_000,
+      staleAfterMs: 3_000,
       dependencies: {
         now: () => now,
         hostname: () => "test-host",
@@ -82,7 +82,7 @@ describe("startup lease reconciliation and recovery takeover", () => {
     });
     const oldHandle = await lock.acquire({ workspaceId: "demo", canonicalPath: workspacePath, executionId: "exec-recover" });
     const oldOwner = await readFile(oldHandle.ownerPath, "utf8");
-    now = 31;
+    now = 3_001;
 
     const recovery = await lock.takeoverRecoveryLease({
       workspaceId: "demo",
@@ -99,11 +99,11 @@ describe("startup lease reconciliation and recovery takeover", () => {
 
   it("does not mutate a lease for alive or unknown recovery status", async () => {
     const { workspacePath, stateRoot } = await fixture();
-    let now = 31;
+    let now = 3_001;
     const lock = new WorkspaceLock({
       stateRoot,
-      heartbeatIntervalMs: 10,
-      staleAfterMs: 30,
+      heartbeatIntervalMs: 1_000,
+      staleAfterMs: 3_000,
       dependencies: { now: () => now, hostname: () => "test-host", randomUUID: () => "lease-old", pidProbe: () => "DEAD" },
     });
     const oldHandle = await lock.acquire({ workspaceId: "demo", canonicalPath: workspacePath, executionId: "exec-recover" });
@@ -124,8 +124,8 @@ describe("startup lease reconciliation and recovery takeover", () => {
     const { workspacePath, stateRoot } = await fixture();
     const lock = new WorkspaceLock({
       stateRoot,
-      heartbeatIntervalMs: 10,
-      staleAfterMs: 30,
+      heartbeatIntervalMs: 1_000,
+      staleAfterMs: 3_000,
       dependencies: { now: () => 31, hostname: () => "test-host", randomUUID: () => "lease-other", pidProbe: () => "DEAD" },
     });
     const oldHandle = await lock.acquire({ workspaceId: "demo", canonicalPath: workspacePath, executionId: "exec-other" });

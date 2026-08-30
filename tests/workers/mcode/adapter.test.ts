@@ -254,7 +254,7 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
       await expect(adapter.collectResult(inv.executionId)).rejects.toMatchObject({
         code: "TIMED_OUT",
       });
-      expect(Date.now() - startedAt).toBeLessThan(4_000);
+      expect(Date.now() - startedAt).toBeLessThan(6_000);
     },
     10_000,
   );

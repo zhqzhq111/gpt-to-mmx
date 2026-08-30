@@ -130,7 +130,7 @@ class ManagedProcessImpl implements ManagedProcess {
     await this.terminate("timeout");
   }
 
-  private async performTermination(_reason: TerminalCause): Promise<TerminationResult> {
+  private async performTermination(reason: TerminalCause): Promise<TerminationResult> {
     if (this.closed || this.pid === undefined) {
       return {
         confirmedGone: true,
@@ -143,6 +143,7 @@ class ManagedProcessImpl implements ManagedProcess {
       const result = await this.controller.terminate(this.pid, {
         gracefulTerminationMs: this.gracefulTerminationMs,
         forceTerminationMs: this.forceTerminationMs,
+        ...(reason === "result_complete" ? { forceImmediately: true } : {}),
       });
       return result;
     } catch (error) {

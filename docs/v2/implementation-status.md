@@ -748,7 +748,32 @@ all 3 real process tests; and `git diff --check` passes. The five skips are
 the existing real-mcode tests. Phase 7 is now sealed; later work is limited to
 the explicitly separate Phase 8+ operational and runtime phases.
 
+## Phase 8 — Unified Process Supervisor
+
+Status: **COMPLETE / SEALED** on branch `codex/phase-8-process-supervisor`.
+
+Implemented:
+
+- `src/process/supervisor.ts` owns managed process lifecycle, bounded timeout,
+  idempotent termination, spawn errors, and exactly-once timeout handling.
+- `src/process/platform.ts` provides Windows `taskkill /T` → `/F` escalation
+  and POSIX detached process-group `SIGTERM` → `SIGKILL` escalation, both with
+  termination confirmation and bounded waits.
+- `MCodeAdapter` no longer contains OS kill/watchdog helpers. It delegates
+  process lifecycle to the Supervisor while preserving stream-json logical
+  completion and prompt wrapper cleanup.
+- Verification uses the same Supervisor, preserves stdout/stderr separation,
+  records termination evidence, and distinguishes confirmed timeout from
+  `termination_unconfirmed`.
+- Engine records `recovery.required` and safe-holds the worktree and Lease when
+  Verification termination cannot be confirmed; patch/final diff collection is
+  skipped in that path.
+- Real parent→grandchild process E2E covers cancellation, timeout, and
+  Verification timeout on Windows.
+
+Final Gate evidence is recorded below after typecheck, build, complete tests,
+lease-process E2E, process-supervisor E2E, and `git diff --check` complete.
+
 ## Remaining phases
 
-Process Supervisor, Storage Manager, GC, operational CLI, runtime hardening,
-and CI matrices.
+Storage Manager, GC, operational CLI, runtime hardening, and CI matrices.

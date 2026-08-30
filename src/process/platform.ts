@@ -20,6 +20,7 @@ export interface PlatformProcessController {
     options: {
       readonly gracefulTerminationMs: number;
       readonly forceTerminationMs: number;
+      readonly forceImmediately?: boolean;
     },
   ): Promise<TerminationResult>;
 }
@@ -127,6 +128,18 @@ function makeController(
           };
         }
 
+        if (options.forceImmediately) {
+          const forced = await runTaskkill(pid, true, options.forceTerminationMs);
+          const status = await waitForGone(probe, pid, options.forceTerminationMs, sleep, now);
+          return {
+            confirmedGone: status === "gone",
+            gracefulAttempted: false,
+            forcedAttempted: true,
+            strategy: "windows_taskkill",
+            ...(!forced.success && forced.error !== undefined ? { error: forced.error } : {}),
+          };
+        }
+
         const graceful = await runTaskkill(pid, false, options.gracefulTerminationMs);
         let status = await waitForGone(probe, pid, options.gracefulTerminationMs, sleep, now);
         if (status === "gone") {
@@ -171,19 +184,36 @@ function makeController(
       }
 
       const errors: string[] = [];
+      const firstSignal = options.forceImmediately ? "SIGKILL" : "SIGTERM";
       try {
-        sendSignal(-pid, "SIGTERM");
+        sendSignal(-pid, firstSignal);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
           errors.push((error as Error).message);
         }
       }
-      let status = await waitForGone(probeGroup, pid, options.gracefulTerminationMs, sleep, now);
+      let status = await waitForGone(
+        probeGroup,
+        pid,
+        options.forceImmediately ? options.forceTerminationMs : options.gracefulTerminationMs,
+        sleep,
+        now,
+      );
       if (status === "gone") {
         return {
           confirmedGone: true,
-          gracefulAttempted: true,
-          forcedAttempted: false,
+          gracefulAttempted: options.forceImmediately !== true,
+          forcedAttempted: options.forceImmediately === true,
+          strategy: "posix_process_group",
+          ...(errors.length > 0 ? { error: errors.join("; ") } : {}),
+        };
+      }
+
+      if (options.forceImmediately) {
+        return {
+          confirmedGone: false,
+          gracefulAttempted: false,
+          forcedAttempted: true,
           strategy: "posix_process_group",
           ...(errors.length > 0 ? { error: errors.join("; ") } : {}),
         };
