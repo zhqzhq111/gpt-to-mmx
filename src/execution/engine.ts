@@ -49,7 +49,9 @@ import { WorkspaceRegistry } from "../workspace/registry.js";
 import {
   applyPreflightedPatch,
   collectWorktreePatch,
+  freezePreparedWorktreePatch,
   createTemporaryWorktree,
+  prepareWorktreePatch,
   preflightAcceptedPatch,
   removeTemporaryWorktree,
   type ApplyAcceptedPatchResult,
@@ -273,6 +275,9 @@ export class G2MExecutionEngine {
         gcEligibleAt,
       });
     } catch (error) {
+      if (error instanceof StorageAdmissionError) {
+        throw new G2MExecutionEngineError(error.code, error.message, error);
+      }
       throw new G2MExecutionEngineError("STORAGE_SCAN_FAILED", "storage usage scan failed", error);
     }
   }
@@ -491,15 +496,32 @@ export class G2MExecutionEngine {
         fingerprint,
       });
 
+      let workerStorageAbort: import("../storage/monitor.js").StorageCheckResult | undefined;
       workerMonitor = this.options.storageMonitor?.start(
         { worktreePath: worktree.worktreePath, artifactPath: this.options.artifactRoot },
-        async () => { await this.options.worker.cancel(executionId); },
+        async (result) => {
+          workerStorageAbort = result;
+          await this.options.worker.cancel(executionId);
+        },
       );
 
       let workerResult;
       try {
         workerResult = await this.options.worker.collectResult(executionId);
       } catch (error) {
+        if (workerStorageAbort !== undefined && error instanceof AdapterError) {
+          const code = workerStorageAbort.status === "limit_exceeded"
+            ? "STORAGE_LIMIT_EXCEEDED"
+            : "STORAGE_ADMISSION_DENIED";
+          this.appendAndReduce(mutable, {
+            taskId: task.task_id,
+            executionId,
+            type: "agent.cancelled",
+            payload: { reason: workerStorageAbort.reason ?? "worker stopped by storage guard", code },
+            fingerprint,
+          });
+          throw new G2MExecutionEngineError(code, "worker stopped by storage guard", error);
+        }
         if (error instanceof AdapterError && error.code === "UNKNOWN") {
           this.appendAndReduce(mutable, {
             taskId: task.task_id,
@@ -624,6 +646,16 @@ export class G2MExecutionEngine {
         verification,
       );
 
+      if (verification.status === "storage_limit_exceeded") {
+        this.appendAndReduce(mutable, {
+          taskId: task.task_id,
+          executionId,
+          type: "verification.failed",
+          payload: { reason: verification.errorMessage ?? "storage limit exceeded", verificationStatus: verification.status, resultHash: verification.resultHash },
+          fingerprint,
+        });
+        throw new G2MExecutionEngineError("STORAGE_LIMIT_EXCEEDED", "verification stopped after storage limit was exceeded");
+      }
       if (verification.status === "termination_unconfirmed") {
         this.appendAndReduce(mutable, {
           taskId: task.task_id,
@@ -647,7 +679,24 @@ export class G2MExecutionEngine {
 
       await this.snapshotStorage(executionId, worktree.worktreePath);
       const executionArtifactRoot = resolve(this.options.artifactRoot, executionId);
-      const patch = await collectWorktreePatch(worktree, executionArtifactRoot);
+      const preparedPatch = await prepareWorktreePatch(worktree, executionArtifactRoot);
+      if (this.options.storageManager !== undefined) {
+        try {
+          await this.options.storageManager.assertExecutionLimits({
+            executionId,
+            artifactPath: executionArtifactRoot,
+            worktreePath: worktree.worktreePath,
+            additionalArtifactBytes: preparedPatch.patchBytes.byteLength + preparedPatch.metadataBytes,
+          });
+        } catch (error) {
+          if (error instanceof StorageAdmissionError) {
+            throw new G2MExecutionEngineError(error.code, error.message, error);
+          }
+          throw error;
+        }
+      }
+      const patch = await freezePreparedWorktreePatch(preparedPatch);
+      await this.snapshotStorage(executionId, worktree.worktreePath);
       const diff = await collectDiff(worktree.worktreePath, worktree.baseRevision);
       recordWorkspaceEvidence(
         this.options.evidenceStore,
@@ -751,6 +800,7 @@ export class G2MExecutionEngine {
           `unexpected state ${mutable.state ?? "null"} after review.requested`,
         );
       }
+      await this.snapshotStorage(executionId, worktree.worktreePath, "RETAINED", null);
 
       const pending: PendingReviewExecution = Object.freeze({
         task,
@@ -779,6 +829,18 @@ export class G2MExecutionEngine {
         !preserveWorktree
       ) {
         await removeTemporaryWorktree(worktree).catch(() => undefined);
+      }
+      if (
+        worktree !== undefined &&
+        this.options.storageManager !== undefined &&
+        ["FAILED", "TIMED_OUT", "CANCELLED"].includes(mutable.state ?? "")
+      ) {
+        await this.snapshotStorage(
+          executionId,
+          worktree.worktreePath,
+          "NORMAL",
+          Date.now() + (this.options.storageManager.storagePolicy?.completed_retention_days ?? 30) * 24 * 60 * 60 * 1000,
+        ).catch(() => undefined);
       }
       if (error instanceof G2MExecutionEngineError) throw error;
       throw new G2MExecutionEngineError(
@@ -1023,6 +1085,14 @@ export class G2MExecutionEngine {
         // The scanner's RETAINED_WORKTREE_CANDIDATE will surface the
         // leftover for the next operator.
         await removeTemporaryWorktree(pending.worktree).catch(() => undefined);
+      }
+      if (this.options.storageManager !== undefined) {
+        const retentionClass = newState === "REVISION_REQUESTED" ? "RETAINED" : "NORMAL";
+        const retentionDays = this.options.storageManager.storagePolicy?.completed_retention_days ?? 30;
+        const gcEligibleAt = retentionClass === "NORMAL"
+          ? Date.now() + retentionDays * 24 * 60 * 60 * 1000
+          : null;
+        await this.snapshotStorage(pending.executionId, pending.worktree.worktreePath, retentionClass, gcEligibleAt);
       }
       this.pending.delete(pending.bundle.bundleId);
 

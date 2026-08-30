@@ -85,8 +85,32 @@ function retentionClass(state: TaskState): string | null {
   return null;
 }
 
+function retentionProjection(
+  state: TaskState,
+  terminalTimestamp: number,
+  completedRetentionDays: number,
+): { retentionClass: string | null; gcEligibleAt: number | null } {
+  const retention = retentionClass(state);
+  if (retention !== "NORMAL") return { retentionClass: retention, gcEligibleAt: null };
+  return {
+    retentionClass: "NORMAL",
+    gcEligibleAt: terminalTimestamp + completedRetentionDays * 24 * 60 * 60 * 1000,
+  };
+}
+
+export interface ExecutionProjectorOptions {
+  readonly completedRetentionDays?: number;
+}
+
 export class ExecutionProjector implements ExecutionProjection {
-  constructor(private readonly database: StateDatabase) {}
+  private readonly completedRetentionDays: number;
+
+  constructor(
+    private readonly database: StateDatabase,
+    options: ExecutionProjectorOptions = {},
+  ) {
+    this.completedRetentionDays = options.completedRetentionDays ?? 30;
+  }
 
   project(event: TaskEvent, state: TaskState, metadata: ProjectionMetadata = {}): void {
     this.database.transaction(() => this.projectWithinTransaction(event, state, metadata));
@@ -299,6 +323,7 @@ export class ExecutionProjector implements ExecutionProjection {
     metadata: ProjectionMetadata,
   ): void {
     const binding = taskBinding(event);
+    const retention = retentionProjection(state, event.timestampMs, this.completedRetentionDays);
     this.database.prepare(`
       INSERT INTO executions(
         execution_id, task_id, workspace_id, state, created_at, updated_at,
@@ -326,7 +351,7 @@ export class ExecutionProjector implements ExecutionProjection {
       event.fingerprint !== undefined ? fingerprintHash(event.fingerprint) : null,
       metadata.artifactPath ?? null,
       metadata.worktreePath ?? null,
-      retentionClass(state),
+      retention.retentionClass,
     );
   }
 
@@ -336,6 +361,7 @@ export class ExecutionProjector implements ExecutionProjection {
     metadata: ProjectionMetadata,
   ): void {
     const reviewBundleId = textPayload(event, "review_bundle_id", "reviewBundleId");
+    const retention = retentionProjection(state, event.timestampMs, this.completedRetentionDays);
     this.database.prepare(`
       UPDATE executions SET
         state = ?,
@@ -347,7 +373,8 @@ export class ExecutionProjector implements ExecutionProjection {
         artifact_path = COALESCE(?, artifact_path),
         worktree_path = COALESCE(?, worktree_path),
         review_bundle_id = COALESCE(?, review_bundle_id),
-        retention_class = COALESCE(?, retention_class)
+        retention_class = ?,
+        gc_eligible_at = ?
       WHERE execution_id = ?
     `).run(
       state,
@@ -359,7 +386,8 @@ export class ExecutionProjector implements ExecutionProjection {
       metadata.artifactPath ?? null,
       metadata.worktreePath ?? null,
       reviewBundleId ?? null,
-      retentionClass(state),
+      retention.retentionClass,
+      retention.gcEligibleAt,
       event.attemptId,
     );
   }

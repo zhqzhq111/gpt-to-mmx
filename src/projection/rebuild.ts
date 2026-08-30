@@ -89,6 +89,7 @@ export interface RebuildOptions {
   readonly stateRoot: string;
   readonly workspaces: readonly RebuildWorkspaceConfig[];
   readonly nowMs: number;
+  readonly completedRetentionDays?: number;
 }
 
 export interface RebuildFailureReason {
@@ -345,7 +346,11 @@ export async function rebuildProjection(options: RebuildOptions): Promise<Rebuil
 
     try {
       tempDatabase = new StateDatabase(tempPath);
-      const projector = new ExecutionProjector(tempDatabase);
+      const projector = new ExecutionProjector(tempDatabase, {
+        ...(options.completedRetentionDays !== undefined
+          ? { completedRetentionDays: options.completedRetentionDays }
+          : {}),
+      });
       writeWorkspaces(projector, workspaces, nowMs);
 
       // The filesystem owner files are authoritative. SQLite receives only

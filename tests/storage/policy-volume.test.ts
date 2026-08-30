@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { DEFAULT_STORAGE_POLICY, resolveStoragePolicy } from "../../src/storage/policy.js";
 import { deduplicateVolumeRoots, volumeIdForPath } from "../../src/storage/volume.js";
@@ -41,6 +44,16 @@ describe("volume identity", () => {
   it("uses device identity on POSIX", () => {
     expect(volumeIdForPath("/worktrees", "linux", 2049)).toBe("posix-dev:2049");
     expect(volumeIdForPath("/artifacts", "linux", 2050)).toBe("posix-dev:2050");
+  });
+
+  it("walks to the nearest existing parent for a configured POSIX root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-volume-"));
+    try {
+      expect(volumeIdForPath(join(root, "not-created", "nested"), "linux"))
+        .toBe(volumeIdForPath(root, "linux"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("returns one root group per volume", () => {

@@ -19,6 +19,7 @@ import { buildReview } from "../../src/review/ingress.js";
 import { ReplayGuard } from "../../src/review/replay-guard.js";
 import { ProcessSupervisor } from "../../src/process/supervisor.js";
 import type { PlatformProcessController } from "../../src/process/platform.js";
+import type { StorageMonitor } from "../../src/storage/monitor.js";
 import type { CodeTaskV1 } from "../../src/protocol/code-task.v1.schema.js";
 import type {
   CodingWorkerAdapter,
@@ -28,6 +29,7 @@ import type {
   WorkerPrompt,
   WorkerResult,
 } from "../../src/workers/coding-worker.js";
+import { AdapterError } from "../../src/workers/coding-worker.js";
 import { FakeMCodeAdapter } from "../../src/workers/mcode/fake.js";
 import { WorkspaceLock } from "../../src/workspace/lock.js";
 import { WorkspaceRegistry } from "../../src/workspace/registry.js";
@@ -45,6 +47,7 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
 
 class EditingWorker implements CodingWorkerAdapter {
   private readonly executions = new Map<ExecutionId, WorkerInvocation>();
+  private cancelled = false;
   constructor(private readonly replacement: string = "fixed\n") {}
 
   probe(): Promise<RuntimeCapabilitySnapshot> {
@@ -79,6 +82,7 @@ class EditingWorker implements CodingWorkerAdapter {
 
   collectResult(executionId: ExecutionId): Promise<WorkerResult> {
     if (!this.executions.has(executionId)) throw new Error("not started");
+    if (this.cancelled) return Promise.reject(new AdapterError("CANCELLED", "cancelled by storage guard"));
     return Promise.resolve({
       executionId,
       sessionId: `fake-${executionId}`,
@@ -90,6 +94,7 @@ class EditingWorker implements CodingWorkerAdapter {
   }
 
   cancel(): Promise<void> {
+    this.cancelled = true;
     return Promise.resolve();
   }
 
@@ -182,6 +187,7 @@ describe("G2MExecutionEngine", () => {
     projection?: ExecutionProjection,
     processSupervisor?: ProcessSupervisor,
     storageManager?: StorageManager,
+    storageMonitor?: StorageMonitor,
   ): G2MExecutionEngine {
     return new G2MExecutionEngine({
       workspaceRegistry,
@@ -195,6 +201,7 @@ describe("G2MExecutionEngine", () => {
       worker,
       ...(processSupervisor !== undefined ? { processSupervisor } : {}),
       ...(storageManager !== undefined ? { storageManager } : {}),
+      ...(storageMonitor !== undefined ? { storageMonitor } : {}),
       workerRuntime: { runtime: "fake", version: "editing-worker-1", model: "fake" },
       adapterContractVersion: "g2m-worker-v1",
       worktreeRoot,
@@ -249,6 +256,43 @@ describe("G2MExecutionEngine", () => {
     });
     expect(workspaceLock.isHeld("demo")).toBe(true);
     workspaceLock.release(pending.lease);
+  });
+
+  it("checks storage limits before creating frozen.patch", async () => {
+    const reservation = {
+      reservationSetId: "set",
+      executionId: "execution",
+      taskId: task.task_id,
+      recordPath: join(tempRoot, "reservation.json"),
+      recordHash: "hash",
+      reservations: [],
+    };
+    const storageManager = {
+      reserveExecution: vi.fn().mockResolvedValue(reservation),
+      releaseReservation: vi.fn().mockResolvedValue(undefined),
+      snapshotExecution: vi.fn().mockResolvedValue(undefined),
+      assertExecutionLimits: vi.fn().mockRejectedValue(
+        new StorageAdmissionError("STORAGE_LIMIT_EXCEEDED", "artifact limit"),
+      ),
+    } as unknown as StorageManager;
+    await expect(engine(new EditingWorker(), undefined, undefined, storageManager).execute(task))
+      .rejects.toMatchObject({ code: "STORAGE_LIMIT_EXCEEDED" });
+    expect((await import("node:fs/promises")).readdir(artifactRoot, { recursive: true }).catch(() => []))
+      .resolves.not.toContain("frozen.patch");
+    expect(eventStore.list().some((event) => event.type === "patch.frozen")).toBe(false);
+  });
+
+  it("maps worker cancellation caused by storage to STORAGE_LIMIT_EXCEEDED", async () => {
+    const storageMonitor = {
+      start: (_paths: unknown, callback: (result: unknown) => void | Promise<void>) => {
+        void callback({ status: "limit_exceeded", code: "STORAGE_LIMIT_EXCEEDED", freeBytes: 1, usage: { artifactBytes: 10, worktreeBytes: 10, totalBytes: 20 } });
+        return { stop: () => undefined };
+      },
+    } as StorageMonitor;
+    await expect(engine(new EditingWorker(), undefined, undefined, undefined, storageMonitor).execute(task))
+      .rejects.toMatchObject({ code: "STORAGE_LIMIT_EXCEEDED" });
+    expect(eventStore.list().some((event) => event.type === "patch.frozen")).toBe(false);
+    expect(eventStore.list().at(-1)?.type).toBe("agent.cancelled");
   });
 
   it("holds REVIEW_PENDING lease and blocks a second manager", async () => {

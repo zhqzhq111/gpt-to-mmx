@@ -58,6 +58,21 @@ export interface WorktreePatch {
   readonly createdAt: number;
 }
 
+/**
+ * A patch that has been assembled entirely in memory.  Keeping preparation
+ * separate from freezing gives storage admission a hard checkpoint before an
+ * immutable artifact is created.
+ */
+export interface PreparedWorktreePatch {
+  readonly handle: TemporaryWorktreeHandle;
+  readonly artifactRoot: string;
+  readonly patchBytes: Buffer;
+  readonly metadataBytes: number;
+  readonly changeSetHash: string;
+  readonly changeSet: WorktreePatch["changeSet"];
+  readonly changedFiles: readonly string[];
+}
+
 export interface ApplyAcceptedPatchResult {
   readonly status: "applied" | "no_changes";
   readonly targetPath: string;
@@ -363,6 +378,13 @@ export async function collectWorktreePatch(
   handle: TemporaryWorktreeHandle,
   artifactRoot: string,
 ): Promise<WorktreePatch> {
+  return freezePreparedWorktreePatch(await prepareWorktreePatch(handle, artifactRoot));
+}
+
+export async function prepareWorktreePatch(
+  handle: TemporaryWorktreeHandle,
+  artifactRoot: string,
+): Promise<PreparedWorktreePatch> {
   assertNonEmpty("artifactRoot", artifactRoot);
   if (!isAbsolute(artifactRoot)) {
     throw new TemporaryWorktreeError("INVALID_INPUT", "artifactRoot must be absolute");
@@ -376,10 +398,33 @@ export async function collectWorktreePatch(
       handle.worktreePath,
       ["diff", "--cached", "--binary", handle.baseRevision],
       "PATCH_FAILED",
-    );
+  );
   const changeSet = await computeIndexedChangeSet(handle.worktreePath, handle.baseRevision);
-  const changedFiles = changeSet.entries.map((entry) => entry.path);
-  const artifactDirectory = resolve(artifactRoot);
+  const metadataBytes = Buffer.byteLength(`${JSON.stringify({
+    artifact_id: `patch-${handle.worktreeId}`,
+    artifact_path: "frozen.patch",
+    patch_blob_hash: "0".repeat(64),
+    change_set_hash: changeSet.hash,
+    base_revision: handle.baseRevision,
+    patch_bytes: patchBytes.length,
+    change_set: changeSet.entries,
+  }, null, 2)}\n`, "utf8");
+  return Object.freeze({
+    handle,
+    artifactRoot: resolve(artifactRoot),
+    patchBytes,
+    metadataBytes,
+    changeSetHash: changeSet.hash,
+    changeSet: changeSet.entries,
+    changedFiles: Object.freeze(changeSet.entries.map((entry) => entry.path)),
+  });
+}
+
+export async function freezePreparedWorktreePatch(
+  prepared: PreparedWorktreePatch,
+): Promise<WorktreePatch> {
+  const { handle, patchBytes, changeSetHash, changeSet, changedFiles } = prepared;
+  const artifactDirectory = prepared.artifactRoot;
   await mkdir(artifactDirectory, { recursive: true });
   const patchPath = join(artifactDirectory, "frozen.patch");
   const metadataPath = join(artifactDirectory, "frozen-patch.json");
@@ -389,10 +434,10 @@ export async function collectWorktreePatch(
     artifact_id: artifactId,
     artifact_path: "frozen.patch",
     patch_blob_hash: patchArtifact.sha256,
-    change_set_hash: changeSet.hash,
+    change_set_hash: changeSetHash,
     base_revision: handle.baseRevision,
     patch_bytes: patchArtifact.bytes,
-    change_set: changeSet.entries,
+    change_set: changeSet,
   };
   await writeImmutableArtifact(
     metadataPath,
@@ -408,11 +453,11 @@ export async function collectWorktreePatch(
     metadataPath,
     patchText,
     patchBlobHash: patchArtifact.sha256,
-    changeSetHash: changeSet.hash,
-    changeSet: changeSet.entries,
+    changeSetHash,
+    changeSet,
     patchBytes: patchArtifact.bytes,
     patchHash: patchArtifact.sha256,
-    changedFiles: Object.freeze(changedFiles),
+    changedFiles,
     empty: patchBytes.length === 0,
     createdAt: Date.now(),
   });

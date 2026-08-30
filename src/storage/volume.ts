@@ -1,5 +1,5 @@
-import { statSync } from "node:fs";
-import { win32 } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { dirname, win32 } from "node:path";
 
 export interface VolumeInfo {
   readonly volumeId: string;
@@ -42,7 +42,13 @@ export function volumeIdForPath(path: string, platform: NodeJS.Platform | "win32
     if (root.length === 0) throw new Error(`cannot resolve Windows volume for path: ${path}`);
     return `win32:${root.toLowerCase()}`;
   }
-  const dev = deviceNumber ?? Number(statSync(path).dev);
+  let existingPath = path;
+  while (!existsSync(existingPath)) {
+    const parent = dirname(existingPath);
+    if (parent === existingPath) throw new Error(`cannot resolve POSIX volume for path: ${path}`);
+    existingPath = parent;
+  }
+  const dev = deviceNumber ?? Number(statSync(existingPath).dev);
   return `posix-dev:${dev}`;
 }
 

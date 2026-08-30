@@ -13,12 +13,13 @@ import {
   type TerminationResult,
 } from "../process/supervisor.js";
 import type { VerificationProfile } from "../policy/verification.js";
-import type { StorageMonitor, StorageMonitorHandle } from "../storage/monitor.js";
+import type { StorageCheckResult, StorageMonitor, StorageMonitorHandle } from "../storage/monitor.js";
 
 export type VerificationStatus =
   | "passed"
   | "failed"
   | "timed_out"
+  | "storage_limit_exceeded"
   | "termination_unconfirmed"
   | "spawn_error"
   | "skipped";
@@ -214,10 +215,14 @@ async function runProfile(
   });
 
   let storageMonitorHandle: StorageMonitorHandle | undefined;
+  let storageAbort: StorageCheckResult | undefined;
   if (options.storageMonitor !== undefined) {
     storageMonitorHandle = options.storageMonitor.start(
       { worktreePath: workspacePath, artifactPath: options.storageArtifactPath ?? workspacePath },
-      async () => { await managed.terminate("timeout"); },
+      async (result) => {
+        storageAbort = result;
+        await managed.terminate("timeout");
+      },
     );
   }
   let processOutcome;
@@ -226,7 +231,23 @@ async function runProfile(
   } finally {
     storageMonitorHandle?.stop();
   }
-  const outcome = classifyProcessOutcome(profile, processOutcome, stdout, stderr);
+  let outcome = classifyProcessOutcome(profile, processOutcome, stdout, stderr);
+  if (storageAbort !== undefined) {
+    const confirmedGone = outcome.termination?.confirmedGone ?? false;
+    if (!confirmedGone) {
+      outcome = {
+        ...outcome,
+        status: "termination_unconfirmed",
+        errorMessage: "storage limit triggered termination, but process termination could not be confirmed",
+      };
+    } else {
+      outcome = {
+        ...outcome,
+        status: "storage_limit_exceeded",
+        errorMessage: storageAbort.reason ?? "verification stopped after storage limit was exceeded",
+      };
+    }
+  }
   const finishedAt = Date.now();
   return withResultHash({
     profileId: profile.id,

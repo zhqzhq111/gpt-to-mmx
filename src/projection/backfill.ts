@@ -17,6 +17,7 @@ export interface BackfillProjectionOptions {
   readonly database: StateDatabase;
   readonly workspaces: readonly WorkspaceSeed[];
   readonly nowMs: number;
+  readonly completedRetentionDays?: number;
 }
 
 export interface BackfillProjectionReport {
@@ -100,7 +101,11 @@ function isCurrent(
 
 export function backfillProjection(options: BackfillProjectionOptions): BackfillProjectionReport {
   const { stateRoot, database, workspaces, nowMs } = options;
-  const projector = new ExecutionProjector(database);
+  const projector = new ExecutionProjector(database, {
+    ...(options.completedRetentionDays !== undefined
+      ? { completedRetentionDays: options.completedRetentionDays }
+      : {}),
+  });
   projector.seedWorkspaces(workspaces, nowMs);
 
   let repairedExecutions = 0;

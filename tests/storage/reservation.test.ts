@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +8,7 @@ import { EventStore } from "../../src/events/store.js";
 import { StateDatabase } from "../../src/projection/database.js";
 import { DEFAULT_STORAGE_POLICY } from "../../src/storage/policy.js";
 import { StorageAdmissionError, StorageManager } from "../../src/storage/reservation.js";
+import { reconcileStorageReservations } from "../../src/storage/reservation.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -50,7 +52,10 @@ describe("StorageManager.reserveExecution", () => {
     expect(f.database.prepare("SELECT state, reserved_bytes FROM storage_reservations").all()).toEqual([
       { state: "ACTIVE", reserved_bytes: 200 },
     ]);
-    expect(await readFile(result.recordPath, "utf8")).toContain("exec-1");
+    const recordText = await readFile(result.recordPath, "utf8");
+    const record = JSON.parse(recordText) as object;
+    expect(recordText).toContain("exec-1");
+    expect(result.recordHash).toBe(createHash("sha256").update(JSON.stringify(record)).digest("hex"));
     expect(f.eventStore.getByAttemptId("exec-1")[0]).toMatchObject({
       type: "storage.reservation.created",
       domain: "storage",
@@ -119,6 +124,51 @@ describe("StorageManager.releaseReservation", () => {
     ]);
     await storage.releaseReservation(handle, "ACCEPTED");
     expect(f.database.prepare("SELECT state FROM storage_reservations").get()).toEqual({ state: "RELEASED" });
+    f.database.close();
+    f.eventStore.close();
+  });
+});
+
+describe("StorageManager storage checkpoints", () => {
+  it("enforces worktree, artifact, and total limits after scanning usage", async () => {
+    const f = await fixture();
+    const storage = new StorageManager({
+      database: f.database,
+      stateRoot: f.stateRoot,
+      policy: { ...f.policy, min_free_bytes: 0, safety_margin_bytes: 0, max_worktree_bytes: 2, max_artifact_bytes: 2, max_total_bytes: 3 },
+      freeSpaceProvider: { freeBytes: async () => 1_000 },
+    });
+    for (const usage of [
+      { artifactBytes: 0, worktreeBytes: 3, totalBytes: 3 },
+      { artifactBytes: 3, worktreeBytes: 0, totalBytes: 3 },
+      { artifactBytes: 2, worktreeBytes: 2, totalBytes: 4 },
+    ]) {
+      expect(() => storage.assertUsageWithinLimits(`limit-${usage.totalBytes}`, usage)).toThrowError(
+        expect.objectContaining({ code: "STORAGE_LIMIT_EXCEEDED" }),
+      );
+    }
+    f.database.close();
+    f.eventStore.close();
+  });
+
+  it("does not reconstruct a pre-commit orphan as a permanent ACTIVE reservation", async () => {
+    const f = await fixture();
+    const reservationRoot = join(f.stateRoot, "reservations");
+    await mkdir(reservationRoot, { recursive: true });
+    const record = {
+      schema_version: 1,
+      reservation_set_id: "orphan-set",
+      execution_id: "orphan-execution",
+      pid: 123,
+      hostname: "test-host",
+      created_at: 100,
+      expires_at: 200,
+      reservations: [{ reservation_id: "orphan-reservation", volume_id: "v1", reserved_bytes: 10, roles: ["worktree"] }],
+    };
+    await (await import("node:fs/promises")).writeFile(join(reservationRoot, "orphan-set.json"), `${JSON.stringify(record)}\n`, "utf8");
+    const report = await reconcileStorageReservations({ stateRoot: f.stateRoot, database: f.database, eventStore: f.eventStore, nowMs: 300 });
+    expect(report.preCommitOrphans).toBe(1);
+    expect(f.database.prepare("SELECT count(*) AS n FROM storage_reservations WHERE reservation_set_id = ?").get("orphan-set")).toEqual({ n: 0 });
     f.database.close();
     f.eventStore.close();
   });

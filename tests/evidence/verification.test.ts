@@ -23,6 +23,7 @@ import {
 } from "../../src/process/platform.js";
 import { sha256 } from "../../src/protocol/hash.js";
 import type { VerificationProfile } from "../../src/policy/verification.js";
+import type { StorageMonitor } from "../../src/storage/monitor.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -118,6 +119,57 @@ describe("runVerification", () => {
     expect(r.exitCode).toBeNull();
     expect(r.errorMessage).toMatch(/500ms/);
     expect(r.termination).toMatchObject({ confirmedGone: true });
+  });
+
+  it("preserves a confirmed storage-triggered termination as storage_limit_exceeded", async () => {
+    const storageMonitor = {
+      start: (_paths: unknown, callback: (result: unknown) => void | Promise<void>) => {
+        void callback({
+          status: "limit_exceeded",
+          code: "STORAGE_LIMIT_EXCEEDED",
+          freeBytes: 1,
+          usage: { artifactBytes: 10, worktreeBytes: 10, totalBytes: 20 },
+        });
+        return { stop: () => undefined };
+      },
+    } as StorageMonitor;
+    const r = await runVerification(
+      makeProfile({ id: "storage-limit", args: ["-e", "setTimeout(() => {}, 10000)"], timeoutMs: 10_000 }),
+      "ws-storage-limit",
+      tempDir,
+      { storageMonitor },
+    );
+    expect(r.status).toBe("storage_limit_exceeded");
+    expect(r.status).not.toBe("timed_out");
+  });
+
+  it("maps an unconfirmed storage-triggered termination to termination_unconfirmed", async () => {
+    const storageMonitor = {
+      start: (_paths: unknown, callback: (result: unknown) => void | Promise<void>) => {
+        void callback({
+          status: "limit_exceeded",
+          code: "STORAGE_LIMIT_EXCEEDED",
+          freeBytes: 1,
+          usage: { artifactBytes: 10, worktreeBytes: 10, totalBytes: 20 },
+        });
+        return { stop: () => undefined };
+      },
+    } as StorageMonitor;
+    const controller: PlatformProcessController = {
+      strategy: "windows_taskkill",
+      isAlive: () => "alive",
+      terminate: async (pid) => {
+        try { process.kill(pid); } catch { /* process may already be gone */ }
+        return { confirmedGone: false, gracefulAttempted: true, forcedAttempted: true, strategy: "windows_taskkill", error: "not confirmed" };
+      },
+    };
+    const r = await runVerification(
+      makeProfile({ id: "storage-unknown", args: ["-e", "setInterval(() => {}, 10000)"], timeoutMs: 10_000 }),
+      "ws-storage-unknown",
+      tempDir,
+      { storageMonitor, processSupervisor: new ProcessSupervisor({ platformController: controller }) },
+    );
+    expect(r.status).toBe("termination_unconfirmed");
   });
 
   it("returns 'termination_unconfirmed' when the process tree cannot be proven gone", async () => {

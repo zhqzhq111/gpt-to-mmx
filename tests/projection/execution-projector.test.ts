@@ -123,6 +123,30 @@ function targetReplaySteps(events: EventStore, executionId: string): ProjectionR
 }
 
 describe("ExecutionProjector", () => {
+  it("projects terminal retention eligibility from the terminal event timestamp", async () => {
+    const { database, events } = await setup();
+    const projector = new ExecutionProjector(database, { completedRetentionDays: 2 });
+    const created = events.append({ taskId: "task-retention", attemptId: "execution-retention", type: "task.created", timestampMs: 100, payload: {} });
+    projector.project(created, "PLANNED");
+    const terminal = events.append({ taskId: "task-retention", attemptId: "execution-retention", type: "task.validation.failed", timestampMs: 200, payload: { reason: "test" } });
+    projector.project(terminal, "FAILED");
+    expect(projector.execution("execution-retention")).toMatchObject({
+      state: "FAILED",
+      retention_class: "NORMAL",
+      gc_eligible_at: 200 + 2 * 24 * 60 * 60 * 1000,
+    });
+
+    const retained = events.append({ taskId: "task-retention", attemptId: "execution-retained", type: "task.created", timestampMs: 300, payload: {} });
+    projector.project(retained, "PLANNED");
+    projector.project(events.append({ taskId: "task-retention", attemptId: "execution-retained", type: "task.validation.started", timestampMs: 400, payload: {} }), "REVIEW_PENDING");
+    expect(projector.execution("execution-retained")).toMatchObject({ retention_class: "RETAINED", gc_eligible_at: null });
+
+    const recovery = events.append({ taskId: "task-retention", attemptId: "execution-recovery", type: "task.created", timestampMs: 500, payload: {} });
+    projector.project(recovery, "PLANNED");
+    projector.project(events.append({ taskId: "task-retention", attemptId: "execution-recovery", type: "recovery.required", timestampMs: 600, payload: { reason: "test" } }), "RECOVERY_REQUIRED");
+    expect(projector.execution("execution-recovery")).toMatchObject({ retention_class: "RECOVERY_CRITICAL", gc_eligible_at: null });
+  });
+
   it("creates and advances an execution projection from durable lifecycle events", async () => {
     const { database, projector, events } = await setup();
     const created = events.append({

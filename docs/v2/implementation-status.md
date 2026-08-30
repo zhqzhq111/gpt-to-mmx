@@ -802,8 +802,13 @@ Implemented:
   state, plus startup reconciliation that retains `RECOVERY_REQUIRED` rows and
   releases only proven-safe terminal leaks;
 - Engine admission before validation passes, reservation release on known
-  terminal paths, Worker/Verification free-space monitoring, and exact usage
-  checkpoints;
+  terminal paths, Worker/Verification storage-cause propagation, exact
+  pre-freeze usage checkpoints, and terminal manifest refreshes;
+- retention projection (`NORMAL` terminal states receive
+  `terminal_timestamp + completed_retention_days`; `RETAINED` and
+  `RECOVERY_CRITICAL` remain ineligible), durable reservation-record
+  fsync/rename/reread verification, and conservative pre-commit orphan
+  reconciliation;
 - real two-process reservation race, release/retry, and independent-volume
   E2E coverage.
 
@@ -811,7 +816,7 @@ Final verification on the Phase 9 branch:
 
 - `npm run typecheck` → pass;
 - `npm run build` → pass;
-- `npm test` → **502 passed, 6 skipped, 0 failed**;
+- `npm test` → **510 passed, 6 skipped, 0 failed**;
 - `npm run test:lease-process` → **3/3**;
 - `npm run test:process-supervisor` → **3/3**;
 - `npm run test:storage-process` → **3/3**;

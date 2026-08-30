@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { hostname as localHostname } from "node:os";
-import { mkdir, readFile, readdir, rm, writeFile, rename } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rm, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import type { TaskEvent } from "../events/events.js";
@@ -12,7 +12,7 @@ import type { TaskState } from "../execution/state-machine.js";
 import { DEFAULT_STORAGE_POLICY, type StoragePolicy } from "./policy.js";
 import { nodeFreeSpaceProvider, type FreeSpaceProvider } from "./free-space.js";
 import { volumeIdForPath, type VolumeInfo } from "./volume.js";
-import { scanExecutionUsage, upsertStorageUsage, writeStorageManifestAtomic, type StorageManifest } from "./usage.js";
+import { scanExecutionUsage, upsertStorageUsage, writeStorageManifestAtomic, type StorageManifest, type StorageUsage } from "./usage.js";
 
 export type StorageErrorCode =
   | "STORAGE_ADMISSION_DENIED"
@@ -95,9 +95,20 @@ function recordHash(record: StorageReservationRecord): string {
 async function writeRecord(path: string, record: StorageReservationRecord): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const serialized = `${JSON.stringify(record, null, 2)}\n`;
   try {
-    await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    const handle = await open(temporary, "wx");
+    try {
+      await handle.writeFile(serialized, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await rename(temporary, path);
+    const reread = JSON.parse(await readFile(path, "utf8")) as StorageReservationRecord;
+    if (recordHash(reread) !== recordHash(record)) {
+      throw new Error("reservation record hash verification failed after rename");
+    }
   } catch (error) {
     await rm(temporary, { force: true });
     throw error;
@@ -133,6 +144,40 @@ export class StorageManager {
     this.hostname = options.hostname ?? localHostname();
     this.pid = options.pid ?? process.pid;
     this.now = options.now ?? Date.now;
+  }
+
+  get storagePolicy(): StoragePolicy {
+    return this.policy;
+  }
+
+  assertUsageWithinLimits(
+    executionId: string,
+    usage: StorageUsage,
+    additionalArtifactBytes = 0,
+  ): void {
+    const existing = this.options.database.prepare(
+      "SELECT COALESCE(artifact_bytes + worktree_bytes, 0) AS total FROM storage_usage WHERE execution_id = ?",
+    ).get(executionId) as { total: number | bigint } | undefined;
+    const projectedTotal = managedUsageTotal(this.options.database) - Number(existing?.total ?? 0) + usage.totalBytes + additionalArtifactBytes;
+    if (this.policy.max_worktree_bytes > 0 && usage.worktreeBytes > this.policy.max_worktree_bytes) {
+      throw new StorageAdmissionError("STORAGE_LIMIT_EXCEEDED", "worktree usage exceeds max_worktree_bytes");
+    }
+    if (this.policy.max_artifact_bytes > 0 && usage.artifactBytes + additionalArtifactBytes > this.policy.max_artifact_bytes) {
+      throw new StorageAdmissionError("STORAGE_LIMIT_EXCEEDED", "artifact usage exceeds max_artifact_bytes");
+    }
+    if (this.policy.max_total_bytes > 0 && projectedTotal > this.policy.max_total_bytes) {
+      throw new StorageAdmissionError("STORAGE_LIMIT_EXCEEDED", "managed storage usage exceeds max_total_bytes");
+    }
+  }
+
+  async assertExecutionLimits(input: {
+    readonly executionId: string;
+    readonly artifactPath: string;
+    readonly worktreePath: string;
+    readonly additionalArtifactBytes?: number;
+  }): Promise<void> {
+    const usage = await scanExecutionUsage(input);
+    this.assertUsageWithinLimits(input.executionId, usage, input.additionalArtifactBytes ?? 0);
   }
 
   async reserveExecution(input: {
@@ -273,6 +318,7 @@ export class StorageManager {
     readonly updatedAt?: number;
   }): Promise<StorageManifest> {
     const usage = await scanExecutionUsage(input);
+    this.assertUsageWithinLimits(input.executionId, usage);
     const manifest = await writeStorageManifestAtomic(
       join(this.options.stateRoot, "executions", input.executionId, "storage-manifest.json"),
       {
@@ -296,6 +342,7 @@ export interface StorageReconcileReport {
   readonly releasedReservations: number;
   readonly retainedReservations: number;
   readonly invalidRecords: number;
+  readonly preCommitOrphans: number;
 }
 
 function terminalState(events: readonly TaskEvent[]): TaskState | null {
@@ -323,6 +370,7 @@ export async function reconcileStorageReservations(options: {
   let releasedReservations = 0;
   let retainedReservations = 0;
   let invalidRecords = 0;
+  let preCommitOrphans = 0;
   for (const name of names) {
     let record: StorageReservationRecord;
     try {
@@ -342,6 +390,13 @@ export async function reconcileStorageReservations(options: {
     const expectedHash = created?.payload["record_hash"];
     if (created !== undefined && (typeof expectedHash !== "string" || expectedHash !== recordHash(record))) {
       invalidRecords += 1;
+      continue;
+    }
+    if (created === undefined && statusEvent === undefined) {
+      // A record is written before the transaction and Journal commit.  Do
+      // not turn an uncommitted record into a permanent ACTIVE reservation.
+      // A later startup can safely retry the execution and write a new set.
+      preCommitOrphans += 1;
       continue;
     }
     const terminal = terminalState(events);
@@ -381,5 +436,5 @@ export async function reconcileStorageReservations(options: {
       retainedReservations += activeRows.length;
     }
   }
-  return { rebuiltReservations, releasedReservations, retainedReservations, invalidRecords };
+  return { rebuiltReservations, releasedReservations, retainedReservations, invalidRecords, preCommitOrphans };
 }

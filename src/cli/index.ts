@@ -103,8 +103,11 @@ async function configureEngine(
         canonicalPath: entry.path,
       })),
       nowMs: Date.now(),
+      completedRetentionDays: config.storage.completed_retention_days,
     });
-    const projection = new ExecutionProjector(projectionDatabase);
+    const projection = new ExecutionProjector(projectionDatabase, {
+      completedRetentionDays: config.storage.completed_retention_days,
+    });
     eventStore = new EventStore({
       executionDirectory: join(stateRoot, "executions"),
       tolerateLoadErrors: true,

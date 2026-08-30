@@ -1,7 +1,9 @@
 # Phase 9 — Storage Manager Contract
 
-Status: Task 0–5 foundation contract. Engine admission and runtime guard are
-deliberately not wired in this checkpoint.
+Status: Phase 9 sealed on `codex/phase-9-storage-manager`. Storage admission,
+runtime guards, terminal manifests, retention projection, and conservative
+reservation reconciliation are wired and regression-tested. Phase 10 is out
+of scope.
 
 ## Authority and boundaries
 

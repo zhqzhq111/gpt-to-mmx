@@ -25,7 +25,7 @@ G2M v1.0.0 Coding Orchestrator 已完成：
 - 可交互 `g2m run` / `g2m review` 命令；
 - 已安装的 `$gpt-to-mmx` Codex Skill。
 
-完整状态见 [_skill/docs/implementation-status.md](/F:/gpt-mmx/_skill/docs/implementation-status.md)，架构基线见 [_skill/docs/GPT-to-MMX-v1-实施计划书.md](/F:/gpt-mmx/_skill/docs/GPT-to-MMX-v1-实施计划书.md)。
+完整状态见 [_skill/docs/implementation-status.md](_skill/docs/implementation-status.md)，架构基线见 [_skill/docs/GPT-to-MMX-v1-实施计划书.md](_skill/docs/GPT-to-MMX-v1-实施计划书.md)。
 
 ## 已验证
 
@@ -54,7 +54,7 @@ npm run build
 npm run g2m -- probe --config <g2m.config.json>
 ```
 
-本地配置可从 [examples/g2m.config.example.json](/F:/gpt-mmx/examples/g2m.config.example.json) 开始。任务、review 和 findings 文件应放在目标仓库外，例如 `.tmp/handoffs/<task-id>/`。
+本地配置可从 [examples/g2m.config.example.json](examples/g2m.config.example.json) 开始。任务、review 和 findings 文件应放在目标仓库外，例如 `.tmp/handoffs/<task-id>/`。
 
 可选的 `state_root` 用于保存跨进程恢复所需的事件、证据、指纹和 Review 防重放状态；未配置时默认使用 `<artifact_root>/state`。
 
@@ -85,7 +85,7 @@ npm run g2m -- recover --config <config.json> --execution-id <execution-id> --pr
 
 ## Codex Skill
 
-Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](/F:/gpt-mmx/_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
+Skill 源码位于 [_skill/gpt-to-mmx/SKILL.md](_skill/gpt-to-mmx/SKILL.md)，个人安装位置通过目录链接指向该源码：
 
 ```text
 C:\Users\zhq\.codex\skills\gpt-to-mmx
@@ -136,7 +136,7 @@ Phase 9 Storage Manager 已完成：策略配置保持旧配置兼容；Storage 
 usage scanner 使用 symlink-safe traversal，manifest 原子更新且可重建；
 storage reservation Journal/projection 支持启动恢复；Worker 和 Verification
 均受运行时磁盘监控保护。详细契约见
-[docs/v2/phase-9-storage-manager.md](/F:/gpt-mmx/docs/v2/phase-9-storage-manager.md)。
+[docs/v2/phase-9-storage-manager.md](docs/v2/phase-9-storage-manager.md)。
 
 ## 目录
 
@@ -161,7 +161,7 @@ _skill/
 
 ## v1 范围结论
 
-ACP 已复评为当前闭环不需要；Agent Team 暂无稳定 External Interface，因此 v1 不接入。详见 [_skill/docs/phase12-13-evaluation.md](/F:/gpt-mmx/_skill/docs/phase12-13-evaluation.md)。
+ACP 已复评为当前闭环不需要；Agent Team 暂无稳定 External Interface，因此 v1 不接入。详见 [_skill/docs/phase12-13-evaluation.md](_skill/docs/phase12-13-evaluation.md)。
 
 ```text
 Plans cross the boundary as data.
