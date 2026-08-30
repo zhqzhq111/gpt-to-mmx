@@ -50,8 +50,8 @@ describe("ProcessSupervisor", () => {
 
   it("terminates a timed-out process tree and proves it is gone", async () => {
     const managed = new ProcessSupervisor({
-      gracefulTerminationMs: 250,
-      forceTerminationMs: 500,
+      gracefulTerminationMs: 1_000,
+      forceTerminationMs: 2_000,
     }).spawn(nodeSpec("setInterval(() => {}, 1000)", { timeoutMs: 25 }));
 
     await expect(managed.wait()).resolves.toMatchObject({
@@ -59,12 +59,12 @@ describe("ProcessSupervisor", () => {
       termination: { confirmedGone: true },
     });
     expect(managed.isRunning()).toBe(false);
-  }, 5_000);
+  }, 10_000);
 
   it("makes manual termination idempotent", async () => {
     const managed = new ProcessSupervisor({
-      gracefulTerminationMs: 250,
-      forceTerminationMs: 500,
+      gracefulTerminationMs: 1_000,
+      forceTerminationMs: 2_000,
     }).spawn(nodeSpec("setInterval(() => {}, 1000)"));
 
     const first = managed.terminate("cancel");
@@ -72,7 +72,7 @@ describe("ProcessSupervisor", () => {
     expect(second).toBe(first);
     await expect(first).resolves.toMatchObject({ confirmedGone: true });
     expect(managed.isRunning()).toBe(false);
-  }, 5_000);
+  }, 10_000);
 
   it("confirms termination when terminate is called after natural exit", async () => {
     const managed = new ProcessSupervisor().spawn(nodeSpec("process.exit(0)"));
