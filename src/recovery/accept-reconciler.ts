@@ -60,7 +60,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -69,12 +69,18 @@ import type { TaskEvent } from "../events/events.js";
 import { EventStore } from "../events/store.js";
 import { reduce } from "../events/reducer.js";
 import type { TaskState } from "../execution/state-machine.js";
-import { FingerprintRegistry } from "../execution/fingerprint.js";
+import {
+  FingerprintRegistry,
+  validateFingerprintV2Artifact,
+  type FingerprintV2Artifact,
+} from "../execution/fingerprint.js";
 import { writeImmutableArtifact } from "../persistence/artifact-writer.js";
 import { computeFullWorkingTreeChangeSet } from "../workspace/change-set.js";
 import type { ExecutionProjection } from "../projection/execution-projector.js";
 import { ReplayGuard, type ReviewSignature } from "../review/replay-guard.js";
 import { computeReviewBundleHash } from "../review/bundle.js";
+import { validateProtectedPolicy, type ProtectedPolicy } from "../runtime/protected-policy.js";
+import { validateRuntimeIdentity, type RuntimeIdentity } from "../runtime/identity.js";
 import {
   applyPreflightedPatch,
   type AcceptedPatchPreflight,
@@ -128,6 +134,9 @@ export interface AcceptRecoveryInput {
   readonly projector: ExecutionProjection;
   readonly replayGuard: ReplayGuard;
   readonly fingerprintRegistry: FingerprintRegistry;
+  /** Optional current root bindings supplied by callers with full config context. */
+  readonly currentWorktreeRoot?: string;
+  readonly currentStateRoot?: string;
 }
 
 export interface AcceptRecoveryResult {
@@ -357,19 +366,24 @@ async function classifyTarget(
 // State replay
 // ---------------------------------------------------------------------------
 
+interface ReplayStateResult {
+  readonly state: TaskState | null;
+  readonly error?: unknown;
+}
+
 function replayState(
   events: readonly TaskEvent[],
   fingerprintRegistry: FingerprintRegistry,
-): TaskState | null {
+): ReplayStateResult {
   let state: TaskState | null = null;
   for (const event of events) {
     try {
       state = reduce(state, event, { fingerprintRegistry });
-    } catch {
-      return state;
+    } catch (error) {
+      return { state, error };
     }
   }
-  return state;
+  return { state };
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +564,211 @@ function readJsonArtifact(path: string): Record<string, unknown> | undefined {
     return parsed as Record<string, unknown>;
   } catch {
     return undefined;
+  }
+}
+
+function comparablePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = comparablePath(left).replaceAll("\\", "/");
+  const normalizedRight = comparablePath(right).replaceAll("\\", "/");
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function legacyFingerprintArtifact(value: Record<string, unknown>): boolean {
+  const required = [
+    ["task_hash", "taskHash"],
+    ["workspace_id", "workspaceId"],
+    ["base_revision", "baseRevision"],
+    ["mcode_version", "mcodeVersion"],
+    ["model"],
+    ["permission_profile", "permissionProfile"],
+    ["max_steps", "maxSteps"],
+    ["timeout_ms", "timeoutMs"],
+    ["adapter_contract_version", "adapterContractVersion"],
+    ["runtime_capability_snapshot_hash", "runtimeCapabilitySnapshotHash"],
+  ] as const;
+  return required.every((aliases) => aliases.some((key) => {
+    const field = value[key];
+    return typeof field === "string" || typeof field === "number" || field === null;
+  }));
+}
+
+/**
+ * Validate only historical Phase 12 identity evidence that is present on
+ * disk. Missing identity artifacts are the normal legacy shape and must not
+ * be synthesized during patch-only recovery.
+ */
+function verifyHistoricalExecutionEvidence(input: AcceptRecoveryInput): void {
+  const executionRoot = resolve(input.artifactRoot, input.executionId);
+  const runtimePath = resolve(executionRoot, "runtime-identity.json");
+  const policyPath = resolve(executionRoot, "protected-policy.json");
+  const fingerprintPath = resolve(executionRoot, "fingerprint.json");
+  const hasRuntime = existsSync(runtimePath);
+  const hasPolicy = existsSync(policyPath);
+  const hasFingerprint = existsSync(fingerprintPath);
+  if (!hasRuntime && !hasPolicy && !hasFingerprint) return;
+
+  if (hasRuntime !== hasPolicy) {
+    throw new RecoverableError(
+      "BINDING_MISMATCH",
+      "Phase 12 identity evidence is incomplete: runtime-identity.json and protected-policy.json must appear together",
+    );
+  }
+
+  const fingerprintValue = hasFingerprint ? readJsonArtifact(fingerprintPath) : undefined;
+  if (hasFingerprint && fingerprintValue === undefined) {
+    throw new RecoverableError("BINDING_MISMATCH", "fingerprint.json is not valid JSON");
+  }
+
+  if (!hasRuntime && !hasPolicy) {
+    if (fingerprintValue !== undefined && fingerprintValue["fingerprint_version"] === 2) {
+      throw new RecoverableError(
+        "BINDING_MISMATCH",
+        "fingerprint.json is Phase 12 v2 evidence but runtime and protected-policy artifacts are missing",
+      );
+    }
+    if (fingerprintValue !== undefined && !legacyFingerprintArtifact(fingerprintValue)) {
+      throw new RecoverableError("BINDING_MISMATCH", "fingerprint.json is not a readable legacy v1 fingerprint");
+    }
+    return;
+  }
+
+  if (fingerprintValue === undefined || fingerprintValue["fingerprint_version"] !== 2) {
+    throw new RecoverableError(
+      "BINDING_MISMATCH",
+      "Phase 12 runtime and policy evidence requires a v2 fingerprint artifact",
+    );
+  }
+  const runtimeValue = readJsonArtifact(runtimePath);
+  const policyValue = readJsonArtifact(policyPath);
+  if (runtimeValue === undefined || policyValue === undefined) {
+    throw new RecoverableError("BINDING_MISMATCH", "Phase 12 identity evidence contains invalid JSON");
+  }
+  const runtime = runtimeValue as unknown as RuntimeIdentity;
+  const policy = policyValue as unknown as ProtectedPolicy;
+  const fingerprint = fingerprintValue as unknown as FingerprintV2Artifact;
+  if (!validateRuntimeIdentity(runtime)) {
+    throw new RecoverableError("BINDING_MISMATCH", "runtime-identity.json self-hash is invalid");
+  }
+  if (
+    runtime.schema_version !== 1 ||
+    runtime.runtime !== "mcode" ||
+    typeof runtime.runtime_version !== "string" ||
+    typeof runtime.identity_hash !== "string" ||
+    typeof runtime.capability_snapshot_hash !== "string" ||
+    typeof runtime.adapter_contract_version !== "string" ||
+    typeof runtime.worker_summary_schema_hash !== "string" ||
+    (runtime.model !== null && typeof runtime.model !== "string")
+  ) {
+    throw new RecoverableError("BINDING_MISMATCH", "runtime-identity.json has an invalid schema");
+  }
+  if (!validateProtectedPolicy(policy)) {
+    throw new RecoverableError("BINDING_MISMATCH", "protected-policy.json self-hash is invalid");
+  }
+  if (
+    policy.schema_version !== 1 ||
+    typeof policy.task_id !== "string" ||
+    typeof policy.execution_id !== "string" ||
+    typeof policy.workspace_id !== "string" ||
+    typeof policy.canonical_workspace_path !== "string" ||
+    typeof policy.base_revision !== "string" ||
+    typeof policy.artifact_root !== "string" ||
+    typeof policy.worktree_root !== "string" ||
+    typeof policy.state_root !== "string" ||
+    typeof policy.runtime_identity_hash !== "string" ||
+    policy.limits === null ||
+    typeof policy.limits !== "object" ||
+    Array.isArray(policy.limits) ||
+    typeof policy.limits["max_steps"] !== "number" ||
+    typeof policy.limits["timeout_ms"] !== "number"
+  ) {
+    throw new RecoverableError("BINDING_MISMATCH", "protected-policy.json has an invalid schema");
+  }
+  if (!validateFingerprintV2Artifact(fingerprint)) {
+    throw new RecoverableError("BINDING_MISMATCH", "fingerprint.json self-hash is invalid");
+  }
+  if (
+    fingerprint.schema_version !== "g2m.fingerprint.v2" ||
+    fingerprint.fingerprint_version !== 2 ||
+    typeof fingerprint.task_id !== "string" ||
+    typeof fingerprint.execution_id !== "string" ||
+    typeof fingerprint.task_hash !== "string" ||
+    typeof fingerprint.workspace_id !== "string" ||
+    typeof fingerprint.base_revision !== "string" ||
+    typeof fingerprint.mcode_version !== "string" ||
+    typeof fingerprint.permission_profile !== "string" ||
+    typeof fingerprint.adapter_contract_version !== "string" ||
+    typeof fingerprint.runtime_identity_hash !== "string" ||
+    typeof fingerprint.protected_policy_hash !== "string" ||
+    typeof fingerprint.worker_summary_schema_hash !== "string" ||
+    typeof fingerprint.max_steps !== "number" ||
+    typeof fingerprint.timeout_ms !== "number"
+  ) {
+    throw new RecoverableError("BINDING_MISMATCH", "fingerprint.json has an invalid schema");
+  }
+  if (policy.execution_id !== input.executionId || fingerprint.execution_id !== input.executionId) {
+    throw new RecoverableError("BINDING_MISMATCH", "historical identity evidence is bound to another execution");
+  }
+  if (policy.runtime_identity_hash !== runtime.identity_hash || fingerprint.runtime_identity_hash !== runtime.identity_hash) {
+    throw new RecoverableError("BINDING_MISMATCH", "runtime identity hashes do not agree across historical artifacts");
+  }
+  if (fingerprint.protected_policy_hash !== policy.policy_hash) {
+    throw new RecoverableError("BINDING_MISMATCH", "fingerprint is not bound to protected-policy.json");
+  }
+  if (
+    fingerprint.task_id !== policy.task_id ||
+    fingerprint.workspace_id !== policy.workspace_id ||
+    fingerprint.base_revision !== policy.base_revision ||
+    fingerprint.mcode_version !== runtime.runtime_version ||
+    fingerprint.model !== runtime.model ||
+    fingerprint.adapter_contract_version !== runtime.adapter_contract_version ||
+    fingerprint.runtime_capability_snapshot_hash !== runtime.capability_snapshot_hash ||
+    fingerprint.worker_summary_schema_hash !== runtime.worker_summary_schema_hash ||
+    fingerprint.permission_profile !== policy.permission_policy ||
+    fingerprint.max_steps !== policy.limits["max_steps"] ||
+    fingerprint.timeout_ms !== policy.limits["timeout_ms"]
+  ) {
+    throw new RecoverableError("BINDING_MISMATCH", "fingerprint fields contradict runtime or protected-policy evidence");
+  }
+
+  const taskEvent = input.events.find((event) => event.type === "task.created");
+  const task = taskEvent?.payload["task"];
+  const workspaceId = task && typeof task === "object"
+    ? (task as { workspace_scope?: { workspace_id?: unknown } }).workspace_scope?.workspace_id
+    : undefined;
+  if (taskEvent !== undefined && policy.task_id !== taskEvent.taskId) {
+    throw new RecoverableError("BINDING_MISMATCH", "protected policy task binding does not match the Journal");
+  }
+  if (typeof workspaceId === "string" && policy.workspace_id !== workspaceId) {
+    throw new RecoverableError("BINDING_MISMATCH", "protected policy workspace binding does not match the Journal");
+  }
+  const prepared = input.events.find((event) => event.type === "review.accept.prepared");
+  const historicalBase = prepared === undefined
+    ? undefined
+    : stringField(prepared, "base_revision", "baseRevision");
+  if (historicalBase !== undefined && policy.base_revision !== historicalBase) {
+    throw new RecoverableError("BINDING_MISMATCH", "protected policy base revision does not match the Journal");
+  }
+  if (!samePath(policy.canonical_workspace_path, input.repositoryPath)) {
+    throw new RecoverableError("BINDING_MISMATCH", "current repository path differs from protected workspace binding");
+  }
+  if (!samePath(policy.artifact_root, input.artifactRoot)) {
+    throw new RecoverableError("BINDING_MISMATCH", "current artifact root differs from protected artifact binding");
+  }
+  if (input.currentWorktreeRoot !== undefined && !samePath(policy.worktree_root, input.currentWorktreeRoot)) {
+    throw new RecoverableError("BINDING_MISMATCH", "current worktree root differs from protected worktree binding");
+  }
+  if (input.currentStateRoot !== undefined && !samePath(policy.state_root, input.currentStateRoot)) {
+    throw new RecoverableError("BINDING_MISMATCH", "current state root differs from protected state binding");
   }
 }
 
@@ -882,7 +1101,8 @@ function isProcessGone(status: AcceptProcessStatus): boolean {
 export async function runAcceptRecovery(
   input: AcceptRecoveryInput,
 ): Promise<AcceptRecoveryResult> {
-  const replayed = replayState(input.events, input.fingerprintRegistry);
+  const replayResult = replayState(input.events, input.fingerprintRegistry);
+  const replayed = replayResult.state;
   const originalState: TaskState = replayed ?? "RECOVERY_REQUIRED";
   const appended: string[] = [];
   const base: AcceptRecoveryResult = {
@@ -915,6 +1135,21 @@ export async function runAcceptRecovery(
       reason: `processStatus=${input.processStatus}; recovery refused without proof previous process is gone`,
     };
   }
+  if (replayResult.error !== undefined) {
+    const replayReason = replayResult.error instanceof Error
+      ? replayResult.error.message
+      : String(replayResult.error);
+    if (replayed === null || !isPartialAccept(replayed)) {
+      return {
+        ...base,
+        verdict: "NOT_PARTIAL_ACCEPT",
+        reason: `journal replay is contradictory: ${replayReason}`,
+      };
+    }
+    return await failAcceptRecovery(input, base, { state: replayed }, {
+      reason: `journal replay is contradictory: ${replayReason}`,
+    });
+  }
   if (!isPartialAccept(replayed)) {
     return {
       ...base,
@@ -927,6 +1162,17 @@ export async function runAcceptRecovery(
   // unrecoverable branch MUST persist `recovery.required` to the
   // Journal (P1#1). They all go through `failAcceptRecovery`.
   const mutable: MutableState = { state: originalState };
+
+  try {
+    verifyHistoricalExecutionEvidence(input);
+  } catch (error) {
+    if (error instanceof RecoverableError) {
+      return await failAcceptRecovery(input, base, mutable, {
+        reason: error.message,
+      });
+    }
+    throw error;
+  }
 
   const preparedEvent = input.events.find((event) => event.type === "review.accept.prepared");
   if (preparedEvent === undefined) {

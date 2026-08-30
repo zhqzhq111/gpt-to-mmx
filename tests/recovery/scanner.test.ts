@@ -221,6 +221,52 @@ describe("scanRecovery", () => {
     f.database.close();
   });
 
+  it("reports terminal legacy executions without inventing Phase 12 identity artifacts", async () => {
+    const f = await fixture();
+    const seed = new EventStore({ executionDirectory: f.executionRoot });
+    appendToRunning(seed, "legacy-terminal");
+    append(seed, "legacy-terminal", "legacy-terminal-task", "agent.failed");
+    seed.close();
+    const events = new EventStore({ executionDirectory: f.executionRoot, tolerateLoadErrors: true });
+    const loaded = events.getByAttemptId("legacy-terminal");
+    expect(replayAndProject(f.database, loaded)).toBe("FAILED");
+
+    const report = scanRecovery(scannerOptions(f, events));
+
+    expect(report.executions).toContainEqual(expect.objectContaining({
+      executionId: "legacy-terminal",
+      state: "FAILED",
+      appendable: true,
+    }));
+    expect(issueKinds(report, "legacy-terminal")).toContain("MISSING_OUTCOME");
+    expect(report.issues.find((issue) => issue.executionId === "legacy-terminal" && issue.kind === "MISSING_OUTCOME")?.severity)
+      .toBe("REPORT_ONLY");
+    expect(await readFile(join(f.artifactRoot, "legacy-terminal", "fingerprint.json")).catch(() => undefined)).toBeUndefined();
+    expect(await readFile(join(f.artifactRoot, "legacy-terminal", "runtime-identity.json")).catch(() => undefined)).toBeUndefined();
+    expect(await readFile(join(f.artifactRoot, "legacy-terminal", "protected-policy.json")).catch(() => undefined)).toBeUndefined();
+    events.close();
+    f.database.close();
+  });
+
+  it("safe-holds active legacy executions with evidence-limited reporting", async () => {
+    const f = await fixture();
+    const seed = new EventStore({ executionDirectory: f.executionRoot });
+    appendToRunning(seed, "legacy-active");
+    seed.close();
+    const events = new EventStore({ executionDirectory: f.executionRoot, tolerateLoadErrors: true });
+    expect(replayAndProject(f.database, events.getByAttemptId("legacy-active"))).toBe("RUNNING");
+
+    const report = scanRecovery(scannerOptions(f, events));
+
+    expect(issueKinds(report, "legacy-active")).toEqual(expect.arrayContaining(["NON_TERMINAL_EXECUTION", "UNKNOWN_WORKER"]));
+    expect(report.issues.filter((issue) => issue.executionId === "legacy-active")
+      .filter((issue) => issue.kind === "NON_TERMINAL_EXECUTION" || issue.kind === "UNKNOWN_WORKER")
+      .every((issue) => issue.severity === "SAFE_HOLD")).toBe(true);
+    expect(report.executions.find((execution) => execution.executionId === "legacy-active")?.state).toBe("RUNNING");
+    events.close();
+    f.database.close();
+  });
+
   it("detects both partial ACCEPT boundaries as active safe holds", async () => {
     const f = await fixture();
     const seed = new EventStore({ executionDirectory: f.executionRoot });

@@ -3,6 +3,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   computeTaskFingerprint,
@@ -145,6 +148,26 @@ describe("FingerprintRegistry", () => {
     expect(reg.size()).toBe(2);
     expect(reg.get("task-1")?.mcodeVersion).toBe("0.2.7");
     expect(reg.get("task-2")?.mcodeVersion).toBe("0.2.8");
+  });
+
+  it("reads a persisted legacy v1 fingerprint without upgrading or rewriting its bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "g2m-fingerprint-legacy-"));
+    try {
+      const path = join(root, "fingerprints.json");
+      const legacy = {
+        "legacy-task": { fingerprint: makeFP(), frozenAt: 123 },
+      };
+      const bytes = Buffer.from(`${JSON.stringify(legacy)}\n`, "utf8");
+      await writeFile(path, bytes);
+
+      const registry = new FingerprintRegistry({ statePath: path });
+
+      expect(registry.get("legacy-task")).toEqual(legacy["legacy-task"].fingerprint);
+      expect(registry.get("legacy-task")?.fingerprintVersion).toBeUndefined();
+      expect(await readFile(path)).toEqual(bytes);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -13,6 +13,7 @@ import { existsSync, readFileSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -23,12 +24,19 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { EventStore } from "../../src/events/store.js";
 import type { TaskEvent } from "../../src/events/events.js";
-import { FingerprintRegistry, type TaskFingerprint } from "../../src/execution/fingerprint.js";
+import {
+  buildFingerprintV2Artifact,
+  computeTaskFingerprint,
+  FingerprintRegistry,
+  type TaskFingerprint,
+} from "../../src/execution/fingerprint.js";
 import { ExecutionProjector } from "../../src/projection/execution-projector.js";
 import { StateDatabase } from "../../src/projection/database.js";
 import { sha256 as canonicalSha256 } from "../../src/protocol/hash.js";
 import { ReplayGuard } from "../../src/review/replay-guard.js";
 import { computeReviewBundleHash, type ReviewBundle } from "../../src/review/bundle.js";
+import { buildProtectedPolicy } from "../../src/runtime/protected-policy.js";
+import { buildRuntimeIdentity } from "../../src/runtime/identity.js";
 import {
   runAcceptRecovery,
   isPartialAccept,
@@ -1043,5 +1051,207 @@ describe("Accept Reconciler", () => {
     const required = persisted.find((event) => event.type === "recovery.required");
     expect(required).toBeDefined();
     expect((required?.payload as { reason?: string }).reason).toMatch(/orphan artifact check|execution_id/);
+  });
+
+  it("refuses destructive recovery when protected policy proves a different workspace binding", async () => {
+    const fixture = await makeFixture("clean");
+    const executionArtifact = join(fixture.artifactRoot, "exec-1");
+    const policyContent = {
+      schema_version: 1,
+      task_id: "task-1",
+      execution_id: "exec-1",
+      workspace_id: "ws-1",
+      canonical_workspace_path: join(fixture.root, "different-repository"),
+      base_revision: fixture.baseRevision,
+      artifact_root: fixture.artifactRoot,
+      worktree_root: join(fixture.root, "worktrees"),
+      state_root: join(fixture.root, "state"),
+      permission_policy: "coding_standard",
+      requested_capabilities: { read: true, write: true, test: false, network: false },
+      limits: { max_steps: 1, timeout_ms: 1_000 },
+      verification_profile: {
+        id: "none",
+        resolved_program: "",
+        program_identity_hash: "a".repeat(64),
+        program_bytes: 0,
+        args_hash: canonicalSha256([]),
+        timeout_ms: 0,
+        env_names: [],
+        env_hash: canonicalSha256({}),
+      },
+      runtime_identity_hash: "b".repeat(64),
+      output_limits: {},
+      storage_policy_hash: "c".repeat(64),
+      lease_policy_hash: "d".repeat(64),
+    };
+    const policy = { ...policyContent, policy_hash: canonicalSha256(policyContent) };
+    await writeFile(join(executionArtifact, "protected-policy.json"), `${JSON.stringify(policy, null, 2)}\n`, "utf8");
+
+    const before = await readFile(join(fixture.repositoryPath, "source.txt"), "utf8");
+    const result = await runAcceptRecovery(makeInput(fixture, "crashed", buildBaseEvents(fixture, false)));
+
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.reason).toMatch(/binding|workspace|incomplete/i);
+    expect(await readFile(join(fixture.repositoryPath, "source.txt"), "utf8")).toBe(before);
+    expect(existsSync(join(executionArtifact, "apply-evidence.json"))).toBe(false);
+  });
+
+  it("treats an incomplete Phase 12 identity artifact set as recovery-required without fabrication", async () => {
+    const fixture = await makeFixture("clean");
+    const executionArtifact = join(fixture.artifactRoot, "exec-1");
+    const identityBytes = Buffer.from('{"schema_version":1,"identity_hash":"not-a-valid-record"}\n', "utf8");
+    await writeFile(join(executionArtifact, "runtime-identity.json"), identityBytes);
+
+    const result = await runAcceptRecovery(makeInput(fixture, "exited_clean", buildBaseEvents(fixture, false)));
+
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.reason).toMatch(/runtime|identity|policy|incomplete|invalid/i);
+    expect(await readFile(join(executionArtifact, "runtime-identity.json"))).toEqual(identityBytes);
+    expect(existsSync(join(executionArtifact, "protected-policy.json"))).toBe(false);
+    expect(existsSync(join(executionArtifact, "fingerprint.json"))).toBe(false);
+    expect(existsSync(join(executionArtifact, "apply-evidence.json"))).toBe(false);
+  });
+
+  it("keeps a legacy v1 fingerprint artifact byte-for-byte and completes patch-only ACCEPT", async () => {
+    const fixture = await makeFixture("clean");
+    const executionArtifact = join(fixture.artifactRoot, "exec-1");
+    const legacyBytes = Buffer.from(`${JSON.stringify({
+      task_hash: "a".repeat(64),
+      workspace_id: "ws-1",
+      base_revision: fixture.baseRevision,
+      mcode_version: "0.2.7",
+      model: "minimax/MiniMax-M3",
+      permission_profile: "coding_standard",
+      max_steps: 30,
+      timeout_ms: 600_000,
+      adapter_contract_version: "g2m.worker.v1",
+      runtime_capability_snapshot_hash: "runtime-hash",
+    }, null, 2)}\n`, "utf8");
+    await writeFile(join(executionArtifact, "fingerprint.json"), legacyBytes);
+
+    const result = await runAcceptRecovery(makeInput(fixture, "crashed", buildBaseEvents(fixture, false)));
+
+    expect(result.verdict).toBe("RESUMED_AND_ACCEPTED");
+    expect(await readFile(join(executionArtifact, "fingerprint.json"))).toEqual(legacyBytes);
+    expect(existsSync(join(executionArtifact, "runtime-identity.json"))).toBe(false);
+    expect(existsSync(join(executionArtifact, "protected-policy.json"))).toBe(false);
+  });
+
+  it("accepts patch-only recovery with valid v2 identity evidence without rewriting any identity artifact", async () => {
+    const fixture = await makeFixture("clean");
+    const executionArtifact = join(fixture.artifactRoot, "exec-1");
+    const descriptor = {
+      kind: "exe" as const,
+      executablePath: join(fixture.root, "mcode.exe"),
+      executableSha256: "a".repeat(64),
+      executableBytes: 10,
+      version: "0.2.7",
+      helpText: "help",
+      helpSha256: "b".repeat(64),
+      execHelpText: "--output-schema",
+      execHelpSha256: "c".repeat(64),
+      outputSchemaSupported: true,
+      resolvedAt: 0,
+      resolvedVia: "trusted-override" as const,
+    };
+    const runtimeIdentity = buildRuntimeIdentity({
+      descriptor,
+      nodeVersion: "v24.14.0",
+      platform: "win32",
+      arch: "x64",
+      capabilitySnapshotHash: "d".repeat(64),
+      workerSummarySchemaHash: "e".repeat(64),
+      model: "historical-model",
+    });
+    const policy = buildProtectedPolicy({
+      task_id: "task-1",
+      execution_id: "exec-1",
+      workspace_id: "ws-1",
+      canonical_workspace_path: fixture.repositoryPath,
+      base_revision: fixture.baseRevision,
+      artifact_root: fixture.artifactRoot,
+      worktree_root: join(fixture.root, "worktrees"),
+      state_root: join(fixture.root, "state"),
+      permission_policy: "coding_standard",
+      requested_capabilities: { read: true, write: true, test: false, network: false },
+      limits: { max_steps: 30, timeout_ms: 600_000 },
+      verification_profile: {
+        id: "historical-tests",
+        resolved_program: join(fixture.root, "historical-node.exe"),
+        program_identity_hash: "f".repeat(64),
+        program_bytes: 99,
+        args: ["--historical"],
+        timeout_ms: 123,
+        env: { HISTORICAL_ONLY: "true" },
+      },
+      runtime_identity_hash: runtimeIdentity.identity_hash,
+      output_limits: { max_worker_stdout_bytes: 1 },
+      storage_policy_hash: "g".repeat(64),
+      lease_policy_hash: "h".repeat(64),
+    });
+    const fingerprint = computeTaskFingerprint(
+      {
+        taskHash: "a".repeat(64),
+        workspaceId: "ws-1",
+        baseRevision: fixture.baseRevision,
+        maxSteps: 30,
+        timeoutMs: 600_000,
+        permissionProfile: "coding_standard",
+      },
+      {
+        mcodeVersion: runtimeIdentity.runtime_version,
+        model: runtimeIdentity.model,
+        adapterContractVersion: runtimeIdentity.adapter_contract_version,
+        runtimeCapabilitySnapshotHash: runtimeIdentity.capability_snapshot_hash,
+        runtimeIdentityHash: runtimeIdentity.identity_hash,
+        protectedPolicyHash: policy.policy_hash,
+        workerSummarySchemaHash: runtimeIdentity.worker_summary_schema_hash,
+      },
+    );
+    const artifacts = {
+      "runtime-identity.json": runtimeIdentity,
+      "protected-policy.json": policy,
+      "fingerprint.json": buildFingerprintV2Artifact({ taskId: "task-1", executionId: "exec-1", fingerprint }),
+    };
+    const before = new Map<string, Buffer>();
+    for (const [name, value] of Object.entries(artifacts)) {
+      const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+      before.set(name, bytes);
+      await writeFile(join(executionArtifact, name), bytes);
+    }
+
+    const result = await runAcceptRecovery(makeInput(fixture, "crashed", buildBaseEvents(fixture, false)));
+
+    expect(result.verdict).toBe("RESUMED_AND_ACCEPTED");
+    for (const [name, bytes] of before) {
+      expect(await readFile(join(executionArtifact, name))).toEqual(bytes);
+    }
+  });
+
+  it("does not continue ACCEPT after a contradictory lifecycle event", async () => {
+    const fixture = await makeFixture("clean");
+    const events = buildBaseEvents(fixture, false);
+    events.push({
+      schemaVersion: 1,
+      eventId: "contradictory",
+      seq: events.length + 1,
+      timestampMs: 12,
+      taskId: "task-1",
+      attemptId: "exec-1",
+      domain: "lifecycle",
+      type: "review.decision.block",
+      durability: "CRITICAL",
+      prevHash: "h12",
+      hash: "h13",
+      payload: {},
+      fingerprint: FINGERPRINT,
+    });
+
+    const result = await runAcceptRecovery(makeInput(fixture, "crashed", events));
+
+    expect(result.verdict).toBe("RECOVERY_REQUIRED");
+    expect(result.reason).toMatch(/replay|transition|contradict/i);
+    expect(existsSync(join(fixture.artifactRoot, "exec-1", "apply-evidence.json"))).toBe(false);
+    expect(await readFile(join(fixture.repositoryPath, "source.txt"), "utf8")).toBe("before\n");
   });
 });
