@@ -16,6 +16,16 @@ export interface ProjectionMetadata {
   readonly model?: string;
 }
 
+export interface ProjectionReplayStep {
+  readonly event: TaskEvent;
+  readonly state: TaskState;
+  readonly metadata?: ProjectionMetadata;
+}
+
+export interface ReplaceExecutionOptions {
+  readonly staleReason?: string;
+}
+
 export interface ExecutionProjection {
   project(event: TaskEvent, state: TaskState, metadata?: ProjectionMetadata): void;
 }
@@ -78,25 +88,40 @@ export class ExecutionProjector implements ExecutionProjection {
   constructor(private readonly database: StateDatabase) {}
 
   project(event: TaskEvent, state: TaskState, metadata: ProjectionMetadata = {}): void {
-    if (event.domain === "projection") return;
-    this.database.transaction(() => {
-      if (event.type === "task.created") {
-        this.createExecution(event, state, metadata);
-      } else {
-        const existing = this.execution(event.attemptId);
-        if (existing === undefined) {
-          throw new Error(
-            `cannot project ${event.type} for ${event.attemptId}: task.created projection is absent`,
-          );
-        }
-        this.updateExecution(event, state, metadata);
-      }
+    this.database.transaction(() => this.projectWithinTransaction(event, state, metadata));
+  }
 
-      this.projectArtifact(event);
-      this.projectReview(event);
-      this.projectRecovery(event);
-      this.database.setMeta(`execution:${event.attemptId}:last_event_hash`, event.hash);
-      this.database.setMeta(`execution:${event.attemptId}:last_event_seq`, String(event.seq));
+  replaceExecution(
+    executionId: string,
+    steps: readonly ProjectionReplayStep[],
+    options: ReplaceExecutionOptions = {},
+  ): void {
+    if (steps.length === 0) {
+      throw new Error("replaceExecution requires at least one replay step");
+    }
+    for (const step of steps) {
+      if (step.event.attemptId !== executionId) {
+        throw new Error(
+          `replaceExecution replay step attemptId ${step.event.attemptId} does not match ${executionId}`,
+        );
+      }
+    }
+
+    this.database.transaction(() => {
+      this.resetExecution(executionId);
+      for (const step of steps) {
+        this.projectWithinTransaction(step.event, step.state, step.metadata ?? {});
+      }
+      if (options.staleReason !== undefined) {
+        this.database.setMeta(`execution:${executionId}:stale`, options.staleReason);
+      }
+    });
+  }
+
+  invalidateExecution(executionId: string, reason: string): void {
+    this.database.transaction(() => {
+      this.resetExecution(executionId);
+      this.database.setMeta(`execution:${executionId}:stale`, reason);
     });
   }
 
@@ -133,6 +158,57 @@ export class ExecutionProjector implements ExecutionProjection {
     for (const workspace of workspaces) {
       statement.run(workspace.workspaceId, workspace.canonicalPath, nowMs);
     }
+  }
+
+  private projectWithinTransaction(
+    event: TaskEvent,
+    state: TaskState,
+    metadata: ProjectionMetadata,
+  ): void {
+    if (event.domain === "projection") {
+      this.updateCursor(event);
+      return;
+    }
+
+    if (event.type === "task.created") {
+      this.createExecution(event, state, metadata);
+    } else {
+      const existing = this.execution(event.attemptId);
+      if (existing === undefined) {
+        throw new Error(
+          `cannot project ${event.type} for ${event.attemptId}: task.created projection is absent`,
+        );
+      }
+      this.updateExecution(event, state, metadata);
+    }
+
+    this.projectArtifact(event);
+    this.projectReview(event);
+    this.projectRecovery(event);
+    this.updateCursor(event);
+  }
+
+  private updateCursor(event: TaskEvent): void {
+    this.database.setMeta(`execution:${event.attemptId}:last_event_hash`, event.hash);
+    this.database.setMeta(`execution:${event.attemptId}:last_event_seq`, String(event.seq));
+  }
+
+  private resetExecution(executionId: string): void {
+    for (const table of [
+      "artifacts",
+      "reviews",
+      "recovery_cases",
+      "storage_usage",
+      "storage_reservations",
+      "executions",
+    ]) {
+      this.database.prepare(`DELETE FROM ${table} WHERE execution_id = ?`).run(executionId);
+    }
+
+    const prefix = `execution:${executionId}:`;
+    this.database.prepare(
+      "DELETE FROM projection_meta WHERE substr(key, 1, length(?)) = ?",
+    ).run(prefix, prefix);
   }
 
   private createExecution(

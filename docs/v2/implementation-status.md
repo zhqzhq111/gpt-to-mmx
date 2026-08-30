@@ -379,8 +379,85 @@ once and cleans the per-test subdirectory in `afterAll`. The parent
 directory is left in place across runs (intentional — it is the
 dedicated location for the NOT_GIT_REPO fixture).
 
+## Phase 4 — Startup Backfill
+
+Status: complete for the Phase 4 Task 3 implementation.
+
+### Architecture and source-of-truth rules
+
+Startup Backfill treats each execution Journal at
+`stateRoot/executions/<execution-id>/state-events.ndjson` as authoritative.
+It scans only direct execution directories, in lexical directory-name order,
+and never sorts or rewrites Journal records. The trusted workspace seeds come
+from the current local CLI configuration; the Journal remains authoritative for
+execution facts.
+
+Each execution is loaded and reduced independently. A fresh in-memory
+`FingerprintRegistry` is created for every valid Journal, so backfill never
+inherits runtime fingerprint state. The reducer runs in physical Journal order
+and produces the replay steps used by the projector.
+
+An execution is current only when all of these conditions hold:
+
+- its execution row exists;
+- its `execution:<id>:stale` marker is absent;
+- `execution:<id>:last_event_hash` equals the final Journal event hash;
+- `execution:<id>:last_event_seq` equals the final Journal event sequence;
+- the projected `task_id` equals the replayed task ID;
+- the projected lifecycle state equals the replayed final state; and
+- `updated_at` equals the timestamp of the final non-projection-domain event.
+
+Any divergence causes a per-execution atomic replacement. The replacement
+deletes execution-scoped derived rows and execution metadata, replays the
+validated steps, and commits the reset and replay in one SQLite transaction.
+Invalid sources are atomically invalidated instead: their execution-scoped
+rows and metadata are removed and only a stale reason is retained. One bad
+execution therefore cannot prevent healthy executions from being repaired.
+
+Projection-domain events, including `projection.stale`, are cursor-only for
+the projector. They advance the execution event hash/sequence cursor but do
+not change lifecycle state or create artifact, review, or recovery rows. A
+backfill therefore repairs the projection once without appending a
+`projection.repaired` event or entering a recovery loop.
+
+A Journal with a `TRUNCATED_TAIL` has its valid prefix replayed and replaced,
+then receives the `TRUNCATED_TAIL` stale marker in the same replacement
+transaction. Missing, malformed, broken-chain, execution-mismatched, or
+unsupported-schema Journals invalidate only the affected execution. An empty
+Journal invalidates any existing projection as `EMPTY_JOURNAL`. A contradictory
+history or incomplete replay is reduced independently, recorded as a stable
+reducer error, and invalidated without aborting the directory scan.
+
+### CLI integration and scope boundary
+
+`configureEngine` resolves `stateRoot`, opens `g2m-state.sqlite`, runs
+`backfillProjection` with the configured workspace seeds and `Date.now()`, and
+only then constructs the live `ExecutionProjector`, `EventStore`, and engine.
+Both `run` and `recover` pass through this startup path. A database-open or
+backfill failure preserves the existing projection-unavailable fallback.
+The `run` path still closes its EventStore and projection database. `probe`
+and standalone `review` do not call `configureEngine`, so they do not create or
+open a startup state database and their public output contracts are unchanged.
+Startup Backfill never appends Journal events, invokes `RecoveryResolver`,
+inspects processes, reclaims leases, or reconciles ACCEPT transactions.
+
+Phase 5 remains explicitly out of scope here: Recovery Scanner and process
+supervision, crash-safe ACCEPT, cross-process leases and reclaim, Storage
+Manager, GC, operational CLI expansion, runtime hardening, and CI matrices are
+not implemented by this phase.
+
+### Verification
+
+The complete test run for this Task 3 checkpoint reported **392 passed, 5
+skipped, 0 failed** across **38 test files** (**35 passed, 3 skipped**). The
+five skips are the existing explicitly gated real-mcode tests: one real
+modify E2E, one real adapter smoke test, and three permission-behavior probes.
+The new Windows-hermetic CLI E2E covers two run-to-BLOCK executions, stale
+SQLite repair from the old Journal, byte-for-byte Journal preservation, no
+recovery/projection-repair event, completed backfill metadata, and probe /
+standalone-review exclusion.
+
 ## Remaining phases
 
-Startup Backfill, Recovery, crash-safe ACCEPT, cross-process lease,
-Process Supervisor, Storage Manager, GC, operational CLI, runtime
-hardening, and CI matrices.
+Recovery, crash-safe ACCEPT, cross-process lease, Process Supervisor, Storage
+Manager, GC, operational CLI, runtime hardening, and CI matrices.

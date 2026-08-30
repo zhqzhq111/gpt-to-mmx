@@ -13,6 +13,7 @@ import {
   ExecutionProjector,
   type ExecutionProjection,
 } from "../projection/execution-projector.js";
+import { backfillProjection } from "../projection/backfill.js";
 import { resolveRecovery, type ProcessStatus } from "../recovery/resolver.js";
 import type { Review } from "../review/ingress.js";
 import { ReplayGuard } from "../review/replay-guard.js";
@@ -100,18 +101,16 @@ function configureEngine(
   let projection: ExecutionProjection;
   try {
     projectionDatabase = new StateDatabase(join(stateRoot, "g2m-state.sqlite"));
-    const projector = new ExecutionProjector(projectionDatabase);
-    // Seed the `workspaces` table from trusted CLI config. The Journal does
-    // not carry workspace identity — this projection row comes purely from
-    // local configuration and is refreshed on every CLI invocation.
-    projector.seedWorkspaces(
-      config.workspaces.map((entry) => ({
+    backfillProjection({
+      stateRoot,
+      database: projectionDatabase,
+      workspaces: config.workspaces.map((entry) => ({
         workspaceId: entry.workspace_id,
         canonicalPath: entry.path,
       })),
-      Date.now(),
-    );
-    projection = projector;
+      nowMs: Date.now(),
+    });
+    projection = new ExecutionProjector(projectionDatabase);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     projection = {
