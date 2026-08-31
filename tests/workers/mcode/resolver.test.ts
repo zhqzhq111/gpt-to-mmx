@@ -7,7 +7,8 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, writeFile, readFile, rm, mkdir, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -136,6 +137,22 @@ describe("resolveMCode (plan §33-35)", () => {
     }
   });
 
+  it("canonicalizes the trusted launcher and hashes its exact bytes", async () => {
+    const aliasDir = join(tmpRoot, "canonical-alias");
+    await mkdir(aliasDir, { recursive: true });
+    process.env["G2M_MCODE_PATH"] = join(aliasDir, "..", "mcode.cmd");
+    try {
+      const d = await resolveMCode({ skipProbe: true });
+      const canonical = await realpath(mockMcode);
+      const bytes = await readFile(mockMcode);
+      expect(d.executablePath).toBe(canonical);
+      expect(d.executableSha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+      expect(d.executableBytes).toBe(bytes.byteLength);
+    } finally {
+      delete process.env["G2M_MCODE_PATH"];
+    }
+  });
+
   it("PATH lookup with tmp dir containing mock mcode (skipProbe) finds it", async () => {
     delete process.env["G2M_MCODE_PATH"];
     const original = process.env["PATH"];
@@ -154,6 +171,104 @@ describe("resolveMCode (plan §33-35)", () => {
       resolveMCode({ explicitPath: oversizedMcode, maxProbeOutputBytes: 32 }),
     ).rejects.toThrow(/exceeded 32 bytes/i);
   });
+
+  it.each([
+    { label: "version", args: ["--version"] },
+    { label: "help", args: ["--help"] },
+    { label: "exec help", args: ["exec", "--help"] },
+  ] as const)("bounds the $label probe independently", async ({ args }) => {
+    const supervisor = {
+      spawn: (spec: { readonly args: readonly string[] }) => {
+        const target = spec.args.length === args.length && spec.args.every((value, index) => value === args[index]);
+        const output = target
+          ? "x".repeat(64)
+          : spec.args[0] === "exec" ? "Usage: mcode exec\n--output-schema\n" : "Usage: mcode\n";
+        return {
+          pid: 12345,
+          stdout: Readable.from([output]),
+          stderr: Readable.from([]),
+          wait: async () => {
+            await new Promise((resolve) => setImmediate(resolve));
+            return { kind: "exited" as const, exitCode: 0, signal: null };
+          },
+          terminate: async () => ({
+            confirmedGone: true,
+            gracefulAttempted: false,
+            forcedAttempted: true,
+            strategy: "windows_taskkill" as const,
+          }),
+          isRunning: () => false,
+        };
+      },
+    };
+    await expect(resolveMCode({
+      explicitPath: mockMcode,
+      maxProbeOutputBytes: 32,
+      processSupervisor: supervisor as never,
+    })).rejects.toMatchObject({ code: "PROBE_OUTPUT_LIMIT" });
+  });
+
+  it("maps a confirmed probe timeout to the version probe failure without retrying", async () => {
+    let spawnCount = 0;
+    const supervisor = {
+      spawn: () => {
+        spawnCount += 1;
+        return {
+          pid: 12345,
+          stdout: Readable.from([]),
+          stderr: Readable.from([]),
+          wait: async () => ({
+            kind: "timed_out" as const,
+            termination: {
+              confirmedGone: true,
+              gracefulAttempted: true,
+              forcedAttempted: true,
+              strategy: "windows_taskkill" as const,
+            },
+          }),
+          terminate: async () => ({
+            confirmedGone: true,
+            gracefulAttempted: true,
+            forcedAttempted: true,
+            strategy: "windows_taskkill" as const,
+          }),
+          isRunning: () => false,
+        };
+      },
+    };
+    await expect(resolveMCode({
+      explicitPath: mockMcode,
+      processSupervisor: supervisor as never,
+    })).rejects.toMatchObject({ code: "VERSION_PROBE_FAILED" });
+    expect(spawnCount).toBe(3);
+  });
+
+  it("preserves a distinct probe termination-unconfirmed error after overflow", async () => {
+    const supervisor = {
+      spawn: () => ({
+        pid: 12345,
+        stdout: Readable.from([Buffer.alloc(64, 120)]),
+        stderr: Readable.from([]),
+        wait: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return { kind: "exited" as const, exitCode: 0, signal: null };
+        },
+        terminate: async () => ({
+          confirmedGone: false,
+          gracefulAttempted: true,
+          forcedAttempted: true,
+          strategy: "windows_taskkill" as const,
+          error: "termination refused",
+        }),
+        isRunning: () => true,
+      }),
+    };
+    await expect(resolveMCode({
+      explicitPath: mockMcode,
+      maxProbeOutputBytes: 32,
+      processSupervisor: supervisor as never,
+    })).rejects.toMatchObject({ code: "PROBE_TERMINATION_UNCONFIRMED" });
+  }, 15_000);
 
   it("waits for sibling probes to settle before returning an output-limit failure", async () => {
     let releaseSiblings!: () => void;
@@ -311,5 +426,16 @@ describe("buildMCodeInvocation (plan §32)", () => {
     // Prompt 不再进入 argv，因此 shell 不会接触其引号或变量语法。
     expect(inv.args).not.toContain('p with "quotes" and $vars');
     expect(inv.stdin).toBe('p with "quotes" and $vars');
+  });
+
+  it("does not add a model argv binding when the model is unpinned", () => {
+    const inv = buildMCodeInvocation("mcode", {
+      workspacePath: "D:/x",
+      prompt: "p",
+      permissionPolicy: "smart",
+      timeoutMs: 60_000,
+      maxSteps: 5,
+    });
+    expect(inv.args).not.toContain("--model");
   });
 });

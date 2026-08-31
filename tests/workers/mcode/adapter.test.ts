@@ -13,6 +13,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -477,5 +478,23 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
       code: "UNKNOWN",
       message: expect.stringMatching(/exceeded|protocol/i),
     });
+  }, 15_000);
+
+  it("keeps bounded diagnostic stderr separate and hash-bound on a valid result", async () => {
+    process.env["MOCK_BEHAVIOR"] = "stderr";
+    const adapter = new MCodeAdapter({ maxWorkerStderrBytes: 8 });
+    const invocation = makeInvocation();
+    await adapter.start(invocation);
+    const result = await adapter.collectResult(invocation.executionId);
+    const evidence = result.diagnosticStderr;
+
+    expect(evidence).toBeDefined();
+    expect(evidence?.capturedBytes).toBe(8);
+    expect(evidence?.totalBytes).toBeGreaterThan(8);
+    expect(evidence?.truncated).toBe(true);
+    expect(evidence?.capturedByteSha256).toBe(
+      createHash("sha256").update(Buffer.from("diagnostic-overflow\r\n").subarray(0, 8)).digest("hex"),
+    );
+    expect(Object.isFrozen(evidence)).toBe(true);
   }, 15_000);
 });

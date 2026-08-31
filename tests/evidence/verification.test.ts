@@ -373,6 +373,30 @@ describe("runVerification", () => {
     expect(Object.isFrozen(r.stderrEvidence)).toBe(true);
   });
 
+  it("counts UTF-8 bytes and preserves a byte-prefix hash when output truncates", async () => {
+    const r = await runVerification(
+      makeProfile({
+        id: "unicode-bounded",
+        args: ["-e", "process.stdout.write('你'.repeat(100)); process.exit(7)"],
+      }),
+      "ws-unicode-bounded",
+      tempDir,
+      { maxStdoutBytes: 5 },
+    );
+    const captured = Buffer.from("你".repeat(100), "utf8").subarray(0, 5);
+
+    expect(r.status).toBe("failed");
+    expect(r.exitCode).toBe(7);
+    expect(r.stdoutBytes).toBe(Buffer.byteLength("你".repeat(100), "utf8"));
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stdoutEvidence).toEqual({
+      capturedBytes: 5,
+      totalBytes: Buffer.byteLength("你".repeat(100), "utf8"),
+      truncated: true,
+      capturedByteSha256: createHash("sha256").update(captured).digest("hex"),
+    });
+  });
+
   it("refuses a changed verification launcher before it runs", async () => {
     const launcher = join(tempDir, "verification-launcher.cmd");
     const marker = join(tempDir, "verification-ran.txt");
@@ -387,6 +411,35 @@ describe("runVerification", () => {
       { expectedProgramIdentity: identity },
     );
     expect(r.status).toBe("runtime_drift");
+    await expect(readFile(marker)).rejects.toThrow();
+  });
+
+  it("classifies executable drift deterministically without spawning either attempt", async () => {
+    const launcher = join(tempDir, "verification-deterministic-drift.cmd");
+    const marker = join(tempDir, "verification-deterministic-drift-ran.txt");
+    const original = ["@echo off", `echo ran>\"${marker}\"`, "exit /b 0", ""].join("\r\n");
+    await writeFile(launcher, original, "utf8");
+    const identity = await resolveProgramIdentity(launcher);
+    await writeFile(launcher, `${original}\r\n`, "utf8");
+
+    const first = await runVerification(
+      makeProfile({ id: "deterministic-drift", program: launcher, args: [] }),
+      "ws-deterministic-drift",
+      tempDir,
+      { expectedProgramIdentity: identity },
+    );
+    const second = await runVerification(
+      makeProfile({ id: "deterministic-drift", program: launcher, args: [] }),
+      "ws-deterministic-drift",
+      tempDir,
+      { expectedProgramIdentity: identity },
+    );
+
+    expect(first.status).toBe("runtime_drift");
+    expect(second.status).toBe("runtime_drift");
+    expect(first.errorMessage).toBe("verification executable identity changed before run");
+    expect(second.errorMessage).toBe(first.errorMessage);
+    expect(second.resultHash).toBe(first.resultHash);
     await expect(readFile(marker)).rejects.toThrow();
   });
 });

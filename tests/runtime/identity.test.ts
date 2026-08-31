@@ -57,4 +57,21 @@ describe("runtime identity", () => {
     expect(identity.model).toBe("MiniMax-M2");
     expect(identity.model_pinned).toBe(true);
   });
+
+  it("changes identity when the pinned model changes and keeps unpinned distinct", () => {
+    const common = {
+      descriptor,
+      capabilitySnapshotHash: "d".repeat(64),
+      workerSummarySchemaHash: "e".repeat(64),
+    } as const;
+    const unpinned = buildRuntimeIdentity(common);
+    const pinned = buildRuntimeIdentity({ ...common, model: "MiniMax-M2" });
+    const changed = buildRuntimeIdentity({ ...common, model: "MiniMax-M3" });
+
+    expect(unpinned.model).toBeNull();
+    expect(unpinned.model_pinned).toBe(false);
+    expect(pinned.identity_hash).not.toBe(unpinned.identity_hash);
+    expect(changed.identity_hash).not.toBe(pinned.identity_hash);
+    expect(validateRuntimeIdentity(changed)).toBe(true);
+  });
 });

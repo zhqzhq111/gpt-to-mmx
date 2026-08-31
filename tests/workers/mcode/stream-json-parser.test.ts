@@ -141,4 +141,39 @@ describe("real mcode stream-json contract", () => {
     }));
     expect(() => normalizeWorkerEvents([malformedTest], { strictSummary: true })).toThrow(/unknown|test/i);
   });
+
+  it("strict mode rejects a missing required summary field", () => {
+    const missingSummary = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: JSON.stringify({
+          files_changed: [],
+          tests: [],
+          remaining_risks: [],
+        }),
+      },
+    }));
+
+    expect(() => normalizeWorkerEvents([missingSummary], { strictSummary: true }))
+      .toThrow(/summary.*string/i);
+  });
+
+  it("strict mode rejects a bad test status in an otherwise valid summary", () => {
+    const badStatus = parseStreamJsonLine(JSON.stringify({
+      type: "exec.completed",
+      result: {
+        status: "succeeded",
+        output: JSON.stringify({
+          summary: "done",
+          files_changed: [],
+          tests: [{ name: "unit", status: "unknown" }],
+          remaining_risks: [],
+        }),
+      },
+    }));
+
+    expect(() => normalizeWorkerEvents([badStatus], { strictSummary: true }))
+      .toThrow(/invalid status/i);
+  });
 });
