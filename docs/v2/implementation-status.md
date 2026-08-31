@@ -920,8 +920,8 @@ and the subsequent original `npm test` rerun passed with zero failures.
 
 ## Phase 13 — CI / Regression
 
-Status: local implementation complete; awaiting the first GitHub Actions run
-on the required Ubuntu and Windows Node.js 22.x matrix.
+Status: complete; GitHub Actions run `33353353810` passed on the required
+Ubuntu and Windows Node.js 22.x matrix.
 
 The Phase 13 spec was frozen at `5f405a09b66cfe4c3a0daa86c8dabeba75148637`.
 Agents F, G, H, and I were implemented from that same base and integrated into
@@ -942,18 +942,17 @@ Local final-gate evidence on Node.js 24.14.0:
   passed and 3 skipped**;
 - Workspace Lease process E2E → **4/4**;
 - Process Supervisor process E2E → **3/3**;
-- Storage Reservation process E2E → **3/3**;
+- Storage Reservation process E2E → **4/4**;
 - GC process E2E → **1/1**;
 - Operations process E2E → **6/6**;
 - `npm run typecheck`, `npm run build`, and `git diff --check` → pass.
 
 The six skipped tests are the existing real-MCode/permission opt-in tests.
-The workflow is configured for Ubuntu and Windows with Node.js 22.x, but the
-cloud GitHub Actions result has not yet been observed in this local session.
-Therefore the current state is a `G2M v2 FINAL RELEASE CANDIDATE`, not a claim
-that both remote CI platforms are green.
+The GitHub Actions run `33353353810` passed all 18 Ubuntu/Windows Node.js 22.x
+matrix gates. The final integrated commit is
+`86c4a9a7fca89cf72a45448553191aa977f013fb`.
 
 ## Remaining phases
 
-- Observe the first GitHub Actions run on Ubuntu and Windows Node.js 22.x.
-- Final Reviewer approval after both required platforms are green.
+- No remaining Phase 13 work is planned. Later changes must start a new
+  explicitly scoped phase and preserve this sealed baseline.
