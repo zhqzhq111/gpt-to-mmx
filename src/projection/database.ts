@@ -25,6 +25,8 @@ export interface StateDatabaseOptions {
   readonly readOnly?: boolean;
 }
 
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+
 export class StateDatabase {
   private readonly database: DatabaseSync;
   private closed = false;
@@ -34,13 +36,13 @@ export class StateDatabase {
     try {
       if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
       const openPath = options.readOnly && path !== ":memory:" ? `file:${path}?immutable=1` : path;
-      opened = new DatabaseSync(openPath, { timeout: 5_000, readOnly: options.readOnly ?? false });
+      opened = new DatabaseSync(openPath, { timeout: SQLITE_BUSY_TIMEOUT_MS, readOnly: options.readOnly ?? false });
       if (!options.readOnly) {
         // Install the busy handler before WAL/schema setup. The first
         // concurrent opener can hold SQLite's schema lock while the other
         // process runs these pragmas; setting it afterwards is too late for
         // that initialization race.
-        opened.exec("PRAGMA busy_timeout = 5000");
+        opened.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
         opened.exec("PRAGMA journal_mode = WAL");
         opened.exec("PRAGMA synchronous = NORMAL");
         opened.exec(FROZEN_SCHEMA_SQL);
