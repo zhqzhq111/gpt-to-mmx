@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: ${{ matrix.gate }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            gate: npm ci + typecheck
+            command: npm run typecheck
+          - os: windows-latest
+            gate: npm ci + typecheck
+            command: npm run typecheck
+          - os: ubuntu-latest
+            gate: npm ci + build
+            command: npm run build
+          - os: windows-latest
+            gate: npm ci + build
+            command: npm run build
+          - os: ubuntu-latest
+            gate: npm ci + unit tests
+            command: npm test
+          - os: windows-latest
+            gate: npm ci + unit tests
+            command: npm test -- --maxWorkers=1
+          - os: ubuntu-latest
+            gate: npm ci + workspace lease E2E
+            command: npm run test:lease-process
+          - os: windows-latest
+            gate: npm ci + workspace lease E2E
+            command: npm run test:lease-process
+          - os: ubuntu-latest
+            gate: npm ci + process supervisor E2E
+            command: npm run test:process-supervisor
+          - os: windows-latest
+            gate: npm ci + process supervisor E2E
+            command: npm run test:process-supervisor
+          - os: ubuntu-latest
+            gate: npm ci + storage reservation E2E
+            command: npm run test:storage-process
+          - os: windows-latest
+            gate: npm ci + storage reservation E2E
+            command: npm run test:storage-process
+          - os: ubuntu-latest
+            gate: npm ci + GC E2E
+            command: npm run test:gc-process
+          - os: windows-latest
+            gate: npm ci + GC E2E
+            command: npm run test:gc-process
+          - os: ubuntu-latest
+            gate: npm ci + operations E2E
+            command: npm run test:operations-process
+          - os: windows-latest
+            gate: npm ci + operations E2E
+            command: npm run test:operations-process
+          - os: ubuntu-latest
+            gate: npm ci + diff hygiene
+            command: >-
+              node -e "const { execFileSync } = require('node:child_process'); execFileSync('git', ['diff', '--check'], { stdio: 'inherit' }); const status = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }); if (status) { console.error(status); process.exit(1); }"
+          - os: windows-latest
+            gate: npm ci + diff hygiene
+            command: >-
+              node -e "const { execFileSync } = require('node:child_process'); execFileSync('git', ['diff', '--check'], { stdio: 'inherit' }); const status = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }); if (status) { console.error(status); process.exit(1); }"
+    env:
+      G2M_RUN_REAL_MODIFY_E2E: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Run ${{ matrix.gate }}
+        run: ${{ matrix.command }}
