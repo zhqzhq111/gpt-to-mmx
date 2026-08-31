@@ -185,7 +185,11 @@ Phase 11 Operational CLI 与 Phase 12 Runtime Hardening 已在当前集成分支
 guard，以及只读 Status/Doctor 和 legacy ACCEPT recovery 证据边界。最终
 Phase 12 gate 的单元测试为 `637 passed / 6 skipped / 0 failed`；五组真实
 process E2E 分别为 `3/3`、`3/3`、`3/3`、`1/1`、`6/6`。Phase 13 CI /
-Regression 尚未开始。
+Regression 已完成本地实现：F/G/H/I 的 CI、Runtime、Recovery、Lease/
+Storage/GC/Operations 回归已集成，workflow 覆盖 Ubuntu/Windows 与 Node.js
+22.x。当前本机最终验证为 `659 passed / 6 skipped / 0 failed`，process E2E
+为 `4/4`、`3/3`、`3/3`、`1/1`、`6/6`；云端 GitHub Actions 尚未触发，因而
+当前是 `G2M v2 FINAL RELEASE CANDIDATE`，待双平台 CI 和最终 Reviewer 批准。
 
 ## 目录
 

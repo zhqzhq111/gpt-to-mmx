@@ -918,8 +918,42 @@ run encountered one Windows `EBUSY` cleanup contention; the controlled failing
 test reproduced the probe-lifecycle cause, the minimal settlement fix passed,
 and the subsequent original `npm test` rerun passed with zero failures.
 
-Phase 13 — CI / Regression remains explicitly unstarted.
+## Phase 13 — CI / Regression
+
+Status: local implementation complete; awaiting the first GitHub Actions run
+on the required Ubuntu and Windows Node.js 22.x matrix.
+
+The Phase 13 spec was frozen at `5f405a09b66cfe4c3a0daa86c8dabeba75148637`.
+Agents F, G, H, and I were implemented from that same base and integrated into
+`codex/phase-12-runtime-hardening`.
+
+Implemented and reviewed:
+
+- cross-platform GitHub Actions workflow with `npm ci`, typecheck, build, unit
+  tests, all five process E2E gates, and diff hygiene;
+- runtime, Worker, Verification, Journal, Recovery, Lease, Storage, GC, and
+  Operations regression coverage;
+- no real-MCode credentials, secrets, paid calls, ACP, OpenCode, Agent Team,
+  daemon, new Worker type, or new repair action in default CI.
+
+Local final-gate evidence on Node.js 24.14.0:
+
+- `npm test` → **659 passed, 6 skipped, 0 failed** across **68 test files
+  passed and 3 skipped**;
+- Workspace Lease process E2E → **4/4**;
+- Process Supervisor process E2E → **3/3**;
+- Storage Reservation process E2E → **3/3**;
+- GC process E2E → **1/1**;
+- Operations process E2E → **6/6**;
+- `npm run typecheck`, `npm run build`, and `git diff --check` → pass.
+
+The six skipped tests are the existing real-MCode/permission opt-in tests.
+The workflow is configured for Ubuntu and Windows with Node.js 22.x, but the
+cloud GitHub Actions result has not yet been observed in this local session.
+Therefore the current state is a `G2M v2 FINAL RELEASE CANDIDATE`, not a claim
+that both remote CI platforms are green.
 
 ## Remaining phases
 
-- Phase 13 — CI / Regression
+- Observe the first GitHub Actions run on Ubuntu and Windows Node.js 22.x.
+- Final Reviewer approval after both required platforms are green.
