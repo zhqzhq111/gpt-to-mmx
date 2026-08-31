@@ -8,6 +8,12 @@ import test from "node:test";
 import { workspaceKeyForPath } from "../../dist/workspace/lock.js";
 
 const childPath = join(process.cwd(), "tests", "process", "workspace-lease.child.mjs");
+const processTempRoot = join(process.cwd(), ".tmp");
+
+async function makeProcessTempRoot(prefix) {
+  await mkdir(processTempRoot, { recursive: true });
+  return mkdtemp(join(processTempRoot, prefix));
+}
 
 function startChild(mode, stateRoot, workspacePath, workspaceId, executionId) {
   const child = spawn(process.execPath, [childPath, mode, stateRoot, workspacePath, workspaceId, executionId], {
@@ -50,7 +56,7 @@ async function removeRoot(root) {
 }
 
 test("two real Node processes have exactly one acquire winner", async () => {
-  const root = await mkdtemp(join(process.cwd(), ".tmp", "lease-process-"));
+  const root = await makeProcessTempRoot("lease-process-");
   try {
     const stateRoot = join(root, "state");
     const workspacePath = join(root, "workspace");
@@ -78,7 +84,7 @@ test("two real Node processes have exactly one acquire winner", async () => {
 });
 
 test("a second real process can acquire after the first releases", async () => {
-  const root = await mkdtemp(join(process.cwd(), ".tmp", "lease-process-retry-"));
+  const root = await makeProcessTempRoot("lease-process-retry-");
   try {
     const stateRoot = join(root, "state");
     const workspacePath = join(root, "workspace");
@@ -107,7 +113,7 @@ test("a second real process can acquire after the first releases", async () => {
 });
 
 test("a real lease refreshes only its heartbeat sidecar", async () => {
-  const root = await mkdtemp(join(process.cwd(), ".tmp", "lease-process-heartbeat-"));
+  const root = await makeProcessTempRoot("lease-process-heartbeat-");
   try {
     const stateRoot = join(root, "state");
     const workspacePath = join(root, "workspace");
@@ -138,7 +144,7 @@ test("a real lease refreshes only its heartbeat sidecar", async () => {
 });
 
 test("two real Node processes have exactly one stale reclaim winner", async () => {
-  const root = await mkdtemp(join(process.cwd(), ".tmp", "lease-process-reclaim-"));
+  const root = await makeProcessTempRoot("lease-process-reclaim-");
   try {
     const stateRoot = join(root, "state");
     const workspacePath = join(root, "workspace");

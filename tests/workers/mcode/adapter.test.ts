@@ -14,7 +14,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +26,15 @@ import {
   type WorkerInvocation,
 } from "../../../src/workers/coding-worker.js";
 import { sha256 } from "../../../src/protocol/hash.js";
+
+async function writePortableLauncher(path: string, windowsSource: string, posixSource: string): Promise<void> {
+  if (process.platform === "win32") {
+    await writeFile(path, windowsSource, "utf8");
+    return;
+  }
+  await writeFile(path, `#!/usr/bin/env node\n${posixSource}\n`, "utf8");
+  await chmod(path, 0o755);
+}
 
 function makeInvocation(
   overrides: Partial<WorkerInvocation> = {},
@@ -57,8 +66,8 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
 
   beforeAll(async () => {
     tmpRoot = await mkdtemp(join(tmpdir(), "g2m-adapter-"));
-    mockCmdPath = join(tmpRoot, "mcode.cmd");
-    await writeFile(
+    mockCmdPath = join(tmpRoot, process.platform === "win32" ? "mcode.cmd" : "mcode.js");
+    await writePortableLauncher(
       mockCmdPath,
       [
         "@echo off",
@@ -123,10 +132,56 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
         "exit /b 0",
         "",
       ].join("\r\n"),
-      "utf8",
+      `
+const args = process.argv.slice(2);
+const output = (value) => process.stdout.write(value + "\\n");
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+if (args[0] === "--version") { output("mcode 9.9.9"); process.exit(0); }
+if (args[0] === "--help") {
+  output("Usage: mcode <command>");
+  output("Commands:");
+  output("  exec  Run a headless task");
+  output("  acp   Start ACP stdio server");
+  process.exit(0);
+}
+if (args[0] === "exec" && args[1] === "--help") {
+  output("Usage: mcode exec");
+  output("Flags:");
+  output("  --cwd <path>");
+  output("  --permission <policy>");
+  output("  --timeout <duration>");
+  output("  --max-steps <n>");
+  output("  --output-format <fmt>");
+  output("  --output-schema <schema>");
+  process.exit(0);
+}
+if (args[0] !== "exec") process.exit(1);
+if (process.env.RUNTIME_DRIFT_MARKER) await import("node:fs/promises").then(({ writeFile }) => writeFile(process.env.RUNTIME_DRIFT_MARKER, "spawned"));
+const behavior = process.env.MOCK_BEHAVIOR;
+if (behavior === "malformed") { output("definitely-not-json"); await delay(5000); process.exit(0); }
+if (behavior === "overflow") { output("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"); process.exit(0); }
+if (behavior === "fail") { process.stderr.write("something bad\\n"); process.exit(7); }
+if (behavior === "stderr") process.stderr.write("diagnostic-overflow\\n");
+if (behavior === "noresult") {
+  output(JSON.stringify({ type: "system", event: "init", session_id: "mcode-noresult" }));
+  output(JSON.stringify({ type: "assistant", text: "thinking..." }));
+  process.exit(0);
+}
+if (behavior === "slow") {
+  output(JSON.stringify({ type: "system", event: "init", session_id: "mcode-slow" }));
+  await delay(5000);
+  output(JSON.stringify({ type: "result", status: "success", summary: "slow done", files_changed: [], tests: [], remaining_risks: [] }));
+  process.exit(0);
+}
+output(JSON.stringify({ type: "system", event: "init", session_id: "mcode-success-001" }));
+output(JSON.stringify({ type: "assistant", text: "Reading trajectory test..." }));
+output(JSON.stringify({ type: "result", status: "success", summary: "Mocked success", files_changed: ["src/trajectory.ts"], tests: [{ name: "trajectory_test", status: "passed" }], remaining_risks: [] }));
+process.exit(0);
+`,
     );
-    envelopeCmdPath = join(tmpRoot, "mcode-envelope.cmd");
-    await writeFile(
+    envelopeCmdPath = join(tmpRoot, process.platform === "win32" ? "mcode-envelope.cmd" : "mcode-envelope.js");
+    await writePortableLauncher(
       envelopeCmdPath,
       [
         "@echo off",
@@ -142,7 +197,19 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
         "exit /b 0",
         "",
       ].join("\r\n"),
-      "utf8",
+      `
+const args = process.argv.slice(2);
+const output = (value) => process.stdout.write(value + "\\n");
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+if (args[0] === "--version") { output("mcode 0.2.7"); process.exit(0); }
+if (args[0] === "--help") { output("Usage: mcode <command>"); process.exit(0); }
+if (args[0] === "exec" && args[1] === "--help") { output("Usage: mcode exec"); output("--output-schema"); process.exit(0); }
+if (args[0] !== "exec") process.exit(1);
+output(JSON.stringify({ schemaVersion: 1, sequence: 1, timestampMs: 1, runId: "exec_turn_envelope", sessionId: "mvs_envelope", turnId: "turn_envelope", type: "exec.started" }));
+output(JSON.stringify({ schemaVersion: 1, sequence: 2, timestampMs: 2, runId: "exec_turn_envelope", sessionId: "mvs_envelope", turnId: "turn_envelope", type: "exec.completed", result: { schemaVersion: 1, type: "exec.result", runId: "exec_turn_envelope", sessionId: "mvs_envelope", turnId: "turn_envelope", status: "succeeded", output: JSON.stringify({ summary: "Envelope success", files_changed: [], tests: [], remaining_risks: [] }), model: {}, usage: {}, durationMs: 1 } }));
+await delay(4000);
+process.exit(0);
+`,
     );
     process.env["G2M_MCODE_PATH"] = mockCmdPath;
   });
@@ -493,7 +560,7 @@ describe("MCodeAdapter end-to-end (plan §65)", () => {
     expect(evidence?.totalBytes).toBeGreaterThan(8);
     expect(evidence?.truncated).toBe(true);
     expect(evidence?.capturedByteSha256).toBe(
-      createHash("sha256").update(Buffer.from("diagnostic-overflow\r\n").subarray(0, 8)).digest("hex"),
+      createHash("sha256").update(Buffer.from(process.platform === "win32" ? "diagnostic-overflow\r\n" : "diagnostic-overflow\n").subarray(0, 8)).digest("hex"),
     );
     expect(Object.isFrozen(evidence)).toBe(true);
   }, 15_000);

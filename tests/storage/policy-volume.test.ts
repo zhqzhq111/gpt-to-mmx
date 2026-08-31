@@ -7,14 +7,18 @@ import { DEFAULT_STORAGE_POLICY, resolveStoragePolicy } from "../../src/storage/
 import { deduplicateVolumeRoots, volumeIdForPath } from "../../src/storage/volume.js";
 import { parseLocalConfig } from "../../src/cli/config.js";
 
+const configFixture = process.platform === "win32"
+  ? { workspace: "F:/demo", worktreeRoot: "F:/g2m-state/worktrees", artifactRoot: "F:/g2m-state/artifacts" }
+  : { workspace: "/tmp/g2m-demo", worktreeRoot: "/tmp/g2m-state/worktrees", artifactRoot: "/tmp/g2m-state/artifacts" };
+
 describe("Phase 9 storage policy", () => {
   it("keeps legacy local configs valid and fills storage defaults", () => {
     const config = parseLocalConfig({
       protocol_version: "g2m.local-config.v1",
-      workspaces: [{ workspace_id: "demo", path: "F:/demo" }],
+      workspaces: [{ workspace_id: "demo", path: configFixture.workspace }],
       verification_profiles: [],
-      worktree_root: "F:/g2m-state/worktrees",
-      artifact_root: "F:/g2m-state/artifacts",
+      worktree_root: configFixture.worktreeRoot,
+      artifact_root: configFixture.artifactRoot,
     });
 
     expect(config.storage).toEqual(DEFAULT_STORAGE_POLICY);

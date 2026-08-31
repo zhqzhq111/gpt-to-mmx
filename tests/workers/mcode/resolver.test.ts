@@ -8,7 +8,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtemp, writeFile, readFile, rm, mkdir, realpath } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile, readFile, rm, mkdir, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -19,6 +19,15 @@ import {
 } from "../../../src/workers/mcode/resolver.js";
 import { buildMCodeInvocation } from "../../../src/workers/mcode/invocation.js";
 
+async function writePortableLauncher(path: string, windowsSource: string, posixSource: string): Promise<void> {
+  if (process.platform === "win32") {
+    await writeFile(path, windowsSource, "utf8");
+    return;
+  }
+  await writeFile(path, `#!/usr/bin/env node\n${posixSource}\n`, "utf8");
+  await chmod(path, 0o755);
+}
+
 describe("resolveMCode (plan §33-35)", () => {
   let tmpRoot: string;
   let mockMcode: string;
@@ -27,7 +36,7 @@ describe("resolveMCode (plan §33-35)", () => {
 
   beforeAll(async () => {
     tmpRoot = await mkdtemp(join(tmpdir(), "g2m-resolver-"));
-    mockMcode = join(tmpRoot, "mcode.cmd");
+    mockMcode = join(tmpRoot, process.platform === "win32" ? "mcode.cmd" : "mcode.js");
     // 写一个真正能被 execFile 调起来的 .cmd:
     //   --version → "mcode 9.9.9"
     //   --help    → 帮助文本
@@ -40,9 +49,16 @@ describe("resolveMCode (plan §33-35)", () => {
       "exit /b 1",
       "",
     ].join("\r\n");
-    await writeFile(mockMcode, script, "utf8");
-    oversizedMcode = join(tmpRoot, "mcode-oversized.cmd");
-    await writeFile(
+    await writePortableLauncher(mockMcode, script, `
+const args = process.argv.slice(2);
+const output = (value) => process.stdout.write(value + "\\n");
+if (args[0] === "--version") { output("mcode 9.9.9"); process.exit(0); }
+if (args[0] === "--help") { output("Usage: mcode <command>"); output("Commands: exec acp"); process.exit(0); }
+if (args[0] === "exec" && args[1] === "--help") { output("Usage: mcode exec"); output("Flags: --cwd --permission --output-schema"); process.exit(0); }
+process.exit(1);
+`);
+    oversizedMcode = join(tmpRoot, process.platform === "win32" ? "mcode-oversized.cmd" : "mcode-oversized.js");
+    await writePortableLauncher(
       oversizedMcode,
       [
         "@echo off",
@@ -52,10 +68,17 @@ describe("resolveMCode (plan §33-35)", () => {
         "exit /b 1",
         "",
       ].join("\r\n"),
-      "utf8",
+      `
+const args = process.argv.slice(2);
+const output = (value) => process.stdout.write(value + "\\n");
+if (args[0] === "--version") { output("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"); process.exit(0); }
+if (args[0] === "--help") { output("Usage: mcode"); process.exit(0); }
+if (args[0] === "exec" && args[1] === "--help") { output("--output-schema"); process.exit(0); }
+process.exit(1);
+`,
     );
-    noSchemaMcode = join(tmpRoot, "mcode-no-schema.cmd");
-    await writeFile(
+    noSchemaMcode = join(tmpRoot, process.platform === "win32" ? "mcode-no-schema.cmd" : "mcode-no-schema.js");
+    await writePortableLauncher(
       noSchemaMcode,
       [
         "@echo off",
@@ -65,7 +88,14 @@ describe("resolveMCode (plan §33-35)", () => {
         "exit /b 1",
         "",
       ].join("\r\n"),
-      "utf8",
+      `
+const args = process.argv.slice(2);
+const output = (value) => process.stdout.write(value + "\\n");
+if (args[0] === "--version") { output("mcode 1.0.0"); process.exit(0); }
+if (args[0] === "--help") { output("Usage: mcode"); process.exit(0); }
+if (args[0] === "exec" && args[1] === "--help") { output("Usage: mcode exec"); process.exit(0); }
+process.exit(1);
+`,
     );
   });
 
@@ -79,7 +109,7 @@ describe("resolveMCode (plan §33-35)", () => {
       const d = await resolveMCode();
       expect(d.executablePath).toBe(mockMcode);
       expect(d.resolvedVia).toBe("trusted-override");
-      expect(d.kind).toBe("cmd");
+      expect(d.kind).toBe(process.platform === "win32" ? "cmd" : "js");
       expect(d.version).toBe("mcode 9.9.9");
       expect(d.executableSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(d.executableBytes).toBeGreaterThan(0);

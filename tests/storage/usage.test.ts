@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, symlink, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -40,7 +40,8 @@ describe("storage usage scanner", () => {
     await mkdir(outside);
     await mkdir(worktree);
     await writeFile(join(outside, "secret.txt"), "secret-bytes");
-    await symlink(outside, join(worktree, "external"), "dir");
+    const externalLink = join(worktree, "external");
+    await symlink(outside, externalLink, "dir");
 
     await expect(scanExecutionUsage({
       executionId: "exec-link",
@@ -52,7 +53,7 @@ describe("storage usage scanner", () => {
       worktreePath: worktree,
       artifactPath: join(root, "missing-artifact"),
     });
-    expect(usage.worktreeBytes).toBeLessThan("secret-bytes".length);
+    expect(usage.worktreeBytes).toBe(Buffer.byteLength(await readlink(externalLink)));
   });
 });
 

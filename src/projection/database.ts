@@ -36,9 +36,13 @@ export class StateDatabase {
       const openPath = options.readOnly && path !== ":memory:" ? `file:${path}?immutable=1` : path;
       opened = new DatabaseSync(openPath, { timeout: 5_000, readOnly: options.readOnly ?? false });
       if (!options.readOnly) {
+        // Install the busy handler before WAL/schema setup. The first
+        // concurrent opener can hold SQLite's schema lock while the other
+        // process runs these pragmas; setting it afterwards is too late for
+        // that initialization race.
+        opened.exec("PRAGMA busy_timeout = 5000");
         opened.exec("PRAGMA journal_mode = WAL");
         opened.exec("PRAGMA synchronous = NORMAL");
-        opened.exec("PRAGMA busy_timeout = 5000");
         opened.exec(FROZEN_SCHEMA_SQL);
         this.ensureStorageReservationColumns(opened);
       }

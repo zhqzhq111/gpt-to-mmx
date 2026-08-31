@@ -49,6 +49,8 @@ export class GcLockError extends Error {
 }
 
 const LOCK_FILE = "gc.lock";
+const TRANSIENT_READ_RETRIES = 5;
+const TRANSIENT_READ_DELAY_MS = 10;
 
 function defaults(overrides: Partial<GcLockDependencies> | undefined): GcLockDependencies {
   return {
@@ -97,6 +99,20 @@ async function readExisting(path: string): Promise<{ readonly raw: string; reado
     if (error instanceof GcLockError) throw error;
     throw new GcLockError("GC_LOCK_IO", "cannot read GC lock", error);
   }
+}
+
+async function readExistingAfterCreateRace(path: string): Promise<{ readonly raw: string; readonly metadata: GcLockMetadata } | undefined> {
+  let lastInvalid: GcLockError | undefined;
+  for (let attempt = 0; attempt < TRANSIENT_READ_RETRIES; attempt += 1) {
+    try {
+      return await readExisting(path);
+    } catch (error) {
+      if (!(error instanceof GcLockError) || error.code !== "GC_LOCK_INVALID") throw error;
+      lastInvalid = error;
+      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_READ_DELAY_MS));
+    }
+  }
+  throw lastInvalid;
 }
 
 async function writeNew(path: string, metadata: GcLockMetadata): Promise<boolean> {
@@ -177,7 +193,7 @@ export async function acquireGcRunLock(options: GcRunLockOptions): Promise<GcRun
         },
       };
     }
-    const existing = await readExisting(path);
+    const existing = await readExistingAfterCreateRace(path);
     if (existing === undefined) continue;
     if (!stale(existing.metadata, deps, staleAfterMs)) {
       throw new GcLockError("GC_LOCK_BUSY", "another GC mutation is in progress");

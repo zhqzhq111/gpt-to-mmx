@@ -29,22 +29,23 @@ const execFileAsync = promisify(execFile);
 // the fixture must be allocated outside the repo.
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const outsideRoot = resolve(repositoryRoot, "..", ".g2m-workspace-tests");
+const nativeWorkspacePath = process.platform === "win32" ? "D:/projects/arm" : "/tmp/projects/arm";
 
 describe("WorkspaceRegistry", () => {
   it("register + get round-trip", () => {
     const r = new WorkspaceRegistry();
-    const entry = r.register("robot-arm", "D:/projects/arm");
+    const entry = r.register("robot-arm", nativeWorkspacePath);
     expect(entry.workspaceId).toBe("robot-arm");
     expect(r.get("robot-arm").canonicalPath.replace(/\\/g, "/")).toBe(
-      "D:/projects/arm",
+      nativeWorkspacePath,
     );
   });
 
   it("rejects duplicate register", () => {
     const r = new WorkspaceRegistry();
-    r.register("dup", "D:/a");
-    expect(() => r.register("dup", "D:/b")).toThrow(WorkspaceRegistryError);
-    expect(() => r.register("dup", "D:/b")).toThrow(/already registered/);
+    r.register("dup", process.platform === "win32" ? "D:/a" : "/tmp/a");
+    expect(() => r.register("dup", process.platform === "win32" ? "D:/b" : "/tmp/b")).toThrow(WorkspaceRegistryError);
+    expect(() => r.register("dup", process.platform === "win32" ? "D:/b" : "/tmp/b")).toThrow(/already registered/);
   });
 
   it("rejects relative path (plan §13 absolute path only via G2M mapping)", () => {
@@ -54,7 +55,7 @@ describe("WorkspaceRegistry", () => {
     );
   });
 
-  it("accepts Windows drive + UNC paths (POSIX path on Windows is normalized by path.resolve)", () => {
+  it.skipIf(process.platform !== "win32")("accepts Windows drive + UNC paths (POSIX path on Windows is normalized by path.resolve)", () => {
     const r = new WorkspaceRegistry();
     // Windows drive letter
     const winPath = `C:${sep}Users${sep}zhq${sep}x`;
@@ -69,15 +70,15 @@ describe("WorkspaceRegistry", () => {
 
   it("unregister then get throws NOT_FOUND", () => {
     const r = new WorkspaceRegistry();
-    r.register("u", "D:/x");
+    r.register("u", process.platform === "win32" ? "D:/x" : "/tmp/x");
     r.unregister("u");
     expect(() => r.get("u")).toThrow(/not registered/);
   });
 
   it("list returns all registered entries", () => {
     const r = new WorkspaceRegistry();
-    r.register("a", "D:/a");
-    r.register("b", "D:/b");
+    r.register("a", process.platform === "win32" ? "D:/a" : "/tmp/a");
+    r.register("b", process.platform === "win32" ? "D:/b" : "/tmp/b");
     const ids = r.list().map((e) => e.workspaceId).sort();
     expect(ids).toEqual(["a", "b"]);
   });
@@ -86,9 +87,10 @@ describe("WorkspaceRegistry", () => {
 describe("WorkspaceResolver", () => {
   it("returns canonical path for known id", () => {
     const r = new WorkspaceRegistry();
-    r.register("known", "D:/projects/known");
+    const knownPath = process.platform === "win32" ? "D:/projects/known" : "/tmp/projects/known";
+    r.register("known", knownPath);
     expect(resolveWorkspace(r, "known").replace(/\\/g, "/")).toBe(
-      "D:/projects/known",
+      knownPath,
     );
   });
 

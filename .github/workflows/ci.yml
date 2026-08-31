@@ -29,10 +29,14 @@ jobs:
             gate: npm ci + build
             command: npm run build
           - os: ubuntu-latest
-            gate: npm ci + unit tests
-            command: npm test
+            gate: npm ci + POSIX unit tests
+            # The CLI handoff E2E is intentionally Windows-only because its
+            # fixture exercises .cmd launch semantics. Portable adapter,
+            # resolver, config, workspace, storage, and process tests still
+            # run in this POSIX unit gate.
+            command: npm test -- --exclude tests/cli/cli.e2e.test.ts
           - os: windows-latest
-            gate: npm ci + unit tests
+            gate: npm ci + Windows unit tests
             command: npm test -- --maxWorkers=1
           - os: ubuntu-latest
             gate: npm ci + workspace lease E2E

@@ -56,6 +56,18 @@ test("two real processes cannot over-reserve the same capacity", async () => {
   }
 });
 
+test("concurrent first opens initialize one shared SQLite schema", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "g2m-storage-process-init-race-"));
+  try {
+    const children = ["init-a", "init-b", "init-c", "init-d"].map((executionId) => start(stateRoot, executionId));
+    const results = await Promise.all(children.map((entry) => entry.first));
+    assert.deepEqual(results.map((result) => result.status).sort(), ["ADMITTED", "DENIED", "DENIED", "DENIED"]);
+    await Promise.all(children.map((entry) => entry.done));
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
 test("a released reservation lets a denied process retry successfully", async () => {
   const stateRoot = await mkdtemp(join(tmpdir(), "g2m-storage-process-release-"));
   try {

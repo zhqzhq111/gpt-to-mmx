@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,6 +36,46 @@ describe("GC run lock", () => {
     await first.release();
     const second = await acquireGcRunLock({ stateRoot, dependencies: deps({ pid: 11, randomUUID: () => "run-b" }) });
     await second.release();
+  });
+
+  it("waits for a concurrently published lock before classifying it as busy", async () => {
+    const stateRoot = await root();
+    const gcRoot = join(stateRoot, "gc");
+    const lockPath = join(gcRoot, "gc.lock");
+    const metadata = {
+      lock_version: 1 as const,
+      gc_run_id: "run-a",
+      pid: 10,
+      hostname: "host-a",
+      created_at: 1_000,
+      heartbeat_at: 1_000,
+    };
+    const serialized = `${JSON.stringify(metadata)}\n`;
+    await mkdir(gcRoot, { recursive: true });
+    await writeFile(lockPath, serialized.slice(0, 12), "utf8");
+    const publication = new Promise<void>((resolve) => {
+      setTimeout(async () => {
+        await writeFile(lockPath, serialized, "utf8");
+        resolve();
+      }, 20);
+    });
+
+    try {
+      await expect(acquireGcRunLock({ stateRoot, dependencies: deps({ pid: 11, randomUUID: () => "run-b" }) }))
+        .rejects.toMatchObject({ code: "GC_LOCK_BUSY" });
+    } finally {
+      await publication;
+    }
+  });
+
+  it("still rejects a persistent malformed lock as invalid", async () => {
+    const stateRoot = await root();
+    const gcRoot = join(stateRoot, "gc");
+    await mkdir(gcRoot, { recursive: true });
+    await writeFile(join(gcRoot, "gc.lock"), "{not-json\n", "utf8");
+
+    await expect(acquireGcRunLock({ stateRoot, dependencies: deps({ pid: 11, randomUUID: () => "run-b" }) }))
+      .rejects.toMatchObject({ code: "GC_LOCK_INVALID" });
   });
 
   it("reclaims only a stale same-host lock whose PID is dead", async () => {
