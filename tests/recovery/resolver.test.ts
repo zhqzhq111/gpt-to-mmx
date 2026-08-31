@@ -162,6 +162,23 @@ describe("resolveRecovery — Crash mid-execution (plan §51 example)", () => {
     }));
     expect(r.verdict).toBe("UNKNOWN");
   });
+
+  it("returns UNKNOWN for a crash during VERIFYING with dirty workspace and no result", () => {
+    const events = makeCompleteHappyPathEvents().slice(0, 9);
+    const r = resolveRecovery(makeInput({
+      events,
+      currentState: "VERIFYING",
+      processStatus: "crashed",
+      workerResult: null,
+      workspaceDirty: true,
+    }));
+
+    expect(r.verdict).toBe("UNKNOWN");
+    expect(r.suggestedNextState).toBe("RECOVERY_REQUIRED");
+    expect(r.safeToRetry).toBe(false);
+    expect(r.safeToResume).toBe(false);
+    expect(r.canAutoContinueNextTask).toBe(false);
+  });
 });
 
 describe("resolveRecovery — Result exists (plan §28 / §67)", () => {

@@ -282,6 +282,30 @@ describe("verifyChain (user requirement 1: chain integrity, no reordering)", () 
     expect(result.reason).toBe("SEQ_MISMATCH");
   });
 
+  it("rejects a duplicated event ID even when the duplicate is re-hashed into a valid chain", () => {
+    const store = new EventStore();
+    store.append({ taskId: "t", attemptId: "a1", type: "task.created", payload: {} });
+    store.append({ taskId: "t", attemptId: "a1", type: "task.validation.started", payload: {} });
+    const events = store.list();
+    const first = events[0];
+    const second = events[1];
+    if (first === undefined || second === undefined) throw new Error("test fixture incomplete");
+
+    const { hash: ignored, ...withoutHash } = second;
+    void ignored;
+    const duplicated = { ...withoutHash, eventId: first.eventId };
+    const result = verifyChain([
+      first,
+      { ...duplicated, hash: computeEventHash(duplicated) },
+      ...events.slice(2),
+    ]);
+
+    expect(result.valid).toBe(false);
+    expect(result.reason).toBe("DUPLICATE_EVENT_ID");
+    expect(result.brokenAtSeq).toBe(2);
+    expect(result.brokenAtEventId).toBe(first.eventId);
+  });
+
   it("first event must have prevHash = null; flagging if it's something else", () => {
     const e: TaskEvent = {
       eventId: "x",
@@ -393,6 +417,41 @@ describe("EventStore tolerant execution-directory loading", () => {
       type: "task.validation.started",
       payload: {},
     })).toThrow(EventStoreError);
+    tolerant.close();
+  });
+
+  it("quarantines a journal that reuses an event ID despite a valid rehashed chain", async () => {
+    const root = await executionRoot();
+    const seeded = new EventStore({ executionDirectory: root });
+    seeded.append({ taskId: "task-1", attemptId: "duplicate-id", type: "task.created", payload: {} });
+    seeded.append({ taskId: "task-1", attemptId: "duplicate-id", type: "task.validation.started", payload: {} });
+    seeded.close();
+
+    const path = join(root, "duplicate-id", "state-events.ndjson");
+    const persisted = (await readFile(path, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const original = seeded.list();
+    const first = original[0];
+    const second = original[1];
+    if (first === undefined || second === undefined) throw new Error("test fixture incomplete");
+    const { hash: ignored, ...withoutHash } = second;
+    void ignored;
+    const duplicate = { ...withoutHash, eventId: first.eventId };
+    const duplicateHash = computeEventHash(duplicate);
+    persisted[1] = { ...persisted[1], event_id: first.eventId, hash: duplicateHash };
+    await writeFile(path, `${persisted.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+
+    const tolerant = new EventStore({ executionDirectory: root, tolerateLoadErrors: true });
+    expect(tolerant.getByAttemptId("duplicate-id")).toEqual([]);
+    expect(tolerant.recoveryIssues()).toEqual([
+      expect.objectContaining({
+        executionId: "duplicate-id",
+        kind: "LOAD_ERROR",
+        reason: expect.stringContaining("chain is invalid"),
+      }),
+    ]);
     tolerant.close();
   });
 });

@@ -143,7 +143,7 @@ export interface ChainVerificationResult {
   readonly valid: boolean;
   readonly brokenAtSeq?: number;
   readonly brokenAtEventId?: string;
-  readonly reason?: "SEQ_MISMATCH" | "PREV_HASH_MISMATCH" | "HASH_MISMATCH";
+  readonly reason?: "SEQ_MISMATCH" | "PREV_HASH_MISMATCH" | "HASH_MISMATCH" | "DUPLICATE_EVENT_ID";
 }
 
 export interface EventStoreOptions {
@@ -357,9 +357,19 @@ export class EventStore {
 }
 
 export function verifyChain(events: readonly TaskEvent[]): ChainVerificationResult {
+  const eventIds = new Set<string>();
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
     if (event === undefined) continue;
+    if (eventIds.has(event.eventId)) {
+      return {
+        valid: false,
+        brokenAtSeq: event.seq,
+        brokenAtEventId: event.eventId,
+        reason: "DUPLICATE_EVENT_ID",
+      };
+    }
+    eventIds.add(event.eventId);
     const expectedSeq = index + 1;
     if (event.seq !== expectedSeq) {
       return { valid: false, brokenAtSeq: event.seq, brokenAtEventId: event.eventId, reason: "SEQ_MISMATCH" };
