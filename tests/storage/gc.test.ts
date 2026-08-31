@@ -111,6 +111,26 @@ describe("GC executor", () => {
     expect(existsSync(join(f.stateRoot, "executions", f.executionId))).toBe(true);
   });
 
+  it.each([
+    ["after_worktree_removed", true, false],
+    ["after_artifacts_removed", false, false],
+    ["after_tombstone_written", false, true],
+  ] as const)("retains the correct durable evidence when interrupted at %s", async (point, artifactPresent, completed) => {
+    const f = await fixture();
+    const report = await executeGc({
+      ...f.options,
+      fault: async (actual) => { if (actual === point) throw new GcFaultError(point); },
+    });
+
+    expect(report.failures[0]?.reason).toContain(point);
+    expect(existsSync(f.artifactPath)).toBe(artifactPresent);
+    expect(existsSync(join(f.stateRoot, "executions", f.executionId))).toBe(true);
+    expect(f.options.eventStore.getByAttemptId(f.executionId).some((event) => event.type === "gc.completed")).toBe(completed);
+    const tombstone = await readTombstone(join(f.stateRoot, "tombstones", f.executionId + ".json"));
+    expect(tombstone === undefined).toBe(!completed);
+    if (completed) expect(tombstone).toMatchObject({ executionId: f.executionId });
+  });
+
   it("resumes a marked operation idempotently after the process is restarted", async () => {
     const f = await fixture();
     await executeGc({ ...f.options, fault: async (point) => { if (point === "after_gc_marked") throw new GcFaultError(point); } });

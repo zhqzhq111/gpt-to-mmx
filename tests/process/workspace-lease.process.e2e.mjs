@@ -106,6 +106,37 @@ test("a second real process can acquire after the first releases", async () => {
   }
 });
 
+test("a real lease refreshes only its heartbeat sidecar", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".tmp", "lease-process-heartbeat-"));
+  try {
+    const stateRoot = join(root, "state");
+    const workspacePath = join(root, "workspace");
+    await mkdir(workspacePath);
+    const key = await workspaceKeyForPath(workspacePath);
+    const owner = startChild("acquire", stateRoot, workspacePath, "heartbeat", "exec-heartbeat");
+    await waitForMessage(owner, (m) => m.kind === "ready");
+    owner.child.stdin.write("GO\n");
+    const acquired = await waitForMessage(owner, (m) => m.kind === "acquired");
+    const ownerPath = join(stateRoot, "locks", `${key}.lock`);
+    const heartbeatPath = join(stateRoot, "locks", `${key}.${acquired.leaseId}.heartbeat`);
+    const ownerBefore = await readFile(ownerPath, "utf8");
+    const initialHeartbeat = JSON.parse(await readFile(heartbeatPath, "utf8"));
+    let refreshed = initialHeartbeat;
+    const deadline = Date.now() + 1_000;
+    while (refreshed.heartbeat_at === initialHeartbeat.heartbeat_at && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      refreshed = JSON.parse(await readFile(heartbeatPath, "utf8"));
+    }
+    assert.notEqual(refreshed.heartbeat_at, initialHeartbeat.heartbeat_at);
+    assert.equal(await readFile(ownerPath, "utf8"), ownerBefore);
+    owner.child.stdin.write("RELEASE\n");
+    await waitForMessage(owner, (m) => m.kind === "released");
+    await waitForExit(owner);
+  } finally {
+    await removeRoot(root);
+  }
+});
+
 test("two real Node processes have exactly one stale reclaim winner", async () => {
   const root = await mkdtemp(join(process.cwd(), ".tmp", "lease-process-reclaim-"));
   try {

@@ -143,6 +143,31 @@ describe("durable WorkspaceLock", () => {
     lock.release(handle);
   });
 
+  it("keeps the owner immutable while heartbeat refreshes continue", async () => {
+    const { stateRoot, workspacePath } = await fixture();
+    let now = 5_000;
+    const lock = new WorkspaceLock({
+      stateRoot,
+      heartbeatIntervalMs: 10,
+      staleAfterMs: 30,
+      dependencies: {
+        now: () => now,
+        hostname: () => "test-host",
+        randomUUID: () => "lease-refresh",
+        pidProbe: () => "ALIVE",
+      },
+    });
+    const handle = await lock.acquire({ workspaceId: "demo", canonicalPath: workspacePath, executionId: "exec-refresh" });
+    const ownerBefore = await readFile(handle.ownerPath, "utf8");
+    now = 5_100;
+    await lock.heartbeat(handle);
+    const heartbeat = JSON.parse(await readFile(handle.heartbeatPath, "utf8")) as Record<string, unknown>;
+
+    expect(await readFile(handle.ownerPath, "utf8")).toBe(ownerBefore);
+    expect(heartbeat).toMatchObject({ lease_id: "lease-refresh", heartbeat_at: 5_100 });
+    await lock.release(handle);
+  });
+
   it("stops an old handle from refreshing a replacement lease", async () => {
     const { stateRoot, workspacePath } = await fixture();
     const first = new WorkspaceLock({

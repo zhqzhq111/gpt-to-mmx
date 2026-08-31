@@ -9,6 +9,7 @@ import { StateDatabase } from "../../src/projection/database.js";
 import { ExecutionProjector } from "../../src/projection/execution-projector.js";
 import { writeStorageManifestAtomic } from "../../src/storage/usage.js";
 import { planGcCandidates, type GcPlannerOptions } from "../../src/storage/gc-candidate.js";
+import { WorkspaceLock } from "../../src/workspace/lock.js";
 
 const roots: string[] = [];
 const openStores: EventStore[] = [];
@@ -117,6 +118,23 @@ describe("GC candidate planner", () => {
     const [candidate] = await planGcCandidates(f.options);
     expect(candidate?.decision).toBe("BLOCKED");
     expect(candidate?.reasons).toEqual(expect.arrayContaining(["GC_ACTIVE_RESERVATION", "GC_PROJECTION_DISAGREEMENT"]));
+  });
+
+  it("blocks deletion while the execution still owns a workspace lease", async () => {
+    const f = await fixture();
+    const workspacePath = join(f.root, "workspace");
+    await mkdir(workspacePath);
+    f.database.prepare("UPDATE executions SET workspace_id = ? WHERE execution_id = ?").run("ws-1", f.executionId);
+    const lock = new WorkspaceLock({
+      stateRoot: join(f.root, "state"),
+      dependencies: { hostname: () => "test-host", randomUUID: () => "lease-gc", pidProbe: () => "ALIVE" },
+    });
+    const handle = await lock.acquire({ workspaceId: "ws-1", canonicalPath: workspacePath, executionId: f.executionId });
+    const [candidate] = await planGcCandidates(f.options);
+
+    expect(candidate?.decision).toBe("BLOCKED");
+    expect(candidate?.reasons).toContain("GC_ACTIVE_LEASE");
+    await lock.release(handle);
   });
 
   it("blocks missing or malformed manifests and broken Journals", async () => {

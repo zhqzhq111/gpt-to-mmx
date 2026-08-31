@@ -65,11 +65,13 @@ export class StorageMonitor {
       if (stopped || notified) return;
       try {
         const result = await this.check(paths);
+        if (stopped) return;
         if (result.status !== "ok" && !notified) {
           notified = true;
           await onEmergency(result);
         }
       } catch (error) {
+        if (stopped) return;
         if (!notified) {
           notified = true;
           await onEmergency({
