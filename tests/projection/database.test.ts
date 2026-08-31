@@ -23,7 +23,7 @@ describe("StateDatabase", () => {
 
     expect(database.pragma("journal_mode")).toBe("wal");
     expect(database.pragma("synchronous")).toBe(1);
-    expect(database.pragma("busy_timeout")).toBe(5_000);
+    expect(database.pragma("busy_timeout")).toBe(30_000);
     database.close();
   });
 

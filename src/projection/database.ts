@@ -26,39 +26,52 @@ export interface StateDatabaseOptions {
 }
 
 const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+const SQLITE_OPEN_RETRIES = 8;
+
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  return error instanceof Error && /database is locked|SQLITE_BUSY/i.test(error.message);
+}
 
 export class StateDatabase {
   private readonly database: DatabaseSync;
   private closed = false;
 
   constructor(readonly path: string, options: StateDatabaseOptions = {}) {
-    let opened: DatabaseSync | undefined;
-    try {
-      if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
-      const openPath = options.readOnly && path !== ":memory:" ? `file:${path}?immutable=1` : path;
-      opened = new DatabaseSync(openPath, { timeout: SQLITE_BUSY_TIMEOUT_MS, readOnly: options.readOnly ?? false });
-      if (!options.readOnly) {
-        // Install the busy handler before WAL/schema setup. The first
-        // concurrent opener can hold SQLite's schema lock while the other
-        // process runs these pragmas; setting it afterwards is too late for
-        // that initialization race.
-        opened.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
-        opened.exec("PRAGMA journal_mode = WAL");
-        opened.exec("PRAGMA synchronous = NORMAL");
-        opened.exec(FROZEN_SCHEMA_SQL);
-        this.ensureStorageReservationColumns(opened);
+    if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
+    const openPath = options.readOnly && path !== ":memory:" ? `file:${path}?immutable=1` : path;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < SQLITE_OPEN_RETRIES; attempt += 1) {
+      let opened: DatabaseSync | undefined;
+      try {
+        opened = new DatabaseSync(openPath, { timeout: SQLITE_BUSY_TIMEOUT_MS, readOnly: options.readOnly ?? false });
+        if (!options.readOnly) {
+          // Install the busy handler before WAL/schema setup. The first
+          // concurrent opener can hold SQLite's schema lock while the other
+          // process runs these pragmas; setting it afterwards is too late for
+          // that initialization race.
+          opened.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+          opened.exec("PRAGMA journal_mode = WAL");
+          opened.exec("PRAGMA synchronous = NORMAL");
+          opened.exec(FROZEN_SCHEMA_SQL);
+          this.ensureStorageReservationColumns(opened);
+        }
+        this.database = opened;
+        if (!options.readOnly) this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
+        return;
+      } catch (error) {
+        lastError = error;
+        if (opened !== undefined) {
+          try { opened.close(); } catch { /* swallow close error during cleanup */ }
+        }
+        if (!isSqliteBusy(error) || attempt === SQLITE_OPEN_RETRIES - 1) break;
+        sleepSync(Math.min(25 * 2 ** attempt, 1_000));
       }
-      this.database = opened;
-      if (!options.readOnly) this.setMeta("schema_version", String(PROJECTION_SCHEMA_VERSION));
-    } catch (error) {
-      // Close the SQLite handle on any failure so the underlying file
-      // lock is released (otherwise a follow-up `rm` / `rename` against
-      // the same path would fail with EBUSY on Windows).
-      if (opened !== undefined) {
-        try { opened.close(); } catch { /* swallow close error during cleanup */ }
-      }
-      throw new ProjectionDatabaseError(`cannot open projection database: ${path}`, error);
     }
+    throw new ProjectionDatabaseError(`cannot open projection database: ${path}`, lastError);
   }
 
   private ensureStorageReservationColumns(database: DatabaseSync): void {
